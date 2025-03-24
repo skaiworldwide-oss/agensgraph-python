@@ -13,6 +13,6 @@ setup(
     author_email='jsyang@bitnine.net',
     maintainer='Gitae Yun',
     maintainer_email='gtyun@bitnine.net',
-    url='https://github.com/bitnine-oss/agensgraph-python',
+    url='https://github.com/skaiworldwide-oss/agensgraph-python',
     license='Apache License Version 2.0',
 )
