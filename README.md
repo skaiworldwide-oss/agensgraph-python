@@ -9,7 +9,7 @@ AgensGraph Python Driver allows Python programs to connect to an AgensGraph data
 ## Build From Source
 
 ```sh
-git clone https://github.com/bitnine-oss/agensgraph-python
+git clone https://github.com/skaiworldwide-oss/agensgraph-python
 cd agensgraph-python
 python setup.py install
 ```
