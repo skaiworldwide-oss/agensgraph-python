@@ -1,0 +1,92 @@
+name: Python Driver Tests
+
+on:
+  push:
+    branches: [ '*' ]
+    paths-ignore:
+      - 'README.md'
+      - 'VERSION.md'
+  pull_request:
+    branches: [ '*' ]
+    paths-ignore:
+      - 'README.md'
+      - 'VERSION.md'
+jobs:
+  driver-ci:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Get latest commit id of AgensGraph
+        run: |
+          echo "AG_COMMIT_HASH=$(git ls-remote https://github.com/skaiworldwide-oss/agensgraph.git HEAD | awk '{print $1}')" >> $GITHUB_ENV
+
+      - name: Cache AgensGraph Build
+        uses: actions/cache@v3
+        id: agcache
+        with:
+          path: ~/agensgraph_build
+          key: ${{ runner.os }}-v1-agensgraph-${{ env.AG_COMMIT_HASH }}
+
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            libreadline-dev \
+            zlib1g-dev \
+            flex \
+            bison \
+            python3-dev \
+            libpq-dev \
+            git
+
+      - name: Clone and Build AgensGraph
+        if: steps.agcache.outputs.cache-hit != 'true'
+        run: |
+          git clone https://github.com/skaiworldwide-oss/agensgraph.git ~/agensgraph_source
+          cd ~/agensgraph_source
+          ./configure --prefix=$HOME/agensgraph_build
+          make -j$(nproc)
+          make install
+
+      - name: Set Environment Variables
+        run: |
+          echo "AGDATA=$HOME/agens_data" >> $GITHUB_ENV
+          echo "LD_LIBRARY_PATH=$HOME/agensgraph_build/lib:$LD_LIBRARY_PATH" >> $GITHUB_ENV
+          echo "PATH=$HOME/agensgraph_build/bin:$PATH" >> $GITHUB_ENV
+
+      - name: Initialize DB Cluster
+        run: |
+          mkdir -p "$HOME/agens_data"
+          $HOME/agensgraph_build/bin/initdb -D "$HOME/agens_data"
+
+      - name: Start AgensGraph
+        run: |
+          $HOME/agensgraph_build/bin/ag_ctl start -D "$HOME/agens_data" -l "$HOME/agens_data/server.log"
+          sleep 10
+
+      - name: Create test database
+        run: |
+          $HOME/agensgraph_build/bin/createdb agensgraph_test
+
+      - name: Checkout Python Driver
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          
+      - name: Build package
+        run: |
+          python setup.py install
+
+      - name: Run regression tests
+        env:
+          AGENGRAPH_TESTDB: agensgraph_test
+          AGENGRAPH_TESTDB_HOST: localhost
+          AGENGRAPH_TESTDB_PORT: 5432
+          AGENGRAPH_TESTDB_USER: runner
+          AGENGRAPH_TESTDB_PASSWORD: runner
+        run: |
+          python setup.py test
