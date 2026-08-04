@@ -1,40 +1,98 @@
-'''
-Copyright (c) 2025, SKAI Worldwide Co., Ltd.
+from __future__ import annotations
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
+import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 
-    http://www.apache.org/licenses/LICENSE-2.0
+from agensgraph import LABID_MAX, LOCID_MAX, GraphId
+from agensgraph._protocol import graphid
 
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-'''
+from .corpus import REJECTED_GRAPHIDS
 
-import unittest
+labids = st.integers(min_value=0, max_value=LABID_MAX)
+locids = st.integers(min_value=0, max_value=LOCID_MAX)
 
-from agensgraph._graphid import GraphId, cast_graphid, adapt_graphid
 
-class TestGraphId(unittest.TestCase):
-    def setUp(self):
-        self.out = '7.9'
-        self.gid = cast_graphid(self.out, None)
+def test_parts_round_trip():
+    gid = GraphId(3, 1)
+    assert gid.labid == 3
+    assert gid.locid == 1
+    assert str(gid) == "3.1"
 
-    def test_getId(self):
-        self.assertEqual((7, 9), self.gid.getId())
 
-    def test_eq(self):
-        self.assertEqual(self.gid, self.gid)
+@given(labids, locids)
+def test_pack_unpack_round_trip(labid, locid):
+    gid = GraphId(labid, locid)
+    assert graphid.unpack(graphid.pack(gid)) == gid
 
-    def test_str(self):
-        self.assertEqual(self.out, str(self.gid))
 
-    def test_repr(self):
-        self.assertEqual("%s(%s)" % (GraphId.__name__, self.gid),
-                         repr(self.gid))
+@given(labids, locids)
+def test_text_round_trip(labid, locid):
+    gid = GraphId(labid, locid)
+    assert graphid.parse_text(str(gid)) == gid
 
-    def test_adapt(self):
-        self.assertEqual(b"'7.9'", adapt_graphid(self.gid).getquoted())
+
+def test_wire_form_is_eight_bytes_big_endian():
+    assert graphid.pack(GraphId(3, 1)) == b"\x00\x03\x00\x00\x00\x00\x00\x01"
+    assert graphid.unpack(b"\x00\x03\x00\x00\x00\x00\x00\x01") == GraphId(3, 1)
+
+
+def test_value_is_unsigned():
+    """A label id in the top half of the range must not read as a negative number."""
+    gid = GraphId(LABID_MAX, LOCID_MAX)
+    assert gid.packed == 0xFFFF_FFFF_FFFF_FFFF
+    assert graphid.unpack(graphid.pack(gid)) == gid
+    assert GraphId(32768, 1).packed > 0
+
+
+def test_sorts_by_label_then_serial():
+    """A label occupies a contiguous range, which is what makes a range test a label test."""
+    ids = [GraphId(2, 5), GraphId(1, 9), GraphId(2, 1), GraphId(1, 1)]
+    assert sorted(ids) == [GraphId(1, 1), GraphId(1, 9), GraphId(2, 1), GraphId(2, 5)]
+
+
+def test_usable_as_a_key():
+    gid = GraphId(3, 1)
+    assert {gid: "x"}[GraphId(3, 1)] == "x"
+    assert len({GraphId(3, 1), GraphId(3, 1)}) == 1
+
+
+def test_immutable():
+    gid = GraphId(3, 1)
+    with pytest.raises(AttributeError):
+        gid.labid = 4  # type: ignore[misc]
+
+
+def test_comparison_with_other_types_is_not_an_error():
+    """A membership test against a mixed list must not raise."""
+    gid = GraphId(3, 1)
+    assert gid != object()
+    assert gid != "3.1"
+    assert gid != (3, 1)
+    assert gid is not None
+    assert gid not in [object(), "3.1", None]
+
+
+@pytest.mark.parametrize(
+    "labid,locid", [(-1, 0), (LABID_MAX + 1, 0), (0, -1), (0, LOCID_MAX + 1)]
+)
+def test_out_of_range_is_rejected(labid, locid):
+    with pytest.raises(ValueError):
+        GraphId(labid, locid)
+
+
+@pytest.mark.parametrize("text", REJECTED_GRAPHIDS)
+def test_bad_text_is_rejected(text):
+    """Trailing characters are an error, not something to discard.
+
+    A truncated value must not pass as a valid identity, or a misaligned parse produces
+    a plausible-looking wrong answer instead of a failure.
+    """
+    with pytest.raises(ValueError):
+        graphid.parse_text(text)
+
+
+@pytest.mark.parametrize("size", [0, 1, 4, 7, 9, 16])
+def test_wrong_wire_length_is_rejected(size):
+    with pytest.raises(ValueError):
+        graphid.unpack(b"\x00" * size)

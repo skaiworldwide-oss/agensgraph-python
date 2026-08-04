@@ -1,0 +1,98 @@
+[build-system]
+requires = ["hatchling>=1.27", "hatch-vcs>=0.4"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agensgraph-python"
+description = "AgensGraph driver for Python, built on psycopg 3"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+dynamic = ["version"]
+dependencies = [
+    "psycopg[binary]>=3.3.4",
+    "psycopg-pool>=3.3.1",
+    "msgspec>=0.19",
+]
+keywords = ["agensgraph", "graph", "database", "postgresql", "cypher", "gql", "driver"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Topic :: Database",
+    "Topic :: Database :: Front-Ends",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Typing :: Typed",
+]
+
+[[project.authors]]
+name = "Muhammad Taha Naveed"
+email = "skaisw@skaiworldwide.com"
+
+[project.urls]
+Homepage = "https://github.com/skaiworldwide-oss/agensgraph-python"
+Source = "https://github.com/skaiworldwide-oss/agensgraph-python"
+
+[project.optional-dependencies]
+arrow = ["pyarrow>=17"]
+pandas = ["pandas>=2.2"]
+polars = ["polars>=1.0"]
+
+[dependency-groups]
+tests = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "hypothesis>=6.100",
+]
+typing = [
+    "mypy>=1.13",
+    "typing-extensions>=4.12",
+]
+lint = ["ruff>=0.16"]
+dev = [
+    {include-group = "tests"},
+    {include-group = "typing"},
+    {include-group = "lint"},
+]
+
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agensgraph"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src", "tests", "README.md", "LICENSE", "pyproject.toml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--strict-markers --strict-config"
+xfail_strict = true
+asyncio_mode = "strict"
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "server: needs a live AgensGraph server (set AGENSGRAPH_TEST_DSN)",
+]
+
+[tool.ruff]
+line-length = 96
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "UP", "B", "SIM", "C4", "RUF", "TC", "PT"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# A rejection is deliberately one exception type, so tests assert on that type rather
+# than on a message that is free to change. Parametrised cases are read as a list of
+# rows. The corpus holds characters that look like other characters on purpose.
+"tests/*" = ["PT006", "PT011", "B017", "RUF001"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["src/agensgraph"]
