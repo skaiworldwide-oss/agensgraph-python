@@ -48,6 +48,57 @@ A dynamic label or property key cannot be bound as a parameter, so the driver re
 `Label` at any call site that places one into a query. That makes an unquoted
 interpolation impossible to write by accident.
 
+## Two wire formats
+
+The driver never rewrites a query. `RETURN n` is sent as written, the server answers in
+its text rendering, and the driver reads that — which is the default and needs nothing
+from the server beyond the answer itself.
+
+The same query can be asked for in the composite rendering instead, per statement. That
+form leaves out the label name, so it needs a label table for the connection, and it is
+worth asking for where a result carries paths or element arrays: on those, measured over
+2,000 paths, it reads `nodes(p)` in 32 ms against 78 ms and `RETURN p` in 61 ms against
+97 ms. On whole vertices the two are within 2% of each other, so it buys nothing there.
+
+Both renderings produce the same objects, and the test suite asserts that against values
+the server itself produced.
+
+## Versions
+
+The driver reads AgensGraph 2.16 and later. It learns which it is talking to from the
+`agversion` parameter the server sends at startup, so the check costs no round trip.
+
+Everything above works on every supported version. Four features do not exist before
+2.18, and asking for one on an older server says so rather than letting the server fail
+on syntax it has never seen:
+
+```python
+caps = agensgraph.Capabilities.of(conn)
+caps.has_property_promotion()   # a property stored in a column of its own
+caps.has_gql_clauses()          # LET, NEXT, FINISH, FILTER, FOR, CALL
+caps.has_element_ordering()     # ORDER BY on a vertex or an edge
+caps.has_endpoint_elision()     # visible in a plan
+```
+
+## Failures
+
+What kind of error something is comes from psycopg, so a graph failure is caught by the
+same PEP-249 class as any other. What to *do* about it is a separate question the class
+cannot answer, and `agensgraph.errors` answers it:
+
+```python
+from agensgraph.errors import Retryability, retryability
+
+recovery = retryability(exc, wrote=True)
+recovery.is_retryable
+recovery.needs_new_connection
+```
+
+A graph write conflict is reported as `40001`, the same code an ordinary row conflict
+uses, and it is the ordinary outcome of two writers touching one element rather than an
+exotic one. Six recoveries are distinguished, because a boolean cannot tell a lost
+connection from a stale statement cache, and anything unrecognised is treated as fatal.
+
 ## Development
 
 ```sh

@@ -59,9 +59,22 @@ class _Element:
         if isinstance(properties, bytes):
             object.__setattr__(self, "_raw", properties)
             object.__setattr__(self, "_props", None)
-        else:
+        elif properties is None:
             object.__setattr__(self, "_raw", None)
-            object.__setattr__(self, "_props", properties if properties is not None else _EMPTY)
+            object.__setattr__(self, "_props", _EMPTY)
+        elif isinstance(properties, dict):
+            object.__setattr__(self, "_raw", None)
+            object.__setattr__(self, "_props", properties)
+        else:
+            # Anything else is a property map that has already been turned into the wrong
+            # thing -- a string, most often, from asking the server for the map as text and
+            # letting it be decoded on the way in. Refusing it here means the mistake is
+            # reported where it was made rather than at whichever later line reads a
+            # property and finds a character.
+            raise TypeError(
+                f"properties must be a dict, undecoded bytes or None, not "
+                f"{type(properties).__name__}"
+            )
 
     def __setattr__(self, name: str, value: object) -> None:
         raise AttributeError(f"{type(self).__name__} is immutable")

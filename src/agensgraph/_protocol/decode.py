@@ -21,10 +21,15 @@ __all__ = [
     "VERTEX_OID",
     "edge_from_binary",
     "edge_from_text",
+    "edges_from_binary",
+    "edges_from_text",
+    "elements_from_text",
     "path_from_binary",
     "path_from_text",
     "vertex_from_binary",
     "vertex_from_text",
+    "vertices_from_binary",
+    "vertices_from_text",
 ]
 
 GRAPHID_OID = 7002
@@ -85,11 +90,32 @@ def path_from_text(buf: bytes) -> Path:
     return Path(tuple(vertices), tuple(edges))
 
 
-def elements_from_text(buf: bytes) -> list[Vertex | Edge | None]:
-    """Build a vertex or edge array from ``[element,element,...]``.
+def vertices_from_text(buf: bytes) -> list[Vertex | None]:
+    """Build a vertex array from ``[vertex,vertex,...]``.
 
-    Unlike a path, an element array may legitimately hold nulls, which are returned as
-    ``None``. Each element is classified by its own shape rather than by position.
+    An array carries one kind of element and its type says which, so nothing here has to
+    work that out from an element's shape. Unlike a path, an array may hold nulls, which
+    are returned as ``None``.
+    """
+    return [
+        None if part == textfmt.NULL_ELEMENT else vertex_from_text(part)
+        for part in textfmt.split_elements(buf)
+    ]
+
+
+def edges_from_text(buf: bytes) -> list[Edge | None]:
+    """Build an edge array from ``[edge,edge,...]``."""
+    return [
+        None if part == textfmt.NULL_ELEMENT else edge_from_text(part)
+        for part in textfmt.split_elements(buf)
+    ]
+
+
+def elements_from_text(buf: bytes) -> list[Vertex | Edge | None]:
+    """Build an array of either kind, classifying each element by its own shape.
+
+    For an array whose type is known, prefer :func:`vertices_from_text` or
+    :func:`edges_from_text`, which do not have to try one shape and then the other.
     """
     out: list[Vertex | Edge | None] = []
     for part in textfmt.split_elements(buf):
@@ -160,6 +186,18 @@ def path_from_binary(buf: bytes, resolve: LabelResolver) -> Path:
             raise ValueError(f"null edge at position {i} of a path")
         edges.append(edge_from_binary(payload, resolve))
     return Path(tuple(vertices), tuple(edges))
+
+
+def vertices_from_binary(buf: bytes, resolve: LabelResolver) -> list[Vertex | None]:
+    """Build a vertex array from its array encoding."""
+    _, payloads = composite.decode_array(buf)
+    return [None if p is None else vertex_from_binary(p, resolve) for p in payloads]
+
+
+def edges_from_binary(buf: bytes, resolve: LabelResolver) -> list[Edge | None]:
+    """Build an edge array from its array encoding."""
+    _, payloads = composite.decode_array(buf)
+    return [None if p is None else edge_from_binary(p, resolve) for p in payloads]
 
 
 def _jsonb_body(field: composite.Field) -> bytes:
