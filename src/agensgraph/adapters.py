@@ -14,10 +14,16 @@ the label id itself, and that means a cache belonging to one connection. Text lo
 therefore registered on a map shared by the whole process, and binary loaders are built per
 connection around the cache they will ask.
 
-Only one type is ever sent. A property map binds as jsonb, so creating a vertex from a
-parameter needs no adapter of ours, and the composite input syntax the server would want is
-not what a vertex prints as anyway. A graph id does bind, for asking about identity, so
-that is the one thing dumped here.
+Two things are sent. A graph id, for asking about identity. And a mapping, because almost
+every parameter a Cypher statement takes is read as jsonb and psycopg cannot adapt a bare
+``dict`` at all, so a property map would otherwise have to be wrapped by hand at every call
+site that writes one.
+
+A ``list`` is deliberately left alone. psycopg sends one as a PostgreSQL array, which is what
+it should be in the plain SQL a graph connection is still expected to run; a list meant as a
+JSON array is wrapped, and says so. A ``str`` is left alone for the same reason, which is the
+one sharp edge here: a string compared against a property has to be wrapped as well, because
+the server reads the parameter as jsonb and a bare word is not JSON.
 """
 
 from __future__ import annotations
@@ -27,6 +33,7 @@ from typing import TYPE_CHECKING, Any
 from psycopg import postgres, pq
 from psycopg.adapt import AdaptersMap, Dumper, Loader
 from psycopg.types import TypeInfo
+from psycopg.types.json import JsonbBinaryDumper, JsonbDumper
 
 from ._protocol import decode
 from ._protocol.graphid import GraphId, pack, parse_text
@@ -183,6 +190,8 @@ def register_text(context: AdaptContext | AdaptersMap) -> None:
     adapters.register_loader(OIDS["_edge"], EdgeArrayLoader)
     adapters.register_dumper(GraphId, GraphIdDumper)
     adapters.register_dumper(GraphId, GraphIdBinaryDumper)
+    adapters.register_dumper(dict, JsonbDumper)
+    adapters.register_dumper(dict, JsonbBinaryDumper)
 
 
 def register_binary(context: AdaptContext, labels: LabelCache) -> None:
