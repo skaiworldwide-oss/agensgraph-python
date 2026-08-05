@@ -80,6 +80,30 @@ class TestReadingTheColumnsOffADefinition:
     def test_an_unclosed_definition(self) -> None:
         assert index_properties("CREATE PROPERTY INDEX i ON doc USING btree (a, b") is None
 
+    def test_a_nested_property_path_is_not_a_plain_property(self) -> None:
+        assert index_properties(an_index("doc", "a.b.c").definition) is None
+
+    def test_a_sort_order_makes_it_more_than_a_list_of_names(self) -> None:
+        assert index_properties(an_index("doc", "a DESC, b").definition) is None
+        assert index_properties(an_index("doc", "a, b NULLS FIRST").definition) is None
+
+    def test_a_partial_index_is_not_a_plain_index_over_its_properties(self) -> None:
+        """It covers them conditionally, so reading it as a plain index would report a desired
+        index as already there when the only one present applies to some of the rows."""
+        definition = (
+            "CREATE PROPERTY INDEX i ON doc USING btree (c) WHERE (c) > cypher_to_jsonb(0)"
+        )
+        assert index_properties(definition) is None
+
+    def test_extra_included_columns_likewise(self) -> None:
+        definition = "CREATE PROPERTY INDEX i ON doc USING btree (d) INCLUDE (e)"
+        assert index_properties(definition) is None
+
+    def test_a_property_named_where_is_still_a_property(self) -> None:
+        """The partial-index check reads the tail after the key list, not the key list itself."""
+        assert index_properties(an_index("doc", "where").definition) == ("where",)
+        assert index_properties(an_index("doc", "include").definition) == ("include",)
+
 
 class TestDiffingIndexes:
     def test_nothing_there_means_make_all_of_them(self) -> None:
@@ -132,6 +156,19 @@ class TestDiffingIndexes:
         assert reconcile_indexes([], [existing], drop_extra=True) == [
             "drop property index doc_name_idx"
         ]
+
+    def test_a_partial_index_does_not_satisfy_a_desired_plain_one(self) -> None:
+        partial = Index(
+            "doc",
+            "doc_c_partial",
+            False,
+            "CREATE PROPERTY INDEX doc_c_partial ON doc USING btree (c) "
+            "WHERE (c) > cypher_to_jsonb(0)",
+        )
+        assert reconcile_indexes([DesiredIndex("doc", ("c",))], [partial]) == [
+            "create property index on doc (c)"
+        ]
+        assert reconcile_indexes([], [partial], drop_extra=True) == []
 
     @pytest.mark.parametrize(
         "definition",
@@ -286,6 +323,27 @@ class TestAgainstAServer:
         graph.execute("create property index on doc (stale)")
         assert graph.ensure_indexes([DesiredIndex("doc", ("name",))], drop_extra=True)
         assert [index_properties(i.definition) for i in graph.indexes("doc")] == [("name",)]
+
+    def test_a_real_partial_index_does_not_satisfy_a_desired_plain_one(self, graph) -> None:  # type: ignore[no-untyped-def]
+        """Against the server, so the rendering of the WHERE clause is the real one."""
+        graph.execute("create property index on doc (c) where c > 0")
+        (existing,) = graph.indexes("doc")
+        assert "WHERE" in existing.definition.upper()
+        assert index_properties(existing.definition) is None
+        assert graph.ensure_indexes([DesiredIndex("doc", ("c",))]) == [
+            "create property index on doc (c)"
+        ]
+        assert graph.ensure_indexes([DesiredIndex("doc", ("c",))]) == []
+
+    def test_the_richer_index_forms_are_left_alone(self, graph) -> None:  # type: ignore[no-untyped-def]
+        """Each of these is accepted by the server and describable by no DesiredIndex, so none may
+        be dropped while reconciling a list of property names."""
+        graph.execute("create property index on doc (a.b.c)")
+        graph.execute("create property index on doc (d desc nulls first, e)")
+        graph.execute("create property index on doc ((f + g))")
+        before = {index.name for index in graph.indexes("doc")}
+        graph.ensure_indexes([DesiredIndex("doc", ("name",))], drop_extra=True)
+        assert before <= {index.name for index in graph.indexes("doc")}
 
     def test_an_expression_index_survives_a_real_drop_extra(self, graph) -> None:  # type: ignore[no-untyped-def]
         """The live form of the case that would hurt. An index made as plain SQL over the property

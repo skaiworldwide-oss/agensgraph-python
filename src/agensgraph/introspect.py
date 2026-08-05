@@ -203,11 +203,17 @@ class Constraint(NamedTuple):
 
 
 class DesiredIndex(NamedTuple):
-    """A property index somebody wants to exist.
+    """A plain btree property index somebody wants to exist.
 
     Matched against what is there by the properties it covers and whether it is unique, read off
     the definition the server printed. Not by name: the server derives one from the columns, but
     truncates it at the identifier limit and appends a counter on a collision.
+
+    A property index can be a good deal more than this -- over a nested path or an expression, with
+    a sort order, an operator class, an access method, ``INCLUDE`` columns, or a ``WHERE`` making it
+    partial. None of that is described here, and reconciliation leaves any such index alone rather
+    than treating it as one of these. Write those as DDL, or as :func:`agensgraph.vector.vector_index`
+    for a vector.
     """
 
     label: str
@@ -220,7 +226,9 @@ class DesiredIndex(NamedTuple):
 class Unique(NamedTuple):
     """An assertion that a property holds a different value on every element of a label.
 
-    One property. ``ASSERT (a, b) IS UNIQUE`` is a syntax error.
+    The server asserts over an *expression*, so ``ASSERT lower(name) IS UNIQUE`` is accepted while
+    ``ASSERT (a, b) IS UNIQUE`` is not -- a parenthesised list is not an expression. Only a plain
+    property name is described here; an assertion over anything else is written as DDL.
     """
 
     label: str
@@ -263,15 +271,19 @@ def _bare_property(token: str) -> str | None:
 
 
 def index_properties(definition: str) -> tuple[str, ...] | None:
-    """The properties an index covers, read off the definition the server printed.
+    """The properties a plain index covers, read off the definition the server printed.
 
-    ``None`` when the index is over an expression rather than over plain properties.
+    ``None`` for anything a desired index cannot describe, which reconciliation therefore leaves
+    alone. The grammar allows a great deal more than a list of property names: a nested path
+    (``a.b.c``), an expression (``((a) + (b))``), a sort or nulls order per element, an operator
+    class, an access method, ``INCLUDE``, and a ``WHERE`` making the index partial. All of those
+    read as ``None`` here.
     """
     start = definition.find("(", definition.find(" USING "))
     if start < 0:
         return None
-    depth, parts, current = 0, [], ""
-    for char in definition[start:]:
+    depth, parts, current, end = 0, [], "", 0
+    for offset, char in enumerate(definition[start:]):
         if char == "(":
             depth += 1
             if depth == 1:
@@ -280,6 +292,7 @@ def index_properties(definition: str) -> tuple[str, ...] | None:
             depth -= 1
             if depth == 0:
                 parts.append(current)
+                end = start + offset + 1
                 break
         if depth == 1 and char == ",":
             parts.append(current)
@@ -287,6 +300,12 @@ def index_properties(definition: str) -> tuple[str, ...] | None:
             continue
         current += char
     else:
+        return None
+    # A partial index, or one carrying extra columns, covers its properties conditionally or holds
+    # more than it is keyed on. Neither is the index a bare list of property names asks for, and
+    # reading one as though it were would report a desired index as already present.
+    rest = definition[end:].upper()
+    if " WHERE " in f" {rest} " or "INCLUDE" in rest:
         return None
     properties = [_bare_property(part) for part in parts]
     if not properties or any(name is None for name in properties):
