@@ -667,10 +667,43 @@ parameter value ever reaches a span.
 
 ## Using it from a generic tool
 
-`agensgraph.dbapi` provides the PEP 249 names, so an ORM or migration tool can drive the driver
-without knowing anything about graphs — and `connect()` there still returns a connection that
-reads a vertex as a vertex. `connection.closed` and `connection.broken` are psycopg's entire
-judgement about a lost connection, so nothing has to match on an error message.
+The PEP 249 names are on `agensgraph.dbapi`, so anything that drives databases generically drives
+this. A whole SQLAlchemy dialect is **ten lines**:
+
+```python
+from sqlalchemy.dialects.postgresql.psycopg import PGDialect_psycopg
+import agensgraph
+
+class AgensGraphDialect(PGDialect_psycopg):
+    driver = "agensgraph"
+    supports_statement_cache = True
+
+    @classmethod
+    def import_dbapi(cls):
+        return agensgraph.dbapi
+```
+
+A vertex still arrives as a `Vertex` through it, and the server version is read off the banner
+(`PostgreSQL 18beta1 (AgensGraph 2.18-devel)`) by the PostgreSQL dialect's own regular expression.
+
+Two things about `agensgraph.dbapi` are deliberate and worth knowing:
+
+- **`adapters` is this driver's template, not psycopg's global map.** A tool that derives its own map
+  from it and hands the result back as a connection's context — which SQLAlchemy's psycopg dialect
+  does — would otherwise pass over a map with no graph types in it, and every vertex would arrive as
+  the text it prints as.
+- **`__version__` is psycopg's.** A tool reading it off a database module is asking which of that
+  module's features it may use, and every feature reachable through this one is psycopg's. The
+  driver's own version is `agensgraph.__version__`.
+
+**One collision to write down.** Cypher's `(:Label)` is also SQLAlchemy's named-parameter syntax, so
+`text("MATCH (n:Person) RETURN n")` asks for a value for a parameter called `Person`. Escape the
+colon and Cypher receives the label:
+
+```python
+conn.execute(text(r"MATCH (n\:Person) RETURN n"))
+```
+
 
 ## Failures
 

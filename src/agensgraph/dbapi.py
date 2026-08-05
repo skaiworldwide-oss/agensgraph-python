@@ -9,6 +9,15 @@ Almost all of it is psycopg's already, so almost all of it is re-exported rather
 What differs is one thing: :func:`connect` returns a graph connection, so a tool driving this
 module reads a vertex as a vertex.
 
+``adapters`` here is **this driver's** template, not psycopg's global map, and that matters: a tool
+that derives its own map from it and hands the result back as a connection's context would otherwise
+hand over a map with no graph types in it, and every vertex would arrive as the text it prints as.
+SQLAlchemy's psycopg dialect does exactly that.
+
+``__version__`` here is **psycopg's**, not this driver's, and deliberately: a tool reading it off a
+database module is asking which of that module's features it may use, and every feature reachable
+through this one is psycopg's. This driver's own version is ``agensgraph.__version__``.
+
 Two attributes are worth naming for what they replace. ``closed`` and ``broken`` on a connection
 are the entirety of psycopg's own judgement about whether a connection has been lost -- so a tool
 that asks those two never has to match on the text of an error message, which is what tools did
@@ -53,6 +62,7 @@ from psycopg import (
 from psycopg import (
     TimestampFromTicks as TimestampFromTicks,
 )
+from psycopg import __version__ as __version__
 from psycopg import (
     apilevel as apilevel,
 )
@@ -63,6 +73,7 @@ from psycopg import (
     threadsafety as threadsafety,
 )
 
+from ._core import GRAPH_ADAPTERS as adapters
 from .connection import Connection
 from .errors import (
     DatabaseError as DatabaseError,
@@ -118,6 +129,8 @@ __all__ = [
     "Timestamp",
     "TimestampFromTicks",
     "Warning",
+    "__version__",
+    "adapters",
     "apilevel",
     "connect",
     "paramstyle",
