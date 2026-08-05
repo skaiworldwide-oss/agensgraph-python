@@ -488,6 +488,28 @@ iterative index scans in 0.8.0.
 Both renderings are asserted to produce identical values on floats drawn from the whole of single
 precision — not just on small whole numbers, which survive every conversion and so prove nothing.
 
+## Being told when the graph changes
+
+A trigger on a label table can announce a change, which makes this the change feed for a graph:
+
+```python
+conn.listen("graph_changed")
+conn.add_notify_handler(lambda notice: print(notice.channel, notice.payload))
+...
+conn.notify("graph_changed", "doc")     # from anywhere
+conn.listening()                        # ['graph_changed']
+conn.unlisten()                         # all of them
+```
+
+The channel is quoted into the statement, because neither `LISTEN` nor `UNLISTEN` takes a parameter
+for it and `LISTEN` cannot be prepared at all. `notify()` goes through `pg_notify`, which is a
+function and does take one, so a channel held in a variable is bound rather than quoted.
+
+There is also `conn.notifications(timeout=…, stop_after=…)` to read them as they arrive. **Prefer the
+handler.** The iterator holds the connection's lock while it is being read, so a caller who stops
+part way leaves the connection unusable until it is collected. Using both at once raises rather than
+delivering each announcement to whichever route happens to be looking.
+
 ## Watching it work
 
 ```python

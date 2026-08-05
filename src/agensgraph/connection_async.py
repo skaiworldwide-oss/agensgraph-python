@@ -52,6 +52,12 @@ from .introspect import (
     reconcile_constraints,
     reconcile_indexes,
 )
+from .notify import (
+    LISTENING_QUERY,
+    NOTIFY_QUERY,
+    listen_statement,
+    unlisten_statement,
+)
 from .observability import Timer, query_span
 from .summary import (
     ASSIGNED_TRANSACTION_QUERY,
@@ -419,6 +425,57 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
         name = self._graph_of(graph)
         rows = await self._fetch(CONSTRAINTS_QUERY, (name, label, label))
         return [Constraint(*row) for row in rows]
+
+    async def listen(self, *channels: str) -> None:
+        """Subscribe to channels the server announces on.
+
+        The channel is quoted into the statement, since neither ``LISTEN`` nor ``UNLISTEN`` takes a
+        parameter for it.
+        """
+        for channel in channels:
+            await self._run(listen_statement(channel))
+
+    async def unlisten(self, *channels: str) -> None:
+        """Stop listening. Given no channel, stop listening to all of them."""
+        for statement in [unlisten_statement(name) for name in channels] or [
+            unlisten_statement()
+        ]:
+            await self._run(statement)
+
+    async def listening(self) -> list[str]:
+        """The channels this connection is subscribed to."""
+        rows = await self._fetch(LISTENING_QUERY, ())
+        return [row[0] for row in rows]
+
+    async def notify(self, channel: str, payload: str = "") -> None:
+        """Announce something on a channel.
+
+        Sent through ``pg_notify``, which takes the channel as a parameter, so a channel name held in a
+        variable needs no quoting and cannot carry a statement of its own.
+        """
+        await self._fetch(NOTIFY_QUERY, (channel, payload))
+
+    async def notifications(
+        self, *, timeout: float | None = None, stop_after: int | None = None
+    ) -> AsyncIterator[psycopg.Notify]:
+        """Read announcements as they arrive.
+
+        Refuses to run while a handler is registered. psycopg reports that pairing as unreliable
+        and warns; a warning is easy to miss and what follows is announcements going to one route
+        or the other unpredictably, so this raises instead.
+
+        A handler is the other way to read these, and the one to prefer: this holds the
+        connection's lock for as long as it is being read, so a caller who stops reading part way
+        leaves the connection unusable until the iterator is collected.
+        """
+        if self._notify_handlers:
+            raise RuntimeError(
+                "this connection already has a notify handler, and reading announcements both "
+                "ways at once delivers each one to whichever route happens to be looking. "
+                "Remove the handler, or read them through it alone."
+            )
+        async for notice in super().notifies(timeout=timeout, stop_after=stop_after):
+            yield notice
 
     async def ensure_indexes(
         self,

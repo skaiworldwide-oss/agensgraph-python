@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from psycopg import Notify as Notify
 from psycopg.types.json import Jsonb as Jsonb
 
 from . import dbapi as dbapi
@@ -77,6 +78,7 @@ __all__ = [
     "Label",
     "LabelInfo",
     "Notice",
+    "Notify",
     "Path",
     "QueryRecord",
     "Result",
