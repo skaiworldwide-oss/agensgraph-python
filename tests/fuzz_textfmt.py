@@ -16,6 +16,7 @@ having to discover them.
 
 from __future__ import annotations
 
+import contextlib
 import sys
 
 import atheris
@@ -65,10 +66,8 @@ SEEDS = [
 def one(data: bytes) -> None:
     """Hand the same bytes to each reader, and let only a stated failure through."""
     for read in (split_elements, parse_vertex, parse_edge, parse_text):
-        try:
+        with contextlib.suppress(*ALLOWED):
             read(data)  # type: ignore[arg-type]
-        except ALLOWED:
-            pass
 
 
 def main() -> None:

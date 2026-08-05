@@ -705,6 +705,37 @@ conn.execute(text(r"MATCH (n\:Person) RETURN n"))
 ```
 
 
+## When the network goes quiet
+
+A connection whose packets stop being delivered waits for the kernel, and on Linux that is **two hours
+and a quarter**. This is the failure that gets reported as "the driver hung". So keepalive is asked for
+unless you decide otherwise:
+
+```python
+{"keepalives": 1, "keepalives_idle": 30, "keepalives_interval": 10, "keepalives_count": 3}
+```
+
+which ends the wait in about a minute. Setting any keepalive option, or `tcp_user_timeout`, means you
+have decided and nothing is added.
+
+**`tcp_user_timeout` alone does not do this**, which is worth knowing because it is the setting usually
+recommended for it. It bounds how long *transmitted* data may go unacknowledged, and a connection
+waiting for a reply has transmitted nothing. Measured against a server whose traffic was dropped:
+
+| | outcome |
+|---|---|
+| nothing set | still waiting after 22 s |
+| **`tcp_user_timeout=3000` alone** | **still waiting after 22 s** |
+| `keepalives_idle=1` + `tcp_user_timeout=3000` | failed after 3.1 s |
+| `keepalives_idle=1` alone | failed after 4.1 s |
+
+So `tcp_user_timeout` is useful *alongside* keepalive — it shortens how long the probing may fail — and
+useless instead of it. It is left unset by default because it also applies while sending, where too
+small a value would end a healthy connection.
+
+All four rows are asserted in the suite, by dropping packets rather than rejecting them: a rejection
+gives a prompt reset, and a suite that tested only that would cover none of this.
+
 ## Failures
 
 What kind of error something is comes from psycopg, so a graph failure is caught by the

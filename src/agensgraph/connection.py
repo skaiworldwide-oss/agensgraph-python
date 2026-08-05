@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Any
 import psycopg
 from psycopg.rows import Row, tuple_row
 
-from ._core import GraphMixin, Result
+from ._core import GraphMixin, Result, with_keepalives
 from .bulk import (
     EDGE_COLUMN_TYPES,
     VERTEX_COLUMN_TYPES,
@@ -95,8 +95,11 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
         The version arrives in the startup packet, so the refusal costs no round trip and
         happens before the first statement rather than at whichever later one first wants a
         catalog the server has never had.
+
+        Keepalive is asked for unless the caller decided otherwise; see
+        :data:`~agensgraph._core.KEEPALIVE_DEFAULTS` for what that is worth.
         """
-        conn = super().connect(conninfo, **kwargs)
+        conn = super().connect(conninfo, **with_keepalives(kwargs))
         try:
             _ = conn.capabilities
         except BaseException:

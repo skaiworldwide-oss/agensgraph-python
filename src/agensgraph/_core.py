@@ -61,6 +61,39 @@ class Result(NamedTuple):
     counts: GraphWriteCounts
 
 
+KEEPALIVE_DEFAULTS = {
+    "keepalives": 1,
+    "keepalives_idle": 30,
+    "keepalives_interval": 10,
+    "keepalives_count": 3,
+}
+"""What a connection asks for unless the caller says otherwise.
+
+Without these a connection whose network stops carrying packets waits for the kernel, which is two
+hours and a quarter on Linux by default. Measured against a server whose traffic was dropped: with
+nothing set the wait had not ended after twenty-two seconds; with these it ends in about a minute.
+
+``tcp_user_timeout`` is **not** among them, and it is worth saying why, because it is the setting
+usually recommended for this. It bounds how long *transmitted* data may go unacknowledged, and a
+connection waiting for a reply has transmitted nothing -- measured, ``tcp_user_timeout`` alone left
+the same wait unbounded. What it does do is bound the keepalive probing once that is on, so it is
+useful alongside these and useless instead of them. It is left unset because it also applies to a
+connection that is busy sending, where too small a value would end a healthy one.
+"""
+
+
+def with_keepalives(kwargs: dict[str, Any]) -> dict[str, Any]:
+    """The connection arguments, with keepalive asked for if the caller did not decide.
+
+    A caller who sets any keepalive setting, or ``tcp_user_timeout``, has decided, and nothing is
+    added.
+    """
+    decided = set(KEEPALIVE_DEFAULTS) | {"tcp_user_timeout"}
+    if decided & kwargs.keys():
+        return kwargs
+    return {**KEEPALIVE_DEFAULTS, **kwargs}
+
+
 class GraphMixin:
     """Everything a graph connection knows that does not require waiting for the server."""
 
