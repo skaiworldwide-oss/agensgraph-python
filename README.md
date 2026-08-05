@@ -262,6 +262,31 @@ Reference counting still frees as usual; only the collection of cycles waits.
 `agensgraph.freeze_after_import()` is the other half — call it once at startup and every later
 collection skips the module-level objects that were never going to be collected anyway.
 
+## Sending a burst of statements
+
+For a batch whose cost is round trips rather than work:
+
+```python
+conn.pipeline_batch([f"CREATE (:Event {{n: {n}}})" for n in range(1000)])
+```
+
+**A pipeline reports a failure against the wrong statement.** Measured with four statements of which
+only the second was bad: the *first* raised the error, and the other three raised with no SQLSTATE at
+all. So a failure here raises `BatchFailed`, carrying every statement sent, with the server's error
+as its `__cause__`:
+
+```python
+try:
+    conn.pipeline_batch(statements)
+except agensgraph.BatchFailed as failed:
+    for statement in failed.statements:   # run them one at a time to find the culprit
+        ...
+```
+
+Running them serially is left to you rather than done automatically, because replaying a write would
+apply it twice. psycopg's `conn.pipeline()` remains available for the cases where you want to read
+results back.
+
 ## Committing in two phases
 
 Works, with graph writes, unchanged from psycopg — including a write that returned rows, which the

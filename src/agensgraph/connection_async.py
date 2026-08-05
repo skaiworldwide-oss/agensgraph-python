@@ -34,6 +34,7 @@ from .bulk import (
 )
 from .capabilities import VECTOR_AVAILABLE_QUERY, VECTOR_VERSION_QUERY
 from .cypher import wrap_for_cursor
+from .errors import BatchFailed
 from .introspect import (
     CONSTRAINTS_QUERY,
     DECLARED_PROPERTIES_QUERY,
@@ -425,6 +426,35 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
         name = self._graph_of(graph)
         rows = await self._fetch(CONSTRAINTS_QUERY, (name, label, label))
         return [Constraint(*row) for row in rows]
+
+    async def pipeline_batch(
+        self, statements: Sequence[tuple[str, Params | None]] | Sequence[str]
+    ) -> None:
+        """Send many statements without waiting for each in turn.
+
+        For a burst whose cost is round trips rather than work. Nothing is read back, so this is for
+        statements whose results are not wanted -- a batch of writes, most often.
+
+        **A failure names the batch, not the statement.** A pipeline attributes an error to the wrong
+        statement: with four statements of which only the second was bad, the first raised the error
+        and the rest raised with no SQLSTATE. So any failure here is raised as
+        :class:`~agensgraph.errors.BatchFailed` carrying every statement sent, with the server's own
+        error as its cause. Running them one at a time is how to find the one at fault, and is left
+        to the caller because replaying a write would apply it twice.
+        """
+        sent = [(item, None) if isinstance(item, str) else item for item in statements]
+        try:
+            async with self.pipeline():
+                for statement, params in sent:
+                    await self.execute(statement, params)
+        except psycopg.Error as exc:
+            failure = BatchFailed(
+                f"one of {len(sent)} pipelined statements failed, and a pipeline does not report "
+                f"which: the error below may belong to any of them. Run them one at a time to "
+                f"find it."
+            )
+            failure.statements = tuple(statement for statement, _ in sent)
+            raise failure from exc
 
     async def listen(self, *channels: str) -> None:
         """Subscribe to channels the server announces on.

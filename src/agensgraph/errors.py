@@ -67,6 +67,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "STRING_TYPE_HINT",
+    "BatchFailed",
     "CapabilityError",
     "ConfigurationError",
     "DataError",
@@ -280,6 +281,21 @@ class ConfigurationError(_pg.OperationalError):
     """A setting, rather than the statement, is what refused the work."""
 
     setting: str | None = None
+
+
+class BatchFailed(_pg.Error):
+    """A statement in a pipelined batch failed, and which one is not known.
+
+    A pipeline reports an error against the wrong statement. Measured with four statements of which
+    only the second was bad: the *first* raised the error and the rest raised with no SQLSTATE at
+    all. So the batch is reported as a whole.
+
+    ``statements`` holds what was sent, in order, and the failure the server reported is the
+    ``__cause__``. Running them one at a time is how to find the one at fault -- not done here,
+    because replaying a write would apply it twice.
+    """
+
+    statements: tuple[str, ...] = ()
 
 
 class ReadOnlyGraphWrite(_pg.ReadOnlySqlTransaction):
