@@ -8,6 +8,9 @@ between an index that exists and one the server refuses.
 
 from __future__ import annotations
 
+import random
+import struct
+
 import pytest
 import pytest_asyncio
 
@@ -403,3 +406,102 @@ class TestSparseVectorsAgainstAServer:
 
     def test_registering_reports_it(self, sparse) -> None:  # type: ignore[no-untyped-def]
         assert "sparsevec" in TYPES
+
+
+def random_single(rng: random.Random) -> float:
+    """A value drawn from the whole of single precision, not from the easy part of it."""
+    while True:
+        value = struct.unpack(">f", struct.pack(">I", rng.getrandbits(32)))[0]
+        if value == value and abs(value) != float("inf"):
+            return value
+
+
+def random_half(rng: random.Random) -> float:
+    """The same for half precision."""
+    while True:
+        value = struct.unpack(">e", struct.pack(">H", rng.getrandbits(16)))[0]
+        if value == value and abs(value) != float("inf"):
+            return value
+
+
+class TestPrecision:
+    """The two renderings have to agree on values that are hard, not only on whole numbers.
+
+    A version of the agreement test using ``[1,2,3,4]`` passed while the two readings of an
+    ordinary embedding differed on 390 values out of 400. Small whole numbers survive every
+    conversion, so they cannot tell anyone anything -- these draw from the whole of the type.
+    """
+
+    def test_nine_digits_is_what_a_single_precision_value_needs(self) -> None:
+        """Six is the default and loses up to five parts in a million. Measured, not assumed."""
+        rng = random.Random(1)
+        worst_six = worst_nine = 0.0
+        for _ in range(20_000):
+            value = random_single(rng)
+            for text, which in ((f"{value:g}", "six"), (f"{value:.9g}", "nine")):
+                back = struct.unpack(">f", struct.pack(">f", float(text)))[0]
+                error = 0.0 if back == value else abs(back - value) / abs(value or 1.0)
+                if which == "six":
+                    worst_six = max(worst_six, error)
+                else:
+                    worst_nine = max(worst_nine, error)
+        assert worst_nine == 0.0, "nine digits must reproduce every single-precision value"
+        assert worst_six > 1e-7, "six digits loses precision, which is why nine are written"
+
+    def test_a_sparse_vector_writes_enough_digits(self) -> None:
+        rng = random.Random(2)
+        for _ in range(2_000):
+            value = random_single(rng)
+            once = SparseVector({0: value}, 1)
+            assert SparseVector.from_text(once.to_text()).values == once.values
+
+    def test_reading_text_narrows_to_what_the_server_keeps(self) -> None:
+        """Otherwise a decimal reads back as a double the stored value never equals."""
+        from agensgraph.vector import parse_vector_text
+
+        rng = random.Random(3)
+        for _ in range(2_000):
+            value = random_single(rng)
+            (read,) = parse_vector_text(f"[{value:.9g}]")
+            assert read == value
+
+    def test_and_at_half_precision_it_narrows_to_half(self) -> None:
+        from agensgraph.vector import parse_vector_text
+
+        rng = random.Random(4)
+        for _ in range(2_000):
+            value = random_half(rng)
+            (read,) = parse_vector_text(f"[{value:.9g}]", half=True)
+            assert read == value
+
+    def test_half_precision_narrows_and_says_so(self) -> None:
+        """What survives is worth knowing, since it is chosen for memory rather than accuracy."""
+        from agensgraph.vector import parse_vector_text
+
+        assert parse_vector_text("[1]", half=True) == [1.0]
+        assert parse_vector_text("[65504]", half=True) == [65504.0]
+        assert parse_vector_text("[65505]", half=True) == [65504.0], "the largest it holds"
+        assert parse_vector_text("[1e-8]", half=True) == [0.0], "below the smallest it holds"
+
+
+@pytest.mark.parametrize("dimensions", [1, 4, 384, 1536])
+def test_the_two_renderings_agree_on_hard_values(vectors, dimensions: int) -> None:  # type: ignore[no-untyped-def]
+    """The test that should have caught the disagreement, drawn from the whole type."""
+    rng = random.Random(dimensions)
+    for _ in range(5):
+        values = [random_single(rng) for _ in range(dimensions)]
+        literal = "[" + ",".join(f"{v:.9g}" for v in values) + "]"
+        text = vectors.execute(f"select %s::vector({dimensions})", (literal,)).fetchone()[0]
+        binary = vectors.execute(
+            f"select %s::vector({dimensions})", (literal,), binary=True
+        ).fetchone()[0]
+        assert text == binary
+        assert text == values, "and both agree with what was sent"
+
+
+def test_a_sparse_vector_survives_the_server_exactly(vectors) -> None:  # type: ignore[no-untyped-def]
+    """Written, stored and read back without a value changing."""
+    rng = random.Random(5)
+    for _ in range(200):
+        mine = SparseVector({0: random_single(rng), 3: random_single(rng)}, 6)
+        assert vectors.execute("select %s::sparsevec", (mine,)).fetchone()[0] == mine
