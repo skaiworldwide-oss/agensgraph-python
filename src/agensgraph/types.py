@@ -236,11 +236,28 @@ class Path(Sequence["Vertex | Edge"]):
     def __len__(self) -> int:
         return len(self._vertices) + len(self._edges)
 
-    def __getitem__(self, index: int) -> Vertex | Edge:  # type: ignore[override]
-        return self.elements[index]
+    def __getitem__(self, index: int | slice) -> Any:
+        """One element, or a slice of them.
+
+        An even position is a vertex and an odd one the edge after it, so one element is reached
+        by arithmetic and nothing is built to reach it.
+        """
+        if isinstance(index, slice):
+            return self.elements[index]
+        total = len(self)
+        if index < 0:
+            index += total
+        if not 0 <= index < total:
+            raise IndexError("path index out of range")
+        half, odd = divmod(index, 2)
+        return self._edges[half] if odd else self._vertices[half]
 
     def __iter__(self) -> Iterator[Vertex | Edge]:
-        return iter(self.elements)
+        edges = self._edges
+        for position, vertex in enumerate(self._vertices):
+            yield vertex
+            if position < len(edges):
+                yield edges[position]
 
     def __eq__(self, other: object) -> bool:
         if isinstance(other, Path):

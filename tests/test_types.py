@@ -140,6 +140,48 @@ class TestPath:
         assert p[0].id == GraphId(5, 1)
         assert len(list(p)) == 3
 
+    def test_indexing_agrees_with_iterating(self):
+        p = Path(tuple(v(locid=i) for i in range(5)), tuple(e(locid=i) for i in range(4)))
+        assert [p[i] for i in range(len(p))] == list(p)
+        assert list(p) == list(p.elements)
+
+    def test_a_negative_index_counts_from_the_end(self):
+        p = Path((v(locid=1), v(locid=2)), (e(locid=1),))
+        assert p[-1] is p.vertices[-1]
+        assert p[-2] is p.edges[-1]
+        assert p[-3] is p.vertices[0]
+
+    def test_a_slice_gives_the_elements_in_order(self):
+        p = Path(tuple(v(locid=i) for i in range(4)), tuple(e(locid=i) for i in range(3)))
+        assert list(p[1:4]) == [p[1], p[2], p[3]]
+        assert list(p[::2]) == list(p.vertices)
+
+    @pytest.mark.parametrize("index", [7, 8, -8, -99])
+    def test_an_index_past_the_end_is_refused(self, index):
+        p = Path((v(locid=1), v(locid=2)), (e(),))
+        with pytest.raises(IndexError):
+            p[index]
+
+    def test_reaching_one_element_does_not_walk_the_path(self):
+        """Indexing was rebuilding the interleaved tuple each time, so a walk by index was
+        quadratic. The cost of one lookup must not grow with the length of the path."""
+        import time
+
+        def walk(hops):
+            path = Path(
+                tuple(v(locid=i) for i in range(hops + 1)),
+                tuple(e(locid=i) for i in range(hops)),
+            )
+            best = float("inf")
+            for _ in range(3):
+                started = time.perf_counter()
+                for i in range(len(path)):
+                    path[i]
+                best = min(best, time.perf_counter() - started)
+            return best / len(path)
+
+        assert walk(1600) < walk(100) * 4, "the cost of one lookup grows with the path"
+
     def test_mismatched_counts_are_rejected(self):
         with pytest.raises(ValueError):
             Path((v(),), (e(), e()))

@@ -80,12 +80,33 @@ def _is_json(buf: bytes) -> bool:
     return True
 
 
+def _id_pair(buf: bytes) -> tuple[int, int] | None:
+    """``labid.locid`` as two numbers, or ``None`` if it is not that shape."""
+    labid, dot, locid = buf.partition(b".")
+    if not dot or not labid.isdigit() or not locid.isdigit():
+        return None
+    return int(labid), int(locid)
+
+
 def parse_vertex(buf: bytes) -> VertexParts:
     """Split ``label[labid.locid]{properties}`` into its parts.
 
     The property map is returned as the raw slice so that a caller which never reads
     it never pays to decode it.
+
+    A label holding a bracket sends this to the search below, which tries every id group in
+    turn. A label holding none -- which is almost all of them -- is cut by finding the first
+    bracket pair.
     """
+    first = buf.find(b"[")
+    close = buf.find(b"]", first + 1)
+    if first > 0 and close > 0 and buf.startswith(b"{", close + 1):
+        pair = _id_pair(buf[first + 1 : close])
+        if pair is not None:
+            rest = buf[close + 1 :]
+            if _is_json(rest):
+                return VertexParts(buf[:first], pair[0], pair[1], rest)
+
     for m in _ELEM_ID.finditer(buf):
         label = buf[: m.start()]
         rest = buf[m.end() :]
@@ -98,7 +119,34 @@ def parse_vertex(buf: bytes) -> VertexParts:
 
 
 def parse_edge(buf: bytes) -> EdgeParts:
-    """Split ``label[labid.locid][start,end]{properties}`` into its parts."""
+    """Split ``label[labid.locid][start,end]{properties}`` into its parts.
+
+    Cut by finding the two bracket pairs, as :func:`parse_vertex` does, and searched for when
+    the label holds a bracket of its own.
+    """
+    first = buf.find(b"[")
+    close = buf.find(b"]", first + 1)
+    if first > 0 and close > 0 and buf.startswith(b"[", close + 1):
+        second = buf.find(b"]", close + 2)
+        if second > 0 and buf.startswith(b"{", second + 1):
+            ident = _id_pair(buf[first + 1 : close])
+            start, comma, end = buf[close + 2 : second].partition(b",")
+            if ident is not None and comma:
+                head, tail = _id_pair(start), _id_pair(end)
+                if head is not None and tail is not None:
+                    props = buf[second + 1 :]
+                    if _is_json(props):
+                        return EdgeParts(
+                            buf[:first],
+                            ident[0],
+                            ident[1],
+                            head[0],
+                            head[1],
+                            tail[0],
+                            tail[1],
+                            props,
+                        )
+
     for m in _ELEM_ID.finditer(buf):
         label = buf[: m.start()]
         if not label:
