@@ -65,6 +65,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
 __all__ = [
+    "STRING_TYPE_HINT",
     "CapabilityError",
     "ConfigurationError",
     "DataError",
@@ -85,6 +86,7 @@ __all__ = [
     "Warning",
     "attach_query",
     "attach_retry_history",
+    "explain_string_type",
     "from_os_error",
     "is_retryable",
     "mask_dsn",
@@ -414,6 +416,35 @@ def translate(exc: BaseException) -> _pg.Error | None:
         )
 
     return None
+
+
+# Reported when a string reached a position that wanted another type: no operator exists for
+# the pair, or a column of one type was given an expression of another.
+_WRONG_TYPE = frozenset({"42883", "42804"})
+
+STRING_TYPE_HINT = (
+    "this driver sends a string as text rather than leaving its type to be worked out, so "
+    "that looking a property up by name reads the string as a string. In plain SQL a string "
+    "standing for another type wants a cast -- %s::date, %s::uuid, %s::int -- or pass the "
+    "value's own type, or wrap it in agensgraph.Unspecified to have the server work the type "
+    "out as it did before."
+)
+
+
+def explain_string_type(exc: BaseException) -> str | None:
+    """Advice for a failure that a string's declared type caused, or ``None``.
+
+    Kept apart from :func:`translate`, which replaces an exception. Nothing is wrong with the
+    class or the code here -- the server is right that there is no ``date = text`` operator --
+    so what is added is the one thing the message cannot know, which is why the parameter was
+    text in the first place. That is advice for a person rather than data a caller matches on,
+    which is what a note is for.
+    """
+    if not isinstance(exc, _pg.Error) or exc.sqlstate not in _WRONG_TYPE:
+        return None
+    if " text" not in str(exc):
+        return None
+    return STRING_TYPE_HINT
 
 
 def attach_query(exc: BaseException, *, statement: str | None, params: object = None) -> None:

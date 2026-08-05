@@ -14,16 +14,40 @@ the label id itself, and that means a cache belonging to one connection. Text lo
 therefore registered on a map shared by the whole process, and binary loaders are built per
 connection around the cache they will ask.
 
-Two things are sent. A graph id, for asking about identity. And a mapping, because almost
-every parameter a Cypher statement takes is read as jsonb and psycopg cannot adapt a bare
-``dict`` at all, so a property map would otherwise have to be wrapped by hand at every call
-site that writes one.
+Three kinds of value are sent, and the interesting one is a string.
 
-A ``list`` is deliberately left alone. psycopg sends one as a PostgreSQL array, which is what
-it should be in the plain SQL a graph connection is still expected to run; a list meant as a
-JSON array is wrapped, and says so. A ``str`` is left alone for the same reason, which is the
-one sharp edge here: a string compared against a property has to be wrapped as well, because
-the server reads the parameter as jsonb and a bare word is not JSON.
+**A string says that it is text.** psycopg leaves a ``str``'s type unspecified, so that one
+string can stand for whatever type the server infers from where it sits. For Cypher that
+inference is the wrong one, and quietly so. The parser has two arms for coercing an expression
+to jsonb and which it takes depends on whether the parameter arrived typed: an *unspecified*
+one is relabelled jsonb and its bytes handed to jsonb's input function, which **parses** them,
+so ``'123'`` arrives as the number 123, ``'null'`` as a JSON null, and ``'Arthur'`` as a parse
+error. A *typed* one goes through ``cypher_to_jsonb``, whose purpose is converting a value
+whose type is known, and which keeps a string a string -- a text value holding ``[9,9]`` holds
+those six characters, not a list. Saying the type reaches the second arm, so looking a property
+up by name works with the string the caller already has.
+
+That is a correctness fix and not a convenience. Left unspecified, a search for a value that
+happens to read as JSON -- an order number, a postcode, a version -- matched nothing and raised
+nothing.
+
+The inference is given up in the one place it was doing useful work: a string passed where the
+type is not text-like no longer resolves, and says so while the statement is being parsed,
+naming both types. ``where d = %s`` with a string wants ``%s::date``, which is psycopg's own
+idiom. Passing the value's real type -- a ``date``, a ``UUID``, an ``int`` -- is untouched, as
+is every text, varchar and name position, and :class:`Unspecified` gives the old behaviour back
+for a single value. Nothing about the plan changes: ``cypher_to_jsonb`` is immutable, so it
+folds into the same constant the jsonb form would have been, and the index condition is
+identical.
+
+**A mapping is sent as jsonb**, because psycopg cannot adapt a bare ``dict`` at all and nearly
+every parameter a Cypher statement takes is read as jsonb.
+
+**A graph id is sent as itself**, for asking about identity.
+
+A ``list`` is deliberately left as a PostgreSQL array, which is what it should be in the plain
+SQL a graph connection is still expected to run. A list meant as a JSON array is wrapped, and
+says so.
 """
 
 from __future__ import annotations
@@ -34,6 +58,7 @@ from psycopg import postgres, pq
 from psycopg.adapt import AdaptersMap, Dumper, Loader
 from psycopg.types import TypeInfo
 from psycopg.types.json import JsonbBinaryDumper, JsonbDumper
+from psycopg.types.string import StrBinaryDumper, StrDumper
 
 from ._protocol import decode
 from ._protocol.graphid import GraphId, pack, parse_text
@@ -47,6 +72,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "OIDS",
+    "Unspecified",
     "assert_oids",
     "graph_adapters",
     "register_binary",
@@ -154,6 +180,37 @@ class EdgeArrayLoader(Loader):
         return decode.edges_from_text(_decode_bytes(data))
 
 
+class Unspecified(str):
+    """A string whose type is left for the server to infer, as psycopg does by default.
+
+    Wanted where the inference was doing the work: a string standing for a date, a uuid or a
+    number in plain SQL, without a cast written next to it.
+
+    ::
+
+        conn.execute("select 1 where d = %s", (Unspecified("2026-08-05"),))
+
+    Not for a Cypher expression. There the inference resolves to jsonb and the string is
+    parsed as JSON, which is the behaviour this type exists to bring back and which a
+    property lookup does not want.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return f"Unspecified({str.__repr__(self)})"
+
+
+class UnspecifiedDumper(Dumper):
+    """Write a string with no type, leaving the server to decide what it is."""
+
+    format = pq.Format.TEXT
+    oid = 0
+
+    def dump(self, obj: str) -> bytes:
+        return obj.encode()
+
+
 class GraphIdDumper(Dumper):
     """Write ``labid.locid``."""
 
@@ -192,6 +249,14 @@ def register_text(context: AdaptContext | AdaptersMap) -> None:
     adapters.register_dumper(GraphId, GraphIdBinaryDumper)
     adapters.register_dumper(dict, JsonbDumper)
     adapters.register_dumper(dict, JsonbBinaryDumper)
+    # Saying a string is text is what reaches the server's own text-to-jsonb conversion
+    # rather than jsonb's parser. psycopg ships these two for exactly this: its own note on
+    # StrDumper is that it is for "where the unknown oid is ambiguous and the text oid is
+    # required". The last dumper registered is the one an ordinary placeholder uses, so this
+    # displaces the unspecified-oid default without touching psycopg's global map.
+    adapters.register_dumper(str, StrDumper)
+    adapters.register_dumper(str, StrBinaryDumper)
+    adapters.register_dumper(Unspecified, UnspecifiedDumper)
 
 
 def register_binary(context: AdaptContext, labels: LabelCache) -> None:

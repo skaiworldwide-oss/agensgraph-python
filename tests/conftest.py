@@ -36,6 +36,28 @@ def dsn() -> str:
 
 
 @pytest.fixture
+def agens(dsn: str) -> Iterator[object]:
+    """A driver connection, on its own scratch graph, with the graph already selected.
+
+    Distinct from :func:`conn`, which is a plain psycopg connection with the graph loaders
+    registered on it. Both are wanted: this one exercises the driver's own surface, and that
+    one proves the loaders work on a connection the driver did not make.
+    """
+    import agensgraph
+
+    with agensgraph.connect(dsn, autocommit=True) as connection:
+        name = f"a_{os.getpid()}_{id(connection) % 100000}"
+        connection.execute(f'create graph "{name}"')
+        connection.graph(name)
+        try:
+            yield connection
+        finally:
+            connection.rollback()
+            connection.execute("reset graph_path")
+            connection.execute(f'drop graph "{name}" cascade')
+
+
+@pytest.fixture
 def conn(dsn: str) -> Iterator[object]:
     """A connection with the graph types registered, on its own scratch graph.
 

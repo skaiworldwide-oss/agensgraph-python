@@ -44,9 +44,21 @@ p[0], p[1]    # first vertex, first edge
 p.length      # hop count
 ```
 
-A dynamic label or property key cannot be bound as a parameter, so the driver requires a
-`Label` at any call site that places one into a query. That makes an unquoted
-interpolation impossible to write by accident.
+A label or a property key cannot be bound as a parameter — the grammar has no place for one
+there — so a statement naming one dynamically has to carry it in its text. `agensgraph.cypher`
+is where that quoting lives:
+
+```python
+from agensgraph.cypher import quote_identifier
+
+quote_identifier("Person")      # 'Person'
+quote_identifier("my label")    # '"my label"'
+quote_identifier('a"b')         # '"a""b"'
+quote_identifier("MATCH")       # '"MATCH"'
+```
+
+A name holding a null byte is refused rather than quoted, because the server's lexer stops at
+one and the statement would end somewhere other than where it appears to.
 
 ## Connecting
 
@@ -80,16 +92,40 @@ The name is quoted rather than bound, because the grammar has no place for a par
 
 ## Parameters
 
-Parameters are psycopg's — `%s`, or `%(name)s`, never string formatting. What differs is the
-type the server reads them as. Almost every position in a Cypher statement is read as `jsonb`,
-so:
+Parameters are psycopg's — `%s`, or `%(name)s`, never string formatting. Pass plain Python
+values:
 
-| you pass | works | why |
-|---|---|---|
-| `1`, `2.5`, `True`, `None` | yes | the literal the server receives is already valid JSON |
-| `{"name": "a"}` | yes | the driver registers a dumper for a mapping, which psycopg has none for |
-| `"a"` | **no** | a bare word is not JSON; wrap it as `agensgraph.Jsonb("a")` |
-| `["a", "b"]` | as an array | a list stays a PostgreSQL array, for the SQL a graph connection still runs; wrap it as `Jsonb([...])` for a JSON one |
+```python
+conn.execute_query("MATCH (n:Person) WHERE n.name = %s RETURN n", ("Arthur",))
+conn.execute_query("MATCH (n:Person) RETURN n LIMIT %s", (10,))
+conn.execute_query("CREATE (:Person %s)", ({"name": "Arthur", "age": 42},))
+conn.execute_query("MATCH (n) WHERE id(n) = %s RETURN n", (vertex.id,))
+```
+
+A string is sent as `text` rather than with its type left for the server to work out. That
+matters more than it sounds. Cypher reads almost every parameter as `jsonb`, and an untyped
+one is handed straight to jsonb's parser — so `"123"` would arrive as the *number* 123,
+`"null"` as a JSON null, and a search for either would quietly match nothing. Saying the type
+reaches the server's own `cypher_to_jsonb` conversion instead, which keeps a string a string.
+
+The price is one thing: in plain SQL, a string standing in for some other type now wants a
+cast, because the server no longer guesses.
+
+```python
+conn.execute("select * from t where d = %s::date", ("2026-08-05",))   # cast
+conn.execute("select * from t where d = %s", (date(2026, 8, 5),))     # or the real type
+conn.execute("select * from t where d = %s",
+             (agensgraph.Unspecified("2026-08-05"),))                 # or opt back out
+```
+
+Passing the value's own type — `date`, `UUID`, `int`, `Decimal`, `bytes` — behaves exactly as
+psycopg does, as do all `text`, `varchar` and `name` positions. When a cast is missing the
+server says so while parsing, naming both types, and the driver attaches a note pointing at
+the fix. This is what the PostgreSQL JDBC driver does by default, so AgensGraph's own Java
+driver already works this way.
+
+A `list` stays a PostgreSQL array, since plain SQL on the same connection needs it to be one.
+Wrap it as `Jsonb([...])` for a JSON array.
 
 One shape is refused before it is sent:
 
@@ -187,7 +223,7 @@ uv run ruff check
 The test suite runs against no server. Tests that need a live AgensGraph carry the
 `server` marker and read their connection string from `AGENSGRAPH_TEST_DSN`.
 
-## Versions
+## Relationship to 1.x
 
-`2.0` is a rewrite on psycopg 3 and shares no API with the `1.x` releases, which were a
-type-extension module for psycopg2. `1.x` remains available on the `v1.0.2` tag.
+`2.0` is a rewrite and shares no API with the `1.x` releases, which were a type-extension
+module for psycopg2. `1.x` remains available on the `v1.0.2` tag.

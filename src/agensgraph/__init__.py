@@ -8,6 +8,7 @@ from . import errors as errors
 from ._core import Result as Result
 from ._protocol.graphid import LABID_MAX as LABID_MAX
 from ._protocol.graphid import LOCID_MAX as LOCID_MAX
+from .adapters import Unspecified as Unspecified
 from .capabilities import MINIMUM_VERSION as MINIMUM_VERSION
 from .capabilities import Capabilities as Capabilities
 from .connection import Connection as Connection
@@ -37,6 +38,7 @@ __all__ = [
     "Path",
     "Result",
     "Retryability",
+    "Unspecified",
     "Vertex",
     "connect",
     "errors",

@@ -20,7 +20,7 @@ from ._protocol.labels import LabelCache
 from .adapters import graph_adapters, register_binary
 from .capabilities import Capabilities
 from .cypher import check_bindable_positions, quote_identifier
-from .errors import translate
+from .errors import explain_string_type, translate
 from .summary import GraphWriteCounts
 
 if TYPE_CHECKING:
@@ -156,8 +156,16 @@ class GraphMixin:
 
     @staticmethod
     def _translated(exc: BaseException) -> BaseException:
-        """A failure the server described badly, described properly, or the failure itself."""
-        return translate(exc) or exc
+        """A failure the server described badly, described properly, or the failure itself.
+
+        A failure caused by a string's declared type also picks up a note saying why the
+        parameter was text, which is the one thing the server's own message cannot know.
+        """
+        replacement = translate(exc) or exc
+        hint = explain_string_type(replacement)
+        if hint is not None:
+            replacement.add_note(hint)
+        return replacement
 
 
 Statement = Union[str, bytes, "SQL", "Composed"]

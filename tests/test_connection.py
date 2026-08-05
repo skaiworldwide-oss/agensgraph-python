@@ -100,19 +100,16 @@ class TestExecuteQuery:
         )
 
     def test_a_parameter(self, conn) -> None:  # type: ignore[no-untyped-def]
-        """A string compared against a property is wrapped, because the server reads the
-        parameter as jsonb and a bare word is not JSON."""
+        """A plain string, because the driver says a string is text."""
+        result = conn.execute_query("match (n:person) where n.name = %s return n", ("a",))
+        assert len(result.records) == 1
+
+    def test_a_wrapped_parameter_still_works(self, conn) -> None:  # type: ignore[no-untyped-def]
+        """Anyone who wrapped one before should not have to stop."""
         result = conn.execute_query(
             "match (n:person) where n.name = %s return n", (agensgraph.Jsonb("a"),)
         )
         assert len(result.records) == 1
-
-    def test_a_bare_string_parameter_says_what_is_wrong(self, conn) -> None:  # type: ignore[no-untyped-def]
-        """It is refused by the server rather than matching nothing, which is the good case."""
-        import psycopg
-
-        with pytest.raises(psycopg.errors.InvalidTextRepresentation):
-            conn.execute_query("match (n:person) where n.name = %s return n", ("a",))
 
     def test_a_number_needs_no_wrapping(self, conn) -> None:  # type: ignore[no-untyped-def]
         conn.execute_query("match (n:person {name: 'a'}) set n.n = 1")
