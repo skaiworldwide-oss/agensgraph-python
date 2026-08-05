@@ -125,14 +125,55 @@ def test_truncated_element_list_is_rejected():
             textfmt.split_elements(bad)
 
 
-def test_fallback_is_counted_when_the_guess_does_not_hold():
-    """The cheap boundary search is an accelerator, so its misses have to be visible."""
-    textfmt.reset_fallback_count()
-    decode.path_from_text(b"[n[7.3]{},r[5.7][7.3,7.9]{},n[7.9]{}]")
-    assert textfmt.fallback_count() == 0
-
-    textfmt.reset_fallback_count()
+def test_a_boundary_inside_a_property_string_does_not_split():
+    """The close of a map, a comma and a label-shaped run, all inside one string value."""
     p = decode.path_from_text(b'[v[5.1]{"a": "},Company[1.1]{"},e[6.1][5.1,5.5]{},v[5.5]{}]')
     assert len(p.vertices) == 2
     assert p.vertices[0].properties == {"a": "},Company[1.1]{"}
-    assert textfmt.fallback_count() == 1
+
+
+@pytest.mark.parametrize(
+    ("buf", "labels", "ids"),
+    [
+        # A property value holding whole elements, beside a label holding a comma.
+        (
+            b'[a[3.1]{"v": "[5.5]{},B[7.7]{},C[9.9]{}"},a,b[4.1]{}]',
+            ["a", "a,b"],
+            ["3.1", "4.1"],
+        ),
+        # The same, where the run inside the string does not close its own brace.
+        (
+            b'[a[3.1]{"v": "[5.5]{},B[7.7]{"},a,b[4.1]{}]',
+            ["a", "a,b"],
+            ["3.1", "4.1"],
+        ),
+        (b'[a[3.1]{"v": "x[1.1]{}"},plain[4.1]{}]', ["a", "plain"], ["3.1", "4.1"]),
+    ],
+)
+def test_a_property_value_cannot_fabricate_elements(buf, labels, ids):
+    """Reading one of these as several invents both labels and identities."""
+    vertices = decode.vertices_from_text(buf)
+    assert [v.label for v in vertices] == labels
+    assert [str(v.id) for v in vertices] == ids
+
+
+def test_the_map_is_not_decoded_until_it_is_read():
+    """A boundary check asks whether the map is JSON, not what it holds."""
+    from agensgraph import numbers
+
+    calls = 0
+    real = numbers._decode
+
+    def counting(data):
+        nonlocal calls
+        calls += 1
+        return real(data)
+
+    numbers._decode = counting
+    try:
+        v = decode.vertex_from_text(b'a[3.1]{"k": 1, "s": "text"}')
+        assert calls == 0
+        assert v.properties == {"k": 1, "s": "text"}
+        assert calls == 1
+    finally:
+        numbers._decode = real

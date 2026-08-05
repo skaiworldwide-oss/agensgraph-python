@@ -90,6 +90,9 @@ ELEMENT_ARRAYS: list[tuple[bytes, int]] = [
     (b"[v[5.1]{},NULL]", 2),
     (b'[v[5.1]{"id": 0},v[5.5]{"id": 4}]', 2),
     (b"[r[5.7][7.3,7.9]{},r[5.8][7.9,7.3]{}]", 2),
+    (b'[a[3.1]{"v": "[5.5]{},B[7.7]{},C[9.9]{}"},a,b[4.1]{}]', 2),
+    (b'[a[3.1]{"v": "[5.5]{},B[7.7]{"},a,b[4.1]{}]', 2),
+    (b'[v[5.1]{"v": "x[1.1]{}"},NULL,v[5.2]{}]', 3),
 ]
 
 # Text that must be rejected rather than quietly turned into something plausible.

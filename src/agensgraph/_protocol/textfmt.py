@@ -9,16 +9,18 @@ The server renders graph values like this::
     empty path  []
     null slot   NULL
 
-Two properties of that format shape everything here. Label names are written with no
-escaping at all, so a label may legally contain any of ``[ ] { } , "``. And the
-property map is JSON, so its string values may contain those same characters. Neither
-the label nor the map can therefore be located by searching for a delimiter alone.
+A label is written with no escaping, so it may hold any of ``[ ] { } , "``, and a
+property map is JSON, so its string values may hold the same characters.
 
-The way through is that a property map has to be decoded anyway, so a decode failure
-is a free correctness check on a guessed boundary. Every function here guesses with a
-cheap C-level search, validates by decoding, and falls back to a scanner that tracks
-brace depth and string state when the guess does not hold. The fallback is counted so
-that a workload paying for it constantly is visible rather than merely slow.
+An element taken alone has more than one reading: ``a[3.1]{"v": "[5.5]{}`` is a label
+of ``a`` with an unterminated map, and a label of ``a[3.1]{"v": "`` with a map of
+``{}``. So an element list is measured from its start -- each element read from a known
+position, its end computed, and the character after it required to be a comma or the
+end of the list.
+
+A map ends at the first ``}`` that is followed by a comma or the end of the buffer and
+that leaves a complete JSON object behind it. The check is ``msgspec`` against ``Raw``,
+which validates without building, so a map nobody reads is never decoded.
 """
 
 from __future__ import annotations
@@ -28,42 +30,23 @@ from typing import NamedTuple
 
 import msgspec
 
-from ..numbers import decode_json
-
 __all__ = [
     "NULL_ELEMENT",
     "EdgeParts",
     "VertexParts",
-    "fallback_count",
     "parse_edge",
     "parse_vertex",
-    "reset_fallback_count",
     "split_elements",
 ]
 
 NULL_ELEMENT = b"NULL"
 """What the server writes where an element is null."""
 
-_decode_json = decode_json
 _ELEM_ID = re.compile(rb"\[(\d+)\.(\d+)\]")
 
-# A boundary between two elements of a path or an element array: the close of one
-# property map, a comma, then the start of the next element's label. Labels can
-# defeat this, which is why every use is validated by decoding.
-_ELEM_BOUNDARY = re.compile(rb"\},(?=(?:[^\[\]{},\"]*\[\d+\.\d+\]|NULL(?:,|$)))")
-
-_fallbacks = 0
-
-
-def fallback_count() -> int:
-    """How many times a guessed boundary had to be re-derived by scanning."""
-    return _fallbacks
-
-
-def reset_fallback_count() -> None:
-    """Set the fallback counter back to zero."""
-    global _fallbacks
-    _fallbacks = 0
+# Validation only: the result is discarded, so nothing is built from the map. What a
+# caller reads later comes from decode_json, which honours the exact-numbers setting.
+_validate_json = msgspec.json.Decoder(type=msgspec.Raw).decode
 
 
 class VertexParts(NamedTuple):
@@ -88,9 +71,10 @@ class EdgeParts(NamedTuple):
     properties: bytes
 
 
-def _is_decodable(buf: bytes) -> bool:
+def _is_json(buf: bytes) -> bool:
+    """Whether the whole of *buf* is one complete JSON value."""
     try:
-        _decode_json(buf)
+        _validate_json(buf)
     except msgspec.DecodeError:
         return False
     return True
@@ -107,7 +91,7 @@ def parse_vertex(buf: bytes) -> VertexParts:
         rest = buf[m.end() :]
         if not label or not rest.startswith(b"{"):
             continue
-        if not _is_decodable(rest):
+        if not _is_json(rest):
             continue
         return VertexParts(label, int(m.group(1)), int(m.group(2)), rest)
     raise ValueError(f"not a vertex: {buf[:80]!r}")
@@ -124,7 +108,7 @@ def parse_edge(buf: bytes) -> EdgeParts:
         if ends is None:
             continue
         props = rest[ends.end() :]
-        if not props.startswith(b"{") or not _is_decodable(props):
+        if not props.startswith(b"{") or not _is_json(props):
             continue
         return EdgeParts(
             label,
@@ -154,54 +138,16 @@ def split_elements(buf: bytes) -> list[bytes]:
     if not inner:
         return []
 
-    parts = _split_fast(inner)
-    if parts is not None:
-        return parts
-
-    global _fallbacks
-    _fallbacks += 1
     return _split_exact(inner)
-
-
-def _split_fast(inner: bytes) -> list[bytes] | None:
-    """Cut on boundaries found by search, keeping the result only if every piece parses.
-
-    Returns ``None`` when the guess does not hold, which sends the caller to the
-    scanner rather than accepting a wrong split.
-    """
-    cuts = [m.start() + 1 for m in _ELEM_BOUNDARY.finditer(inner)]
-    if not cuts:
-        return [inner] if _element_is_wellformed(inner) else None
-    parts: list[bytes] = []
-    prev = 0
-    for cut in cuts:
-        parts.append(inner[prev:cut])
-        prev = cut + 1
-    parts.append(inner[prev:])
-    if all(_element_is_wellformed(p) for p in parts):
-        return parts
-    return None
-
-
-def _element_is_wellformed(part: bytes) -> bool:
-    if part == NULL_ELEMENT:
-        return True
-    return _scan_element(part, 0) == len(part)
 
 
 def _split_exact(inner: bytes) -> list[bytes]:
     """Cut by measuring each element in turn.
 
-    Tracking brace depth across the whole list cannot work, because a label may contain
-    a brace and the depth would never return to zero. Nor can it split on commas at
-    depth zero, because a label may contain a comma.
-
-    What is reliable is that an element has a rigid interior: an id group written as
-    ``[digits.digits]``, for an edge a second bracketed group of two ids, and then a
-    JSON object whose extent can be measured exactly. So each element is parsed from a
-    known start, its end computed, and the character that follows required to be a
-    comma or the end of the list. Alignment is therefore verified at every step rather
-    than assumed.
+    An element has a rigid interior: an id group written as ``[digits.digits]``, for an
+    edge a second bracketed group of two ids, then a JSON object. Each element is read
+    from a known start, its end computed, and the character that follows required to be
+    a comma or the end of the list.
     """
     parts: list[bytes] = []
     pos = 0
@@ -244,43 +190,28 @@ def _scan_element(buf: bytes, pos: int) -> int:
         if ends is not None:
             rest = ends.end()
         if rest < len(buf) and buf[rest] == 0x7B:  # {
-            stop = _scan_json_object(buf, rest)
-            if stop > 0 and (stop == len(buf) or buf[stop] == 0x2C):
+            stop = _map_end(buf, rest)
+            if stop > 0:
                 return stop
         search = m.start() + 1
 
 
-def _scan_json_object(buf: bytes, start: int) -> int:
-    """Measure the JSON object beginning at *start*, returning the offset just past it.
+def _map_end(buf: bytes, start: int) -> int:
+    """Measure the property map beginning at *start*, returning the offset just past it.
 
-    Inside JSON the syntax is unambiguous, so brace depth is meaningful here even
-    though it is not across a whole element list. Quoted strings are skipped and
-    backslash escapes honoured, so a brace or a quote inside a string value does not
-    move the depth.
+    The map is the last thing in an element, so it closes at a ``}`` followed by a comma
+    or the end of the buffer. Each such ``}`` is tried in turn; the first that leaves a
+    complete JSON object behind it is the end.
 
-    Returns -1 if the object does not close.
+    Returns -1 when no complete object ends where one could.
     """
-    depth = 0
-    in_string = False
-    escaped = False
-    for pos in range(start, len(buf)):
-        ch = buf[pos]
-        if in_string:
-            if escaped:
-                escaped = False
-            elif ch == 0x5C:  # backslash
-                escaped = True
-            elif ch == 0x22:  # quote
-                in_string = False
-            continue
-        if ch == 0x22:  # quote
-            in_string = True
-        elif ch == 0x7B:  # {
-            depth += 1
-        elif ch == 0x7D:  # }
-            depth -= 1
-            if depth == 0:
-                return pos + 1
-            if depth < 0:
-                return -1
-    return -1
+    end = len(buf)
+    pos = start
+    while True:
+        close = buf.find(b"}", pos)
+        if close < 0:
+            return -1
+        after = close + 1
+        if (after == end or buf[after] == 0x2C) and _is_json(buf[start:after]):
+            return after
+        pos = after
