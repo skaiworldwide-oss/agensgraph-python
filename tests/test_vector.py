@@ -24,6 +24,7 @@ from agensgraph.vector import (
     generated_column,
     nearest,
     parse_vector_text,
+    search_option_statements,
     vector_index,
 )
 
@@ -879,3 +880,87 @@ class TestVectorIsLazyAndStillBehavesLikeASequence:
         assert text == binary
         assert text == values
         assert text.tolist() == binary.tolist()
+
+
+class TestTuningASearch:
+    """The seven settings a vector search takes, and refusing anything that is not one of them."""
+
+    def test_a_whole_number_setting(self) -> None:
+        assert search_option_statements({"hnsw.ef_search": 100}) == [
+            "set local hnsw.ef_search = 100"
+        ]
+
+    def test_a_real_setting(self) -> None:
+        assert search_option_statements({"hnsw.scan_mem_multiplier": 2.5}) == [
+            "set local hnsw.scan_mem_multiplier = 2.5"
+        ]
+
+    def test_an_enumerated_setting_is_quoted(self) -> None:
+        assert search_option_statements({"hnsw.iterative_scan": "relaxed_order"}) == [
+            "set local hnsw.iterative_scan = 'relaxed_order'"
+        ]
+
+    def test_it_is_local_to_the_transaction_unless_asked_otherwise(self) -> None:
+        assert search_option_statements({"ivfflat.probes": 10}, local=False) == [
+            "set ivfflat.probes = 10"
+        ]
+
+    def test_every_documented_setting_is_accepted(self) -> None:
+        from agensgraph.vector import SEARCH_OPTIONS
+
+        for name, kind in SEARCH_OPTIONS.items():
+            value: object = 1 if kind is not str else "on"
+            assert search_option_statements({name: value})
+
+    def test_a_name_that_is_not_one_of_them_is_refused(self) -> None:
+        """The server takes an unknown ``hnsw.`` name without complaint, so a typo would look as
+        though it had been applied."""
+        with pytest.raises(ValueError, match="not a vector search option"):
+            search_option_statements({"hnsw.ef_serach": 100})
+
+    def test_a_setting_given_the_wrong_kind_of_value_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="takes a whole number"):
+            search_option_statements({"hnsw.ef_search": "lots"})
+
+    def test_the_server_accepts_them_and_a_search_still_answers(self, vectors) -> None:  # type: ignore[no-untyped-def]
+        vectors.execute(vector_index("loose", "v", dimensions=4))
+        vectors.execute("create (:loose {v: [1,2,3,4]})")
+        vectors.vector_search_options(
+            {"hnsw.ef_search": 100, "hnsw.iterative_scan": "relaxed_order"}
+        )
+        result = vectors.execute_query(
+            nearest("loose", "v", dimensions=4, limit=1), ("[1,2,3,4]",)
+        )
+        assert len(result.records) == 1
+
+    def test_an_unknown_name_never_reaches_the_server(self, vectors) -> None:  # type: ignore[no-untyped-def]
+        with pytest.raises(ValueError, match="not a vector search option"):
+            vectors.vector_search_options({"hnsw.nonsense": 1})
+
+
+class TestBinaryQuantisation:
+    """Reachable from Cypher as a function, and no further: the cast it needs is not Cypher's."""
+
+    def test_the_function_runs_and_returns_a_bit_string(self, vectors) -> None:  # type: ignore[no-untyped-def]
+        vectors.execute("create (:loose {v: [1,-2,3,-4]})")
+        (value,) = vectors.execute_query(
+            "match (n:loose) return binary_quantize(n.v::vector(4))"
+        ).records[0]
+        assert value == "1010"
+
+    def test_but_the_bit_cast_is_not_something_cypher_can_spell(self, vectors) -> None:  # type: ignore[no-untyped-def]
+        """So the hamming and jaccard operators need plain SQL against the label's table."""
+        vectors.execute("create (:loose {v: [1,2,3,4]})")
+        with pytest.raises(agensgraph.errors.Error):
+            vectors.execute("match (n:loose) return binary_quantize(n.v::vector(4))::bit(4)")
+
+    def test_and_it_works_in_sql_on_the_same_data(self, vectors) -> None:  # type: ignore[no-untyped-def]
+        graph = vectors.label_table.graph
+        vectors.execute("create (:loose {v: [1,-2,3,-4]})")
+        (distance,) = vectors.execute(
+            f"select binary_quantize((properties->>%s)::vector(4))::bit(4) "
+            f"<~> binary_quantize('[1,-2,3,-4]'::vector(4))::bit(4) "
+            f'from "{graph}".loose limit 1',
+            ("v",),
+        ).fetchone()
+        assert distance == 0.0

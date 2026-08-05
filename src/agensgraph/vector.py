@@ -54,6 +54,7 @@ if TYPE_CHECKING:
     from psycopg.types import TypeInfo
 
 __all__ = [
+    "SEARCH_OPTIONS",
     "TYPES",
     "Distance",
     "SparseVector",
@@ -63,6 +64,7 @@ __all__ = [
     "generated_column",
     "nearest",
     "parse_vector_text",
+    "search_option_statements",
     "vector_index",
 ]
 
@@ -419,6 +421,51 @@ def generated_column(name: str, dimensions: int, *, type: str = "vector") -> str
     if type not in TYPES:
         raise ValueError(f"expected one of {TYPES}, got {type!r}")
     return f"{name} {type}({dimensions}) generated"
+
+
+SEARCH_OPTIONS: Mapping[str, type] = {
+    "hnsw.ef_search": int,
+    "hnsw.iterative_scan": str,
+    "hnsw.max_scan_tuples": int,
+    "hnsw.scan_mem_multiplier": float,
+    "ivfflat.probes": int,
+    "ivfflat.iterative_scan": str,
+    "ivfflat.max_probes": int,
+}
+"""What a search can be tuned with, and the type each one takes.
+
+Defaults on pgvector 0.8.5: ``ef_search`` 40, ``max_scan_tuples`` 20000, ``scan_mem_multiplier`` 1,
+``probes`` 1, ``max_probes`` 32768, and both ``iterative_scan`` settings off. They do not appear in
+``pg_settings`` until the extension's library is loaded, which the first vector operation in a session
+does.
+"""
+
+
+def search_option_statements(options: Mapping[str, object], *, local: bool = True) -> list[str]:
+    """Statements that set what a vector search may be tuned with.
+
+    ``local`` keeps each setting to the current transaction, so it reverts on commit rather than
+    outliving the search it was meant for. Pass ``False`` to set them for the session.
+
+    A name that is not one of :data:`SEARCH_OPTIONS` is refused rather than sent, since the server
+    accepts an unknown ``hnsw.`` name silently -- an extension may define one -- and a typo would
+    then read as having been applied.
+    """
+    statements = []
+    scope = "local " if local else ""
+    for name, value in options.items():
+        wanted = SEARCH_OPTIONS.get(name)
+        if wanted is None:
+            raise ValueError(
+                f"not a vector search option: {name!r}. One of {sorted(SEARCH_OPTIONS)}"
+            )
+        if wanted is int and not isinstance(value, int):
+            raise ValueError(f"{name} takes a whole number, got {value!r}")
+        if wanted is float and not isinstance(value, int | float):
+            raise ValueError(f"{name} takes a number, got {value!r}")
+        rendered = value if isinstance(value, int | float) else f"'{value}'"
+        statements.append(f"set {scope}{name} = {rendered}")
+    return statements
 
 
 def _searched_expression(property: str, dimensions: int | None, type: str) -> str:

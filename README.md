@@ -468,6 +468,25 @@ Two more things cost the index silently, both measured, and the second is why `v
 `Distance.operator_class` gives the right class for an operator. `hnsw` and `ivfflat` both work;
 pass `options={"lists": 100}` for the `WITH` clause an ivfflat index wants.
 
+### Tuning a search
+
+```python
+conn.vector_search_options({"hnsw.ef_search": 100})     # the transaction, not the session
+```
+
+Seven settings exist, and `agensgraph.vector.SEARCH_OPTIONS` lists them with the type each takes:
+`hnsw.ef_search` (40), `hnsw.iterative_scan` (off), `hnsw.max_scan_tuples` (20000),
+`hnsw.scan_mem_multiplier` (1), `ivfflat.probes` (1), `ivfflat.iterative_scan` (off),
+`ivfflat.max_probes` (32768). A name that is not one of them is refused before it is sent — the
+server accepts an unknown `hnsw.` name without complaint, so a typo would otherwise look applied.
+
+### Binary quantisation
+
+`binary_quantize()` runs in Cypher and returns a bit string. **The cast it needs does not.** Cypher's
+cast grammar takes `::vector(n)` and `::halfvec(n)`, but `::bit(n)` is a syntax error and there is no
+`cast(… as …)` form — so hamming (`<~>`) and jaccard (`<%>`) search needs plain SQL against the
+label's own table. Both halves are asserted in the suite.
+
 ### Sparse vectors
 
 `sparsevec` gets a value of its own rather than a list, and the reason is size: three non-zero

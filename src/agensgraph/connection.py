@@ -66,6 +66,7 @@ from .summary import (
     CommitOutcome,
     read_outcome,
 )
+from .vector import search_option_statements
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator, Mapping, Sequence
@@ -423,6 +424,19 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
             )
             failure.statements = tuple((statement for statement, _ in sent))
             raise failure from exc
+
+    def vector_search_options(
+        self, options: Mapping[str, object], *, local: bool = True
+    ) -> None:
+        """Tune a vector search, by default for the current transaction only.
+
+        Setting ``hnsw.ef_search`` higher looks at more candidates, and so recalls more of the true
+        nearest neighbours. :data:`agensgraph.vector.SEARCH_OPTIONS` lists
+        what can be set; a name that is not one of them is refused rather than sent, since the server
+        accepts an unknown one silently.
+        """
+        for statement in search_option_statements(options, local=local):
+            self._run(statement)
 
     def listen(self, *channels: str) -> None:
         """Subscribe to channels the server announces on.
