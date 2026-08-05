@@ -241,8 +241,15 @@ def check_bindable_positions(statement: str) -> None:
 
 # A clause that changes something. A statement holding one cannot be read in chunks, because
 # the wrap a server-side cursor needs takes only the read-only subset.
+#
+# Each of these words is also a legal property name, label name and map key. So the word is taken
+# for a clause only where one could stand: not after a dot or a quote or a colon, which is a
+# property read, a quoted name and a label; and not before a colon, which is a key in a map.
+# Missing a write here costs nothing, since the server refuses one from the wrap anyway. Refusing
+# a read that never wrote anything is the mistake worth avoiding.
 _WRITE_CLAUSE = re.compile(
-    r"(?<![A-Za-z0-9_])(create|merge|set|delete|remove|detach)(?![A-Za-z0-9_])", re.IGNORECASE
+    r'(?<![A-Za-z0-9_.":])(create|merge|set|delete|remove|detach)(?![A-Za-z0-9_]|\s*:)',
+    re.IGNORECASE,
 )
 
 WRAP = "select * from ({statement}) as {alias}"

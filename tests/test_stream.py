@@ -200,3 +200,39 @@ class TestTheAwaitingInterface:
         await amany.rollback()
         result = await amany.execute_query("match (n:thing) return count(*)")
         assert result.records
+
+
+class TestAWordThatIsAlsoAPropertyName:
+    """Every write clause is also a legal property name, label and map key."""
+
+    @pytest.mark.parametrize(
+        "statement",
+        [
+            "match (n:doc) return n.set",
+            "match (n:doc) return n.create",
+            "match (n:doc) where n.delete = 1 return n",
+            "match (n:doc) return n.merge, n.remove, n.detach",
+            'match (n:doc) return n."set"',
+            "match (n:set) return n",
+            "match (n) return {set: 1, create: 2}",
+            "match (n:doc) return n.setting",
+        ],
+    )
+    def test_a_read_is_not_refused_for_holding_one(self, statement: str) -> None:
+        check_can_wrap(statement)
+
+    @pytest.mark.parametrize(
+        "statement",
+        [
+            "match (n:doc) set n.a = 1",
+            "create (:doc)",
+            "match (n) detach delete n",
+            "match (n) remove n.a",
+            "merge (n:doc)",
+            "MATCH (n) SET n.a = 1",
+            "match (n) with n set n.a = 1",
+        ],
+    )
+    def test_a_write_still_is(self, statement: str) -> None:
+        with pytest.raises(ValueError, match="cannot be read in chunks"):
+            check_can_wrap(statement)
