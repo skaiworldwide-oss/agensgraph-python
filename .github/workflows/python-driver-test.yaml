@@ -58,6 +58,32 @@ jobs:
       - name: Import time
         run: uv run python -X importtime -c "import agensgraph" 2>&1 | tail -1
 
+  # Atheris ships wheels for cp312 and later on Linux x86_64 and no source distribution, so this
+  # cannot be part of the matrix above.
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install
+        run: |
+          uv sync --group dev --python 3.13
+          uv pip install atheris
+      - name: Fuzz what reads the text rendering
+        run: uv run python tests/fuzz_textfmt.py -atheris_runs=200000 -print_final_stats=1
+      - name: Keep whatever it found
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-findings
+          path: |
+            crash-*
+            timeout-*
+            oom-*
+
   # A declared floor is only a claim until something resolves to it.
   lowest-versions:
     runs-on: ubuntu-latest
