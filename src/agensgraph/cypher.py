@@ -40,7 +40,9 @@ __all__ = [
 _PLACEHOLDER = r"(?:\$\d+|%(?:\([^)]*\))?[sbt])"
 _LENGTH_PARAMETER = re.compile(r"\*\s*(?:\d+\s*)?(?:\.\.\s*)?" + _PLACEHOLDER)
 
-_UNQUOTED_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+# Lower case only: the lexer lowers an unquoted name, so anything holding a capital has to
+# be quoted to reach the server as it was written.
+_UNQUOTED_IDENTIFIER = re.compile(r"[a-z_][a-z0-9_]*\Z")
 
 _RESERVED = frozenset(
     {
@@ -97,9 +99,13 @@ _RESERVED = frozenset(
 def quote_identifier(name: str) -> str:
     """Quote a label or a property key for placing into a statement.
 
-    A name that could not be mistaken for anything else is left bare, which keeps an
-    ordinary statement readable. Everything else is quoted, and a quote inside the name is
-    doubled, which is how the server's own lexer reads one back.
+    A name already in lower case and holding nothing but letters, digits and underscores is
+    left bare. Everything else is quoted, and a quote inside the name is doubled, which is
+    how the server's own lexer reads one back.
+
+    An unquoted name is lowered by the lexer, so ``MixedKey`` left bare reaches the server
+    as ``mixedkey``: it would name a different property from the one written, and two keys
+    differing only in case would become one.
 
     A name holding a null byte is refused rather than quoted. The server's lexer stops at
     one, so quoting it would produce a statement that ends somewhere other than where it

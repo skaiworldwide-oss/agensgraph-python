@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import pytest
 
+import agensgraph
+from agensgraph import DesiredIndex, Unique
 from agensgraph.cypher import (
     check_bindable_positions,
     quote_identifier,
@@ -103,9 +105,14 @@ class TestWithoutLiterals:
 
 
 class TestQuoteIdentifier:
-    @pytest.mark.parametrize("name", ["person", "Person", "_x", "a1", "x_2"])
-    def test_a_plain_name_is_left_plain(self, name: str) -> None:
+    @pytest.mark.parametrize("name", ["person", "_x", "a1", "x_2", "a_very_long_one"])
+    def test_a_lower_case_name_is_left_plain(self, name: str) -> None:
         assert quote_identifier(name) == name
+
+    @pytest.mark.parametrize("name", ["Person", "MixedKey", "UPPER", "aB", "eMail"])
+    def test_a_name_holding_a_capital_is_quoted(self, name: str) -> None:
+        """The lexer lowers an unquoted name, so bare it would reach the server as another."""
+        assert quote_identifier(name) == f'"{name}"'
 
     @pytest.mark.parametrize(
         ("name", "expected"),
@@ -158,3 +165,69 @@ class TestQuoteString:
     def test_a_quote_cannot_escape_the_quoting(self) -> None:
         quoted = quote_string("' or true --")
         assert quoted == "''' or true --'"
+
+
+@pytest.mark.server
+class TestCasePreservationAgainstAServer:
+    """The lexer lowers an unquoted identifier, so what the driver builds has to be quoted."""
+
+    def test_a_label_keeps_the_case_it_was_created_with(self, agens) -> None:  # type: ignore[no-untyped-def]
+        agens.execute(f"create vlabel {quote_identifier('MyLabel')}")
+        agens.refresh_labels()
+        assert "MyLabel" in [label.name for label in agens.labels()]
+
+    def test_two_keys_differing_only_in_case_stay_two(self, agens) -> None:  # type: ignore[no-untyped-def]
+        """Written bare they collapse into one, the later value winning."""
+        agens.execute("create vlabel doc")
+        agens.refresh_labels()
+        agens.execute("create (:doc %s)", ({"MixedKey": "a", "mixedkey": "b"},))
+        (vertex,) = agens.execute_query("match (n:doc) return n").records[0]
+        assert vertex.properties == {"MixedKey": "a", "mixedkey": "b"}
+
+    def test_a_mixed_case_property_reads_back_through_a_built_statement(self, agens) -> None:  # type: ignore[no-untyped-def]
+        agens.execute("create vlabel doc")
+        agens.refresh_labels()
+        agens.execute("create (:doc %s)", ({"MixedKey": "a", "mixedkey": "b"},))
+        key = quote_identifier("MixedKey")
+        (got,) = agens.execute_query(f"match (n:doc) return n.{key}").records[0]
+        assert got == "a"
+
+    def test_a_uniqueness_assertion_on_a_mixed_case_property_is_enforced(self, agens) -> None:  # type: ignore[no-untyped-def]
+        agens.execute("create vlabel doc")
+        agens.refresh_labels()
+        agens.ensure_constraints([Unique("doc", "MixedKey")])
+        agens.execute("create (:doc %s)", ({"MixedKey": "one"},))
+        with pytest.raises(agensgraph.errors.Error):
+            agens.execute("create (:doc %s)", ({"MixedKey": "one"},))
+
+    def test_reconciling_a_mixed_case_name_twice_does_nothing_the_second_time(
+        self, agens
+    ) -> None:  # type: ignore[no-untyped-def]
+        agens.execute("create vlabel doc")
+        agens.refresh_labels()
+        indexes = [DesiredIndex("doc", ("MixedKey",))]
+        assert len(agens.ensure_indexes(indexes)) == 1
+        assert agens.ensure_indexes(indexes) == []
+        constraints = [Unique("doc", "MixedKey")]
+        assert len(agens.ensure_constraints(constraints)) == 1
+        assert agens.ensure_constraints(constraints) == []
+
+    def test_an_identity_map_reads_the_label_and_key_it_was_given(self, agens) -> None:  # type: ignore[no-untyped-def]
+        agens.execute(f"create vlabel {quote_identifier('MyLabel')}")
+        agens.refresh_labels()
+        agens.execute(f"create (:{quote_identifier('MyLabel')} %s)", ({"Tag": "x"},))
+        assert set(agens.identity_map("MyLabel", "Tag")) == {"x"}
+
+    def test_a_channel_holding_a_capital_carries_a_notification(self, agens, dsn: str) -> None:  # type: ignore[no-untyped-def]
+        """``listen`` quotes the channel and ``pg_notify`` takes it as a parameter, so the two
+        have to agree about its case."""
+        seen: list[agensgraph.Notify] = []
+        agens.add_notify_handler(seen.append)
+        agens.listen("MyChannel")
+        with agensgraph.Connection.connect(dsn, autocommit=True) as other:
+            other.notify("MyChannel", "hello")
+        for _ in range(200):
+            agens.execute("select 1")
+            if seen:
+                break
+        assert [(item.channel, item.payload) for item in seen] == [("MyChannel", "hello")]
