@@ -49,7 +49,7 @@ from .deadline import Deadline
 from .errors import StaleGeneration
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Awaitable, Callable
+    from collections.abc import AsyncGenerator, Awaitable, Callable
 
     from psycopg.abc import Params
 
@@ -232,7 +232,7 @@ class AsyncConnectionPool:
     @asynccontextmanager
     async def connection(
         self, *, timeout: float | None = None, deadline: Deadline | None = None
-    ) -> AsyncIterator[AsyncConnection[Any]]:
+    ) -> AsyncGenerator[AsyncConnection[Any]]:
         """Take a connection for the duration of a block.
 
         The wait comes out of *deadline* if one is given, so waiting for a connection is spent

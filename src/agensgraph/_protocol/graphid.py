@@ -91,22 +91,22 @@ class GraphId:
     def __hash__(self) -> int:
         return hash(self._packed)
 
-    def __lt__(self, other: GraphId) -> bool:
+    def __lt__(self, other: object) -> bool:
         if not isinstance(other, GraphId):
             return NotImplemented
         return self._packed < other._packed
 
-    def __le__(self, other: GraphId) -> bool:
+    def __le__(self, other: object) -> bool:
         if not isinstance(other, GraphId):
             return NotImplemented
         return self._packed <= other._packed
 
-    def __gt__(self, other: GraphId) -> bool:
+    def __gt__(self, other: object) -> bool:
         if not isinstance(other, GraphId):
             return NotImplemented
         return self._packed > other._packed
 
-    def __ge__(self, other: GraphId) -> bool:
+    def __ge__(self, other: object) -> bool:
         if not isinstance(other, GraphId):
             return NotImplemented
         return self._packed >= other._packed

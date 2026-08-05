@@ -35,7 +35,7 @@ from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable, Generator
 
     from psycopg.errors import Diagnostic
 
@@ -54,7 +54,7 @@ logger = logging.getLogger("agensgraph")
 
 # Read before every span site, and the only thing a caller who has not asked for tracing pays.
 # Not a call, not an attribute lookup on an object, and not a question put to the tracer.
-_TRACING = False
+_tracing = False
 _tracer: Any = None
 
 _query_loggers: list[Callable[[QueryRecord], None]] = []
@@ -124,7 +124,7 @@ def enable_tracing(tracer: Any = None) -> None:
     Imports ``opentelemetry-api`` and nothing else. Pass a tracer to use one already configured;
     otherwise one is asked for under this driver's name.
     """
-    global _TRACING, _tracer
+    global _tracing, _tracer
     if tracer is None:
         try:
             from opentelemetry import trace
@@ -135,30 +135,30 @@ def enable_tracing(tracer: Any = None) -> None:
             ) from exc
         tracer = trace.get_tracer("agensgraph")
     _tracer = tracer
-    _TRACING = True
+    _tracing = True
 
 
 def disable_tracing() -> None:
     """Stop taking spans, and go back to costing a boolean test."""
-    global _TRACING, _tracer
-    _TRACING = False
+    global _tracing, _tracer
+    _tracing = False
     _tracer = None
 
 
 def tracing_enabled() -> bool:
     """Whether spans are being taken."""
-    return _TRACING
+    return _tracing
 
 
 @contextmanager
-def query_span(statement: str, *, graph: str | None = None) -> Iterator[None]:
+def query_span(statement: str, *, graph: str | None = None) -> Generator[None]:
     """A span around one statement, or nothing at all.
 
     The statement text is attached. It is parameterized -- this driver never puts a value into
     it -- so there is nothing in it to redact, which is also the position the semantic
     conventions take. Parameters are never attached.
     """
-    if not _TRACING:
+    if not _tracing:
         yield
         return
     with _tracer.start_as_current_span("query") as span:
@@ -208,7 +208,7 @@ class Timer:
     __slots__ = ("_started",)
 
     def __init__(self) -> None:
-        self._started = time.monotonic() if logging_wanted() or _TRACING else 0.0
+        self._started = time.monotonic() if logging_wanted() or _tracing else 0.0
 
     @property
     def elapsed(self) -> float:

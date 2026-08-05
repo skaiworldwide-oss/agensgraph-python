@@ -52,7 +52,7 @@ from .deadline import Deadline
 from .errors import StaleGeneration
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Iterator
+    from collections.abc import Awaitable, Callable, Generator
 
     from psycopg.abc import Params
 
@@ -214,7 +214,7 @@ class ConnectionPool:
     @contextmanager
     def connection(
         self, *, timeout: float | None = None, deadline: Deadline | None = None
-    ) -> Iterator[Connection[Any]]:
+    ) -> Generator[Connection[Any]]:
         """Take a connection for the duration of a block.
 
         The wait comes out of *deadline* if one is given, so waiting for a connection is spent

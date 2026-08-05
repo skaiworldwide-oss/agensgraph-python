@@ -51,7 +51,8 @@ RENAMES: dict[str, str] = {
     "AsyncTransaction": "Transaction",
     "AsyncCopy": "Copy",
     "AsyncPipeline": "Pipeline",
-    "AsyncGenerator": "Iterator",
+    # A generator is a generator; @contextmanager wants that rather than an iterator.
+    "AsyncGenerator": "Generator",
     "AsyncIterator": "Iterator",
     "AsyncIterable": "Iterable",
     "asynccontextmanager": "contextmanager",

@@ -113,3 +113,31 @@ ignore_missing_imports = true
 module = ["pyarrow.*", "pandas.*", "polars.*"]
 ignore_missing_imports = true
 follow_imports = "skip"
+
+[tool.pyright]
+include = ["src/agensgraph"]
+typeCheckingMode = "strict"
+pythonVersion = "3.11"
+venvPath = "."
+venv = ".venv"
+
+# The columnar backends are optional, imported where they are used, and ship no stubs.
+reportMissingImports = "warning"
+reportMissingTypeStubs = "warning"
+
+# What a decoder and a cursor hand back is Any, and every value read from either carries that
+# through whatever it touches. These three report the shape of that typing rather than anything
+# about this code, and there are thirty-five of them against a driver whose whole job is to receive
+# untyped values and give them names.
+reportUnknownVariableType = "none"
+reportUnknownMemberType = "none"
+reportUnknownArgumentType = "none"
+
+# psycopg declares a statement as a LiteralString, to discourage one built by joining text. This
+# driver builds its statements and quotes every identifier that goes into one, so what it passes is
+# a str and cannot be a literal.
+reportArgumentType = "warning"
+reportCallIssue = "warning"
+
+# The pool reads the generation stamped on a connection by this same package.
+reportPrivateUsage = "none"

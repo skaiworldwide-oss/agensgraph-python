@@ -31,7 +31,7 @@ from psycopg.types.json import Jsonb
 from .cypher import quote_identifier
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Iterator, Mapping
+    from collections.abc import Generator, Iterable, Mapping
 
     from ._protocol.graphid import GraphId
 
@@ -45,7 +45,7 @@ __all__ = [
 
 
 @contextmanager
-def paused_collection() -> Iterator[None]:
+def paused_collection() -> Generator[None]:
     """Stop the cyclic collector for the duration of a large read or load.
 
     Worth about 1.03 times on a read of two hundred thousand vertices. It is no more than that

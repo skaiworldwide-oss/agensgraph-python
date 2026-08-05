@@ -17,13 +17,9 @@ module gates them.
 from __future__ import annotations
 
 import re
-from typing import TYPE_CHECKING
+from typing import Protocol
 
 from .errors import CapabilityError
-
-if TYPE_CHECKING:
-    from psycopg import Connection
-    from psycopg.abc import ConnectionType
 
 __all__ = ["MINIMUM_VERSION", "Capabilities", "parse_version"]
 
@@ -46,6 +42,17 @@ def parse_version(text: str) -> tuple[int, int]:
     if match is None:
         raise ValueError(f"cannot read an AgensGraph version from {text!r}")
     return int(match.group(1)), int(match.group(2))
+
+
+class _Reports(Protocol):
+    """Anything that can be asked what the server said at startup."""
+
+    @property
+    def info(self) -> _Startup: ...
+
+
+class _Startup(Protocol):
+    def parameter_status(self, param_name: str) -> str | None: ...
 
 
 class Capabilities:
@@ -75,7 +82,7 @@ class Capabilities:
         self._reported = reported
 
     @classmethod
-    def of(cls, conn: Connection[object] | ConnectionType) -> Capabilities:
+    def of(cls, conn: _Reports) -> Capabilities:
         """Read the version a connection was told at startup.
 
         A server that reports no ``agversion`` at all is a PostgreSQL without the graph

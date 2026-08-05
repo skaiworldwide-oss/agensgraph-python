@@ -571,6 +571,18 @@ def dimensions_of(values: Sequence[float]) -> int:
     return len(values)
 
 
+def _pairs_of(
+    entries: Mapping[int, float] | Iterable[tuple[int, float]],
+) -> Iterable[object]:
+    """The index-and-value pairs, whichever shape they arrived in.
+
+    A mapping iterates to its keys, so its pairs are asked for instead. A mapping whose keys are
+    themselves pairs satisfies both shapes and takes that branch, which is why what comes back is
+    checked rather than trusted.
+    """
+    return entries.items() if isinstance(entries, Mapping) else entries
+
+
 class SparseVector:
     """A vector most of whose entries are zero, holding only the ones that are not.
 
@@ -605,10 +617,15 @@ class SparseVector:
     ) -> None:
         if dimensions < 1:
             raise ValueError(f"a sparse vector has at least one dimension, got {dimensions}")
-        pairs = entries.items() if isinstance(entries, Mapping) else entries
         kept: dict[int, float] = {}
-        for index, value in pairs:
-            index = int(index)
+        for pair in _pairs_of(entries):
+            if not isinstance(pair, tuple) or len(pair) != 2:
+                raise TypeError(f"expected an index and a value, got {pair!r}")
+            index, value = pair
+            if not isinstance(index, int) or isinstance(index, bool):
+                raise TypeError(f"an index is a whole number, got {index!r}")
+            if not isinstance(value, int | float) or isinstance(value, bool):
+                raise TypeError(f"a value is a number, got {value!r}")
             if not 0 <= index < dimensions:
                 raise ValueError(
                     f"index {index} is outside a vector of {dimensions} dimensions "
