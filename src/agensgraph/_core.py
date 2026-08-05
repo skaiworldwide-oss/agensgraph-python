@@ -21,6 +21,7 @@ from .adapters import graph_adapters, register_binary
 from .capabilities import Capabilities
 from .cypher import check_bindable_positions, quote_identifier
 from .errors import explain_string_type, translate
+from .observability import QueryRecord, logging_wanted, report
 from .summary import GraphWriteCounts
 
 if TYPE_CHECKING:
@@ -166,6 +167,27 @@ class GraphMixin:
         if before is None:
             return GraphWriteCounts.unknown()
         return GraphWriteCounts.between(before, after)
+
+    def _report_query(
+        self, statement: str, timer: Any, *, rows: int, error: BaseException | None
+    ) -> None:
+        """Tell anything listening what one statement did, and cost nothing when nothing is.
+
+        The connection is identified by an opaque number rather than by anything it was
+        configured with, because its settings hold the password.
+        """
+        if not logging_wanted():
+            return
+        report(
+            QueryRecord(
+                connection=id(self),
+                statement=statement,
+                elapsed=timer.elapsed,
+                rows=rows,
+                failed=error is not None,
+                error=error,
+            )
+        )
 
     @staticmethod
     def _translated(exc: BaseException) -> BaseException:

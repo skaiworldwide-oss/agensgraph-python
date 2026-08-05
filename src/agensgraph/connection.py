@@ -39,6 +39,7 @@ from .introspect import (
     Label,
     element_count_query,
 )
+from .observability import Timer, query_span
 from .summary import (
     ASSIGNED_TRANSACTION_QUERY,
     COUNTER_QUERY,
@@ -136,21 +137,27 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
         """
         if isinstance(query, str):
             self._check(query)
-        with self.cursor(row_factory=row_) if row_ else self.cursor() as cursor:
-            if binary_:
-                cursor.format = psycopg.pq.Format.BINARY
-            before: Sequence[int] | None = None
-            if counts_:
-                before = self._counters()
-            try:
-                cursor.execute(query, params, prepare=prepare_)
-            except psycopg.Error as exc:
-                raise self._translated(exc) from None
-            described = cursor.description
-            records = cursor.fetchall() if described is not None else []
-            keys = [column.name for column in described or ()]
-            tag = cursor.statusmessage
+        text = query if isinstance(query, str) else str(query)
+        timer = Timer()
+        with query_span(text, graph=self.label_table.graph):
+            with self.cursor(row_factory=row_) if row_ else self.cursor() as cursor:
+                if binary_:
+                    cursor.format = psycopg.pq.Format.BINARY
+                before: Sequence[int] | None = None
+                if counts_:
+                    before = self._counters()
+                try:
+                    cursor.execute(query, params, prepare=prepare_)
+                except psycopg.Error as exc:
+                    failure = self._translated(exc)
+                    self._report_query(text, timer, rows=0, error=failure)
+                    raise failure from None
+                described = cursor.description
+                records = cursor.fetchall() if described is not None else []
+                keys = [column.name for column in described or ()]
+                tag = cursor.statusmessage
         after = self._counters() if counts_ else None
+        self._report_query(text, timer, rows=len(records), error=None)
         return Result(records, keys, self._counts_for(tag, before, after))
 
     def transaction_id(self, *, assign: bool = False) -> int | None:

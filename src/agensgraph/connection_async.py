@@ -36,6 +36,7 @@ from .introspect import (
     Label,
     element_count_query,
 )
+from .observability import Timer, query_span
 from .summary import (
     ASSIGNED_TRANSACTION_QUERY,
     COUNTER_QUERY,
@@ -137,25 +138,33 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
         """
         if isinstance(query, str):
             self._check(query)
+        text = query if isinstance(query, str) else str(query)
+        timer = Timer()
 
-        async with self.cursor(row_factory=row_) if row_ else self.cursor() as cursor:
-            if binary_:
-                cursor.format = psycopg.pq.Format.BINARY
-            before: Sequence[int] | None = None
-            if counts_:
-                before = await self._counters()
-            try:
-                await cursor.execute(query, params, prepare=prepare_)
-            except psycopg.Error as exc:
-                raise self._translated(exc) from None
-            # A statement that changed something without returning rows still has a
-            # result, and asking that result for rows raises.  What distinguishes the
-            # two is whether it describes any columns.
-            described = cursor.description
-            records = await cursor.fetchall() if described is not None else []
-            keys = [column.name for column in described or ()]
-            tag = cursor.statusmessage
+        # The span is taken outside, and is not something to wait for: it is a plain block
+        # in both interfaces, so it stays one rather than being converted into a wait.
+        with query_span(text, graph=self.label_table.graph):
+            async with self.cursor(row_factory=row_) if row_ else self.cursor() as cursor:
+                if binary_:
+                    cursor.format = psycopg.pq.Format.BINARY
+                before: Sequence[int] | None = None
+                if counts_:
+                    before = await self._counters()
+                try:
+                    await cursor.execute(query, params, prepare=prepare_)
+                except psycopg.Error as exc:
+                    failure = self._translated(exc)
+                    self._report_query(text, timer, rows=0, error=failure)
+                    raise failure from None
+                # A statement that changed something without returning rows still has a
+                # result, and asking that result for rows raises.  What distinguishes the
+                # two is whether it describes any columns.
+                described = cursor.description
+                records = await cursor.fetchall() if described is not None else []
+                keys = [column.name for column in described or ()]
+                tag = cursor.statusmessage
         after = await self._counters() if counts_ else None
+        self._report_query(text, timer, rows=len(records), error=None)
         return Result(records, keys, self._counts_for(tag, before, after))
 
     async def transaction_id(self, *, assign: bool = False) -> int | None:

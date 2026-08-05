@@ -38,6 +38,7 @@ Homepage = "https://github.com/skaiworldwide-oss/agensgraph-python"
 Source = "https://github.com/skaiworldwide-oss/agensgraph-python"
 
 [project.optional-dependencies]
+otel = ["opentelemetry-api>=1.33"]
 arrow = ["pyarrow>=17"]
 pandas = ["pandas>=2.2"]
 polars = ["polars>=1.0"]
@@ -87,6 +88,10 @@ select = ["E", "W", "F", "I", "UP", "B", "SIM", "C4", "RUF", "TC", "PT"]
 ignore = ["E501"]
 
 [tool.ruff.lint.per-file-ignores]
+# A generated file, so it is not edited to satisfy a style rule. Its source has a plain block
+# around an awaiting one, which cannot be combined; converted, the pair becomes two plain
+# blocks that could be.
+"src/agensgraph/connection.py" = ["SIM117"]
 # A rejection is deliberately one exception type, so tests assert on that type rather
 # than on a message that is free to change. Parametrised cases are read as a list of
 # rows. The corpus holds characters that look like other characters on purpose.
@@ -96,3 +101,8 @@ ignore = ["E501"]
 python_version = "3.11"
 strict = true
 files = ["src/agensgraph"]
+
+# Tracing is optional and its package ships no stubs, so the one import of it is unchecked.
+[[tool.mypy.overrides]]
+module = "opentelemetry.*"
+ignore_missing_imports = true

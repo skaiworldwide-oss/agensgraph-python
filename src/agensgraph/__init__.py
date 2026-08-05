@@ -23,6 +23,12 @@ from .introspect import DeclaredProperty as DeclaredProperty
 from .introspect import Graph as Graph
 from .introspect import Index as Index
 from .introspect import Label as LabelInfo
+from .observability import Notice as Notice
+from .observability import QueryRecord as QueryRecord
+from .observability import add_query_logger as add_query_logger
+from .observability import disable_tracing as disable_tracing
+from .observability import enable_tracing as enable_tracing
+from .observability import remove_query_logger as remove_query_logger
 from .pool import ConnectionPool as ConnectionPool
 from .pool_async import AsyncConnectionPool as AsyncConnectionPool
 from .retry import RetryPolicy as RetryPolicy
@@ -57,16 +63,22 @@ __all__ = [
     "Jsonb",
     "Label",
     "LabelInfo",
+    "Notice",
     "Path",
+    "QueryRecord",
     "Result",
     "RetryPolicy",
     "Retryability",
     "TokenBucket",
     "Unspecified",
     "Vertex",
+    "add_query_logger",
     "connect",
+    "disable_tracing",
+    "enable_tracing",
     "errors",
     "is_retryable",
+    "remove_query_logger",
     "retryability",
 ]
 
