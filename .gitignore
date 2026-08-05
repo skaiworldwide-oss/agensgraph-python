@@ -5,3 +5,5 @@ dist
 *.pyc
 *.swp
 .idea
+# Agent worktrees and local session state.
+.claude/
