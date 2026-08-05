@@ -262,6 +262,30 @@ Reference counting still frees as usual; only the collection of cycles waits.
 `agensgraph.freeze_after_import()` is the other half — call it once at startup and every later
 collection skips the module-level objects that were never going to be collected anyway.
 
+## Numbers in a property map
+
+jsonb keeps an arbitrary-precision decimal; Python's float does not. Where they part company,
+measured:
+
+| written | read back |
+|---|---|
+| an integer of any size, `1e400` included | **exactly**, as an `int` |
+| `3.141592653589793238462643383279` | `3.141592653589793` |
+| `1e-400` | `0.0` |
+| `-0.0` | `0.0` — the **server** drops the sign, before the driver sees it |
+
+`1e400` is worth calling out: the server stores it as an exact 401-digit integer, not an infinity.
+
+For the cases where the lost digits matter:
+
+```python
+agensgraph.read_numbers_exactly()      # once, at startup
+```
+
+Every non-integer then reads as a `Decimal` keeping whatever the server holds — `1e-400` included.
+It costs about **3.7×** to decode a map of numbers, and integers are exact either way. Writing a
+`Decimal` back stores it as a JSON string, so that round trip is not identity.
+
 ## Sending a burst of statements
 
 For a batch whose cost is round trips rather than work:

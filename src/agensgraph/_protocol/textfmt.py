@@ -28,6 +28,8 @@ from typing import NamedTuple
 
 import msgspec
 
+from ..numbers import decode_json
+
 __all__ = [
     "NULL_ELEMENT",
     "EdgeParts",
@@ -42,7 +44,7 @@ __all__ = [
 NULL_ELEMENT = b"NULL"
 """What the server writes where an element is null."""
 
-_decode_json = msgspec.json.decode
+_decode_json = decode_json
 _ELEM_ID = re.compile(rb"\[(\d+)\.(\d+)\]")
 
 # A boundary between two elements of a path or an element array: the close of one

@@ -16,8 +16,7 @@ from __future__ import annotations
 import struct
 from typing import NamedTuple
 
-import msgspec
-
+from ..numbers import decode_json
 from .graphid import GraphId
 from .graphid import unpack as _unpack_graphid
 
@@ -35,7 +34,7 @@ TID_OID = 27
 
 _i32 = struct.Struct(">i")
 _unpack_i32_from = _i32.unpack_from
-_decode_json = msgspec.json.decode
+_decode_json = decode_json
 
 
 class Field(NamedTuple):

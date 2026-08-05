@@ -41,7 +41,8 @@ class TestWhatAPipelineDoesWithAnError:
                         raised.append(None)
                     except agensgraph.errors.Error as exc:
                         raised.append(exc)
-            assert raised[0] is not None and raised[0].sqlstate == "22012"
+            assert raised[0] is not None
+            assert raised[0].sqlstate == "22012"
             assert [exc.sqlstate for exc in raised[1:]] == [None, None, None]
             conn.rollback()
 

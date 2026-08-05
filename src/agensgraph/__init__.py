@@ -33,6 +33,8 @@ from .introspect import Index as Index
 from .introspect import IndexElement as IndexElement
 from .introspect import Label as LabelInfo
 from .introspect import Unique as Unique
+from .numbers import read_numbers_exactly as read_numbers_exactly
+from .numbers import reading_numbers_exactly as reading_numbers_exactly
 from .observability import Notice as Notice
 from .observability import QueryRecord as QueryRecord
 from .observability import add_query_logger as add_query_logger
@@ -103,6 +105,8 @@ __all__ = [
     "freeze_after_import",
     "is_retryable",
     "paused_collection",
+    "read_numbers_exactly",
+    "reading_numbers_exactly",
     "remove_query_logger",
     "retryability",
     "vector",

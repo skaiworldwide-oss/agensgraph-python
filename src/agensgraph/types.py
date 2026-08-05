@@ -16,14 +16,14 @@ from __future__ import annotations
 from collections.abc import Iterator, Sequence
 from typing import Any
 
-import msgspec
 from msgspec import Struct
 
 from ._protocol.graphid import GraphId
+from .numbers import decode_json
 
 __all__ = ["Edge", "GraphId", "Label", "Path", "Vertex"]
 
-_decode_json = msgspec.json.decode
+_decode_json = decode_json
 _EMPTY: dict[str, Any] = {}
 
 # Stands in for an identity an edge must be given. An edge always has both, so this is only ever
