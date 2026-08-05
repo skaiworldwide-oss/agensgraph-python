@@ -264,9 +264,13 @@ optional: without one the server reports that Cypher in a FROM needs an alias.
 def wrap_for_cursor(statement: str, *, alias: str = "t") -> str:
     """The statement as a server-side cursor can read it.
 
-    Verified against a live server: the wrap accepts a plain read, a trailing ``LIMIT``, a
-    trailing ``ORDER BY``, ``WHERE`` and ``WITH ... RETURN``, and refuses a mid-query ``LIMIT``,
-    an ``ORDER BY`` that is not final, and any write.
+    What the wrap takes, from the grammar and confirmed against a server: a chain of ``MATCH``,
+    ``WITH``, ``LET``, ``LOAD``, ``UNWIND``, ``FOR`` and ``CALL { }`` ending in ``RETURN``, with a
+    trailing ``ORDER BY``, ``SKIP`` or ``LIMIT``; ``FINISH`` in place of ``RETURN``; and ``UNION``,
+    ``INTERSECT`` or ``EXCEPT`` between parenthesised reads. The alias is required.
+
+    What it refuses: any write, ``FILTER``, a ``LIMIT`` or ``ORDER BY`` that is not last, and
+    ``CALL func() YIELD``, which the grammar allows only as a top-level clause.
     """
     check_can_wrap(statement)
     return WRAP.format(statement=statement.rstrip().rstrip(";"), alias=quote_identifier(alias))

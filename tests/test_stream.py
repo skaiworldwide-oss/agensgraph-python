@@ -236,3 +236,45 @@ class TestAWordThatIsAlsoAPropertyName:
     def test_a_write_still_is(self, statement: str) -> None:
         with pytest.raises(ValueError, match="cannot be read in chunks"):
             check_can_wrap(statement)
+
+
+class TestWhatTheWrapItselfTakes:
+    """Asserted against the server, since the boundary is the grammar's rather than the driver's."""
+
+    @pytest.mark.server
+    @pytest.mark.parametrize(
+        "statement",
+        [
+            "match (n:doc) return n",
+            "match (n:doc) return n order by n.a",
+            "match (n:doc) return n limit 1",
+            "match (n:doc) with n return n",
+            "let x = 1 return x",
+            "unwind [1,2] as x return x",
+            "for x in [1,2] return x",
+            "call { match (n:doc) return n as v } return v",
+            "match (n:doc) finish",
+            "(match (n:doc) return 1) union (match (n:doc) return 2)",
+            "(match (n:doc) return 1) intersect (match (n:doc) return 1)",
+            "(match (n:doc) return 1) except (match (n:doc) return 2)",
+        ],
+    )
+    def test_it_is_accepted(self, agens, statement: str) -> None:  # type: ignore[no-untyped-def]
+        agens.execute("create vlabel doc")
+        agens.execute("create (:doc {a: 1})")
+        agens.execute(wrap_for_cursor(statement))
+
+    @pytest.mark.server
+    @pytest.mark.parametrize(
+        "statement",
+        [
+            "match (n:doc) filter n.a > 0 return n",
+            "match (n:doc) with n limit 1 return n",
+            "call generate_series(1,2) yield generate_series as g return g",
+        ],
+    )
+    def test_it_is_refused_by_the_server(self, agens, statement: str) -> None:  # type: ignore[no-untyped-def]
+        """None of these is a write, so the driver lets them through and the server judges."""
+        agens.execute("create vlabel doc")
+        with pytest.raises(agensgraph.errors.Error):
+            agens.execute(wrap_for_cursor(statement))
