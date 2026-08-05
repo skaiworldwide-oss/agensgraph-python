@@ -31,19 +31,21 @@ Two ways to index one, and only one of them is a trap:
 from __future__ import annotations
 
 import struct
+from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
-from psycopg.adapt import Loader
+from psycopg.adapt import Dumper, Loader
 from psycopg.pq import Format
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Iterable, Sequence
 
     from psycopg.abc import AdaptContext, Buffer
     from psycopg.types import TypeInfo
 
 __all__ = [
     "TYPES",
+    "SparseVector",
     "accept",
     "expression_index",
     "generated_column",
@@ -51,16 +53,23 @@ __all__ = [
     "parse_vector_text",
 ]
 
-TYPES = ("vector", "halfvec")
+TYPES = ("vector", "halfvec", "sparsevec")
 """The types read here.
 
-``sparsevec`` is left out deliberately: its text form is ``{1:1,3:2}/4`` rather than a list, so it
-is a different shape rather than a narrower one, and reading it as if it were the others would
-produce a plausible wrong answer.
+The first two are lists of numbers. The third is not, and gets a value of its own -- see
+:class:`SparseVector` for why a dense list would have been the wrong answer.
 """
 
-# Two bytes of dimension, two the type does not use, then that many floats, big-endian.
+TEXT_OID = 25
+"""What a sparse vector is sent as. See :class:`SparseVectorDumper` for why."""
+
+# A dense vector: two bytes of dimension, two the type does not use, then that many floats.
 _HEADER = struct.Struct(">HH")
+
+# A sparse one: the dimension, how many entries are not zero, one word the type does not use.
+# Then that many indices, then that many values. All big-endian, and the indices are counted
+# from zero -- which the text form does not do.
+_SPARSE_HEADER = struct.Struct(">iii")
 
 
 def _elements(data: Buffer, code: str) -> list[float]:
@@ -125,6 +134,11 @@ def accept(context: AdaptContext, info: TypeInfo) -> None:
     """
     info.register(context)
     adapters = context.adapters
+    if info.name == "sparsevec":
+        adapters.register_loader(info.oid, SparseVectorLoader)
+        adapters.register_loader(info.oid, SparseVectorBinaryLoader)
+        adapters.register_dumper(SparseVector, SparseVectorDumper)
+        return
     adapters.register_loader(info.oid, VectorLoader)
     adapters.register_loader(
         info.oid,
@@ -196,3 +210,202 @@ def nearest(
 def dimensions_of(values: Sequence[float]) -> int:
     """How many dimensions a value has, for building a column or a cast to match it."""
     return len(values)
+
+
+class SparseVector:
+    """A vector most of whose entries are zero, holding only the ones that are not.
+
+    A dense list would have been the obvious reading and is the wrong one. Measured: three
+    non-zero entries in a million dimensions is 36 bytes on the wire and roughly 8 MiB as a list
+    of Python floats -- so reading it densely expands it more than two hundred thousand fold and
+    throws away the whole reason the type exists. :meth:`to_dense` is there for the caller who
+    means it.
+
+    **Indices count from zero here.** The server's text form counts from one -- ``{1:9}/3`` is the
+    first entry of three -- while its binary form counts from zero. Two renderings disagreeing
+    about the base, read into one representation without noticing, give an answer that is wrong by
+    one rather than an error; so the conversion happens once, at the text boundary, and everything
+    in Python is zero-based like the language it is in. ``to_dense()[i]`` and ``indices`` agree.
+
+    What the server refuses is refused here: a repeated index, an index outside the dimension, a
+    dimension below one, and a value that is not finite. Failing before the round trip is the only
+    place a caller learns about it in time to do anything.
+
+    An entry that is explicitly zero is dropped, because the server drops it -- ``{1:0,2:5}/4``
+    comes back as ``{2:5}/4``. Keeping it would make a round trip lossy in one direction only.
+    """
+
+    __slots__ = ("_dimensions", "_indices", "_values")
+
+    _dimensions: int
+    _indices: tuple[int, ...]
+    _values: tuple[float, ...]
+
+    def __init__(
+        self, entries: Mapping[int, float] | Iterable[tuple[int, float]], dimensions: int
+    ) -> None:
+        if dimensions < 1:
+            raise ValueError(f"a sparse vector has at least one dimension, got {dimensions}")
+        pairs = entries.items() if isinstance(entries, Mapping) else entries
+        kept: dict[int, float] = {}
+        for index, value in pairs:
+            index = int(index)
+            if not 0 <= index < dimensions:
+                raise ValueError(
+                    f"index {index} is outside a vector of {dimensions} dimensions "
+                    f"(indices count from zero here; the server's text form counts from one)"
+                )
+            if index in kept:
+                raise ValueError(f"index {index} appears more than once")
+            value = float(value)
+            if value != value or value in (float("inf"), float("-inf")):
+                raise ValueError(f"a sparse vector holds no infinity and no nan, got {value}")
+            if value != 0.0:
+                kept[index] = value
+        ordered = sorted(kept)
+        object.__setattr__(self, "_dimensions", dimensions)
+        object.__setattr__(self, "_indices", tuple(ordered))
+        object.__setattr__(self, "_values", tuple(kept[index] for index in ordered))
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError("SparseVector is immutable")
+
+    @property
+    def dimensions(self) -> int:
+        """How long the vector is, counting the zeros it does not store."""
+        return self._dimensions
+
+    @property
+    def indices(self) -> tuple[int, ...]:
+        """Where the entries that are not zero sit, counted from zero, ascending."""
+        return self._indices
+
+    @property
+    def values(self) -> tuple[float, ...]:
+        """Those entries, in the same order as :attr:`indices`."""
+        return self._values
+
+    def to_dict(self) -> dict[int, float]:
+        """The entries as a mapping, for a caller who would rather look one up than scan."""
+        return dict(zip(self._indices, self._values, strict=True))
+
+    def to_dense(self) -> list[float]:
+        """Every entry, zeros and all.
+
+        Costs one float per dimension, which for the values this type is meant for is the
+        expansion it exists to avoid -- so this is asked for rather than done by default.
+        """
+        dense = [0.0] * self._dimensions
+        for index, value in zip(self._indices, self._values, strict=True):
+            dense[index] = value
+        return dense
+
+    @classmethod
+    def from_dense(cls, values: Sequence[float]) -> SparseVector:
+        """Keep only what is not zero out of an ordinary list."""
+        return cls(
+            {index: value for index, value in enumerate(values) if value != 0.0}, len(values)
+        )
+
+    def to_text(self) -> str:
+        """The server's text form, whose indices count from one."""
+        body = ",".join(
+            f"{index + 1}:{value:g}"
+            for index, value in zip(self._indices, self._values, strict=True)
+        )
+        return f"{{{body}}}/{self._dimensions}"
+
+    @classmethod
+    def from_text(cls, text: str | bytes) -> SparseVector:
+        """Read ``{1:1,3:2}/4``, whose indices count from one.
+
+        This is the only place the two bases meet, so it is the only place that can get the
+        conversion wrong -- which is why it is one function and not a rule to remember.
+        """
+        if isinstance(text, bytes):
+            text = text.decode()
+        text = text.strip()
+        brace = text.rfind("}")
+        if not text.startswith("{") or brace < 0:
+            raise ValueError(f"not a sparse vector: {text!r}")
+        tail = text[brace + 1 :].strip()
+        if not tail.startswith("/"):
+            raise ValueError(f"a sparse vector needs its dimension after a slash: {text!r}")
+        dimensions = int(tail[1:])
+        body = text[1:brace].strip()
+        entries: list[tuple[int, float]] = []
+        if body:
+            for part in body.split(","):
+                index, _, value = part.partition(":")
+                if not _:
+                    raise ValueError(f"not an index and a value: {part!r}")
+                # From one on the wire's text form, to zero here.
+                entries.append((int(index.strip()) - 1, float(value.strip())))
+        return cls(entries, dimensions)
+
+    def __len__(self) -> int:
+        """How many entries are stored, which is not the number of dimensions."""
+        return len(self._indices)
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, SparseVector):
+            return NotImplemented
+        return (
+            self._dimensions == other._dimensions
+            and self._indices == other._indices
+            and self._values == other._values
+        )
+
+    def __hash__(self) -> int:
+        return hash((self._dimensions, self._indices, self._values))
+
+    def __repr__(self) -> str:
+        return f"SparseVector({self.to_dict()}, {self._dimensions})"
+
+
+class SparseVectorLoader(Loader):
+    """Read ``{1:1,3:2}/4``."""
+
+    format = Format.TEXT
+
+    def load(self, data: Buffer) -> SparseVector:
+        return SparseVector.from_text(bytes(data))
+
+
+class SparseVectorBinaryLoader(Loader):
+    """Read the dimension, the count, then that many indices and that many values.
+
+    The indices arrive counted from zero, which is what this driver uses, so the path that matters
+    for a large value adjusts nothing.
+    """
+
+    format = Format.BINARY
+
+    def load(self, data: Buffer) -> SparseVector:
+        raw = bytes(data)
+        dimensions, stored, _unused = _SPARSE_HEADER.unpack_from(raw, 0)
+        at = _SPARSE_HEADER.size
+        indices = struct.unpack_from(f">{stored}i", raw, at)
+        values = struct.unpack_from(f">{stored}f", raw, at + 4 * stored)
+        return SparseVector(zip(indices, values, strict=True), dimensions)
+
+
+class SparseVectorDumper(Dumper):
+    """Write one, which is the only reasonable way to write one at all.
+
+    A Cypher list cannot go into a sparse column -- the server refuses it, saying the contents must
+    start with a brace -- where the same list is accepted by a dense one. So sending the text form
+    is not a convenience here; it is the way in.
+
+    Sent as **text**, which is the same choice this driver makes for a string and for the same
+    reason. Left untyped it would be worked out as jsonb in a Cypher property position and parsed
+    as JSON, which it is not. Declared text it goes both ways: a SQL position casts it explicitly,
+    and a property position converts it to a JSON string that the generated column then casts --
+    which is exactly what a hand-written literal does.
+    """
+
+    format = Format.TEXT
+    oid = TEXT_OID
+
+    def dump(self, obj: SparseVector) -> bytes:
+        return obj.to_text().encode()

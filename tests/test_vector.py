@@ -14,6 +14,7 @@ import pytest_asyncio
 import agensgraph
 from agensgraph.vector import (
     TYPES,
+    SparseVector,
     expression_index,
     generated_column,
     nearest,
@@ -77,9 +78,13 @@ class TestTheStatementsItBuilds:
         with pytest.raises(ValueError, match="at least one dimension"):
             generated_column("v", bad)
 
-    def test_an_unknown_type_is_refused(self) -> None:
+    def test_a_sparse_column_can_be_asked_for(self) -> None:
+        assert generated_column("v", 6, type="sparsevec") == "v sparsevec(6) generated"
+
+    @pytest.mark.parametrize("unknown", ["bit", "float8", "vector4", ""])
+    def test_a_type_this_driver_cannot_read_is_refused(self, unknown: str) -> None:
         with pytest.raises(ValueError, match="expected one of"):
-            generated_column("v", 4, type="sparsevec")
+            generated_column("v", 4, type=unknown)
 
     def test_an_expression_index_carries_the_dimension_in_the_cast(self) -> None:
         """Which is the difference between an index and 'column does not have dimensions'."""
@@ -233,3 +238,168 @@ class TestTheAwaitingInterface:
     async def test_it_is_declared(self, avectors) -> None:  # type: ignore[no-untyped-def]
         declared = await avectors.declared_properties("emb")
         assert [(each.name, each.type) for each in declared] == [("v", "vector(4)")]
+
+
+class TestSparseVectorsWithoutAServer:
+    """A sparse vector is a value rather than a list, and this is why and how."""
+
+    def test_it_keeps_only_what_is_not_zero(self) -> None:
+        """Measured: three entries in a million dimensions is 36 wire bytes against 8 MiB dense."""
+        v = SparseVector({0: 1.0, 499_999: 2.0}, 1_000_000)
+        assert len(v) == 2, "len counts what is stored, not the dimensions"
+        assert v.dimensions == 1_000_000
+        assert v.indices == (0, 499_999)
+
+    def test_the_entries_are_ordered(self) -> None:
+        v = SparseVector([(3, 1.0), (0, 2.0)], 4)
+        assert v.indices == (0, 3)
+        assert v.values == (2.0, 1.0)
+
+    def test_it_can_be_built_from_a_mapping_or_from_pairs(self) -> None:
+        assert SparseVector({0: 1.0}, 4) == SparseVector([(0, 1.0)], 4)
+
+    def test_a_dense_list_can_be_narrowed_and_widened_again(self) -> None:
+        dense = [1.0, 0.0, 0.0, 2.0]
+        v = SparseVector.from_dense(dense)
+        assert v.dimensions == 4
+        assert len(v) == 2
+        assert v.to_dense() == dense
+
+    def test_the_mapping_view_agrees_with_the_dense_one(self) -> None:
+        v = SparseVector({0: 1.0, 3: 2.0}, 4)
+        assert v.to_dict() == {0: 1.0, 3: 2.0}
+        assert [v.to_dense()[i] for i in v.indices] == list(v.values)
+
+    def test_it_is_a_value(self) -> None:
+        v = SparseVector({0: 1.0}, 4)
+        assert v == SparseVector({0: 1.0}, 4)
+        assert {v: "seen"}[SparseVector({0: 1.0}, 4)] == "seen"
+        with pytest.raises(AttributeError):
+            v.dimensions = 9  # type: ignore[misc]
+
+    def test_the_dimension_is_part_of_the_value(self) -> None:
+        """An empty vector of four is not an empty vector of a thousand."""
+        assert SparseVector({}, 4) != SparseVector({}, 1000)
+
+    def test_an_explicit_zero_is_dropped_because_the_server_drops_it(self) -> None:
+        """Keeping it would make a round trip lossy in one direction only."""
+        assert SparseVector({0: 0.0, 1: 5.0}, 4).to_text() == "{2:5}/4"
+
+    @pytest.mark.parametrize(
+        ("entries", "dimensions", "why"),
+        [
+            ([(0, 1.0), (0, 2.0)], 4, "more than once"),
+            ({4: 1.0}, 4, "outside"),
+            ({-1: 1.0}, 4, "outside"),
+            ({}, 0, "at least one dimension"),
+            ({}, -1, "at least one dimension"),
+            ({0: float("nan")}, 4, "no infinity and no nan"),
+            ({0: float("inf")}, 4, "no infinity and no nan"),
+            ({0: float("-inf")}, 4, "no infinity and no nan"),
+        ],
+    )
+    def test_what_the_server_would_refuse_is_refused_here_first(
+        self, entries, dimensions: int, why: str
+    ) -> None:  # type: ignore[no-untyped-def]
+        """Before the round trip is the only place a caller can still do something about it."""
+        with pytest.raises(ValueError, match=why):
+            SparseVector(entries, dimensions)
+
+
+class TestTheTwoIndexBases:
+    """The trap in the type: text counts from one, the wire counts from zero."""
+
+    def test_the_text_form_counts_from_one(self) -> None:
+        assert SparseVector({0: 9.0}, 3).to_text() == "{1:9}/3"
+
+    def test_and_reading_it_converts_back(self) -> None:
+        v = SparseVector.from_text("{1:9}/3")
+        assert v.indices == (0,), "the first text entry is index zero here"
+        assert v.to_dense() == [9.0, 0.0, 0.0]
+
+    @pytest.mark.parametrize(
+        "text",
+        ["{1:1,3:2}/4", "{}/4", "{1:1.5}/1", "{1:1000}/4", "{ 1 : 1 }/4", "{1:-2.25,4:1}/8"],
+    )
+    def test_a_round_trip_through_the_text_form_is_stable(self, text: str) -> None:
+        once = SparseVector.from_text(text)
+        assert SparseVector.from_text(once.to_text()) == once
+
+    @pytest.mark.parametrize(
+        "text", ["1:1/4", "{1}/4", "{1:1}", "{1:1}/", "", "[1,2]", "{1:1}4", "{0:1}/4"]
+    )
+    def test_something_that_is_not_one_is_refused(self, text: str) -> None:
+        with pytest.raises(ValueError):
+            SparseVector.from_text(text)
+
+    def test_an_index_of_zero_in_the_text_form_is_out_of_bounds(self) -> None:
+        """As the server says: its text indices start at one, so zero is below the first."""
+        with pytest.raises(ValueError, match="outside"):
+            SparseVector.from_text("{0:1}/4")
+
+
+class TestSparseVectorsAgainstAServer:
+    @pytest.fixture
+    def sparse(self, agens):  # type: ignore[no-untyped-def]
+        if not agens.has_vectors():
+            pytest.skip("the vector extension is not created in this database")
+        found = agens.register_vectors()
+        if "sparsevec" not in found:
+            pytest.skip("this pgvector has no sparsevec")
+        agens.execute("create vlabel s (v sparsevec(6) generated)")
+        agens.refresh_labels()
+        return agens
+
+    def test_both_renderings_agree(self, sparse) -> None:  # type: ignore[no-untyped-def]
+        text = sparse.execute("select %s::sparsevec", ("{1:1,4:2}/6",)).fetchone()[0]
+        binary = sparse.execute(
+            "select %s::sparsevec", ("{1:1,4:2}/6",), binary=True
+        ).fetchone()[0]
+        assert text == binary == SparseVector({0: 1.0, 3: 2.0}, 6)
+
+    def test_the_server_reads_back_what_we_sent(self, sparse) -> None:  # type: ignore[no-untyped-def]
+        mine = SparseVector({0: 1.0, 3: 2.0}, 6)
+        assert sparse.execute("select %s::sparsevec", (mine,)).fetchone()[0] == mine
+
+    def test_a_large_one_stays_small(self, sparse) -> None:  # type: ignore[no-untyped-def]
+        """The reason it is not read densely: this would be 8 MiB of Python floats."""
+        big = SparseVector({0: 1.0, 499_999: 2.0, 999_999: 3.0}, 1_000_000)
+        back = sparse.execute("select %s::sparsevec", (big,)).fetchone()[0]
+        assert back == big
+        assert len(back) == 3
+
+    def test_it_can_be_written_through_cypher(self, sparse) -> None:  # type: ignore[no-untyped-def]
+        """A list cannot -- the server refuses it -- so sending the value is the way in."""
+        mine = SparseVector({1: 5.0}, 6)
+        sparse.execute("create (:s {v: %s})", (mine,))
+        (stored,) = sparse.execute_query("match (n:s) return n.v").records[0]
+        assert stored == mine
+        assert isinstance(stored, SparseVector)
+
+    def test_a_list_is_refused_by_the_server(self, sparse) -> None:  # type: ignore[no-untyped-def]
+        """Unlike a dense column, which takes one -- which is why the dumper exists."""
+        with pytest.raises(agensgraph.errors.Error, match="must start with"):
+            sparse.execute("create (:s {v: [1,0,0,2,0,0]})")
+
+    def test_the_dimension_is_enforced_at_write(self, sparse) -> None:  # type: ignore[no-untyped-def]
+        with pytest.raises(agensgraph.errors.Error):
+            sparse.execute("create (:s {v: %s})", (SparseVector({0: 1.0}, 99),))
+
+    def test_it_indexes_and_answers_a_distance_query(self, sparse) -> None:  # type: ignore[no-untyped-def]
+        graph = sparse.label_table.graph
+        sparse.execute("create (:s {v: %s})", (SparseVector({0: 1.0, 3: 2.0}, 6),))
+        sparse.execute("create (:s {v: %s})", (SparseVector({5: 9.0}, 6),))
+        sparse.execute(f'create index on "{graph}".s using hnsw (v sparsevec_l2_ops)')
+        rows = sparse.execute(
+            f'select id, v <-> %s::sparsevec as d from "{graph}".s order by d limit 1',
+            (SparseVector({0: 1.0, 3: 2.0}, 6),),
+        ).fetchall()
+        assert rows[0][1] == 0.0, "the closest thing to a vector is itself"
+
+    def test_it_is_declared_with_its_dimension(self, sparse) -> None:  # type: ignore[no-untyped-def]
+        assert [(p.name, p.type) for p in sparse.declared_properties("s")] == [
+            ("v", "sparsevec(6)")
+        ]
+
+    def test_registering_reports_it(self, sparse) -> None:  # type: ignore[no-untyped-def]
+        assert "sparsevec" in TYPES

@@ -291,8 +291,42 @@ conn.execute(expression_index("social", "Doc", "v", 1024))
 rows = conn.execute(nearest("social", "Emb", "v", limit=10), (query_vector_text,)).fetchall()
 ```
 
-`sparsevec` is deliberately not read: its text form is `{1:1,3:2}/4` rather than a list, so reading
-it like the others would give a plausible wrong answer.
+### Sparse vectors
+
+`sparsevec` gets a value of its own rather than a list, and the reason is size: three non-zero
+entries in a million dimensions is **36 bytes on the wire against roughly 8 MiB** as a list of
+Python floats. Reading it densely would expand it 230,000-fold and discard the entire reason the
+type exists.
+
+```python
+from agensgraph.vector import SparseVector
+
+v = SparseVector({0: 1.0, 3: 2.0}, 6)   # indices, then how many dimensions
+len(v)            # 2   -- what is stored
+v.dimensions      # 6   -- how long it is
+v.to_dict()       # {0: 1.0, 3: 2.0}
+v.to_dense()      # [1.0, 0.0, 0.0, 2.0, 0.0, 0.0]  -- asked for, never done by default
+SparseVector.from_dense([1, 0, 0, 2, 0, 0]) == v
+```
+
+**Indices count from zero here.** The server's text form counts from one — `{1:9}/3` is the first
+of three entries — while its binary form counts from zero. Two renderings disagreeing about the
+base give an off-by-one rather than an error, so the conversion happens once, at the text boundary,
+and everything in Python is zero-based like the language it's in. `to_dense()[i]` and `indices`
+agree.
+
+Whatever the server would refuse is refused on construction, where you can still do something about
+it: a repeated index, an index outside the dimension, a dimension below one, `NaN`, infinity. An
+explicit zero is dropped, because the server drops it.
+
+A Cypher *list* cannot be written into a sparse column — the server refuses it, where a dense
+column accepts one — so passing the value is the way in, and it works in both a Cypher property
+position and a SQL cast:
+
+```python
+conn.execute("CREATE (:Emb {v: %s})", (v,))
+conn.execute('SELECT id, v <-> %s::sparsevec AS d FROM social."Emb" ORDER BY d LIMIT 5', (v,))
+```
 
 ## Watching it work
 
