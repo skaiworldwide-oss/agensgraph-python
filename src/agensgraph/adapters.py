@@ -238,6 +238,16 @@ def register_text(context: AdaptContext | AdaptersMap) -> None:
     from the server to do it.
     """
     adapters = context if isinstance(context, AdaptersMap) else context.adapters
+    # The types are named first, and the loaders registered over the top of them.
+    #
+    # Naming them is what lets binary copying be told what a column is: it applies no
+    # conversions of its own, so it looks a column's type up by name and a type it cannot find
+    # cannot be copied into. But naming a type also gives it psycopg's own array support, and
+    # psycopg's array reader expects PostgreSQL's array syntax -- which an array of graph
+    # elements is not written in. So the loaders go on afterwards, and the last one registered
+    # is the one used.
+    for name in ("graphid", "vertex", "edge", "graphpath", "rowid"):
+        type_info(name).register(adapters)
     adapters.register_loader(OIDS["graphid"], GraphIdLoader)
     adapters.register_loader(OIDS["graphid"], GraphIdBinaryLoader)
     adapters.register_loader(OIDS["vertex"], VertexLoader)
