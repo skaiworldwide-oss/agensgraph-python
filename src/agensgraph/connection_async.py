@@ -32,7 +32,7 @@ from .bulk import (
     vertex_copy_statement,
     vertex_rows,
 )
-from .capabilities import VECTOR_AVAILABLE_QUERY
+from .capabilities import VECTOR_AVAILABLE_QUERY, VECTOR_VERSION_QUERY
 from .cypher import wrap_for_cursor
 from .introspect import (
     CONSTRAINTS_QUERY,
@@ -286,6 +286,18 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
         """Whether vectors can be read here at all, without registering anything."""
         rows = await self._fetch(VECTOR_AVAILABLE_QUERY, ())
         return bool(rows and rows[0][0])
+
+    async def vector_version(self) -> tuple[int, ...] | None:
+        """What version of pgvector is created here, or ``None`` if none is.
+
+        A version rather than a yes or no, because pgvector gates its own features on it: sparse
+        vectors and half precision arrived in 0.7.0 and iterative index scans in 0.8.0, so a caller
+        deciding whether to use one has a number to compare rather than a boolean to guess from.
+        """
+        rows = await self._fetch(VECTOR_VERSION_QUERY, ())
+        if not rows or rows[0][0] is None:
+            return None
+        return tuple(int(part) for part in str(rows[0][0]).split(".") if part.isdigit())
 
     # -- loading a lot at once -----------------------------------------------------------
 

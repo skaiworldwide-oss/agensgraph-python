@@ -150,6 +150,16 @@ class Capabilities:
         return f"Capabilities({self._reported!r})"
 
 
+VECTOR_VERSION_QUERY = """
+select extversion from pg_catalog.pg_extension where extname = 'vector'
+"""
+"""What version of pgvector is created here, or nothing.
+
+Worth having as a version rather than a yes or no, because pgvector gates features on its own
+version the way the server does: iterative index scans arrived in 0.8.0, and half precision and
+sparse vectors in 0.7.0. A caller that has to know cannot read it off a boolean.
+"""
+
 VECTOR_AVAILABLE_QUERY = """
 select count(*) > 0 from pg_catalog.pg_type t
 join pg_catalog.pg_namespace n on n.oid = t.typnamespace

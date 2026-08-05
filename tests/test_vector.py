@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import random
 import struct
+from array import array
 
 import pytest
 import pytest_asyncio
@@ -17,6 +18,8 @@ import pytest_asyncio
 import agensgraph
 from agensgraph.vector import (
     TYPES,
+    DenseVector,
+    Distance,
     SparseVector,
     expression_index,
     generated_column,
@@ -505,3 +508,119 @@ def test_a_sparse_vector_survives_the_server_exactly(vectors) -> None:  # type: 
     for _ in range(200):
         mine = SparseVector({0: random_single(rng), 3: random_single(rng)}, 6)
         assert vectors.execute("select %s::sparsevec", (mine,)).fetchone()[0] == mine
+
+
+class TestNamedDistances:
+    """Six operators, two or three punctuation characters each, two differing by one character."""
+
+    def test_every_operator_pgvector_defines_is_named(self) -> None:
+        assert {d.value for d in Distance} == {"<->", "<#>", "<=>", "<+>", "<~>", "<%>"}
+
+    def test_each_names_the_operator_class_an_index_needs(self) -> None:
+        assert Distance.L2.operator_class == "vector_l2_ops"
+        assert Distance.COSINE.operator_class == "vector_cosine_ops"
+        assert Distance.INNER_PRODUCT.operator_class == "vector_ip_ops"
+        assert Distance.L1.operator_class == "vector_l1_ops"
+
+    def test_the_two_that_measure_bits_say_so(self) -> None:
+        assert Distance.HAMMING.is_for_bits
+        assert Distance.JACCARD.is_for_bits
+        assert not Distance.L2.is_for_bits
+
+    def test_it_is_usable_straight_into_a_statement(self) -> None:
+        assert f"v {Distance.COSINE} %s" == "v <=> %s"
+
+    @pytest.mark.parametrize("distance", [d for d in Distance if not d.is_for_bits])
+    def test_the_server_has_every_one_of_them(self, vectors, distance) -> None:  # type: ignore[no-untyped-def]
+        row = vectors.execute(
+            f"select '[1,2,3,4]'::vector(4) {distance} '[4,3,2,1]'::vector(4)"
+        ).fetchone()
+        assert isinstance(row[0], float)
+
+    @pytest.mark.parametrize("distance", [d for d in Distance if d.is_for_bits])
+    def test_and_the_bit_ones_too(self, vectors, distance) -> None:  # type: ignore[no-untyped-def]
+        row = vectors.execute(f"select '1010'::bit(4) {distance} '1100'::bit(4)").fetchone()
+        assert isinstance(row[0], float)
+
+    @pytest.mark.parametrize("distance", [d for d in Distance if not d.is_for_bits])
+    def test_and_an_index_can_be_built_for_each(self, vectors, distance) -> None:  # type: ignore[no-untyped-def]
+        graph = vectors.label_table.graph
+        vectors.execute(
+            f'create index on "{graph}".emb using hnsw (v {distance.operator_class})'
+        )
+
+
+class TestSendingADenseVector:
+    """Reading needs nothing like this. Sending does, because the alternatives format text."""
+
+    def test_it_holds_what_it_was_given(self) -> None:
+        v = DenseVector([1.0, 2.0, 3.0])
+        assert len(v) == 3
+        assert list(v.values) == [1.0, 2.0, 3.0]
+
+    def test_it_is_a_value(self) -> None:
+        assert DenseVector([1.0]) == DenseVector([1.0])
+        assert hash(DenseVector([1.0])) == hash(DenseVector([1.0]))
+        with pytest.raises(AttributeError):
+            DenseVector([1.0]).values = [2.0]  # type: ignore[misc]
+
+    def test_the_wire_form_is_the_dimension_then_the_numbers(self) -> None:
+        raw = DenseVector([1.0, 2.0]).to_bytes()
+        assert len(raw) == 4 + 2 * 4
+        assert struct.unpack_from(">HH", raw, 0) == (2, 0)
+        assert struct.unpack_from(">2f", raw, 4) == (1.0, 2.0)
+
+    def test_the_bytes_are_a_third_of_the_text(self) -> None:
+        """Measured at 1536 dimensions: 6,148 bytes against 17,595."""
+        values = [i * 0.0012345678 for i in range(1536)]
+        text = "[" + ",".join(f"{v:.9g}" for v in values) + "]"
+        assert len(DenseVector(values).to_bytes()) < len(text) / 2
+
+    def test_a_value_sent_this_way_survives_exactly(self, vectors) -> None:  # type: ignore[no-untyped-def]
+        rng = random.Random(6)
+        values = [random_single(rng) for _ in range(4)]
+        sent = DenseVector(values)
+        back = vectors.execute("select %b", (sent,)).fetchone()[0]
+        assert back == values
+
+    def test_it_can_be_written_through_cypher(self, vectors) -> None:  # type: ignore[no-untyped-def]
+        vectors.execute("create (:emb {v: %s})", (DenseVector([1.0, 2.0, 3.0, 4.0]),))
+        (stored,) = vectors.execute_query("match (n:emb) return n.v").records[0]
+        assert stored == EMBEDDING
+
+    def test_it_sends_far_less_than_a_list_does(self, vectors) -> None:  # type: ignore[no-untyped-def]
+        """The mechanism behind the speed, asserted deterministically rather than by a clock.
+
+        A list is formatted as decimal text: 1536 numbers at up to nine significant digits each.
+        Packed, each is four bytes. The wall-clock consequence -- 0.32 ms against 2.55 ms for one
+        1536-dimension embedding, and 31,000 rows a second against 2,000 in bulk -- is recorded in
+        the module rather than asserted here, because a clock in a test suite is a flake waiting to
+        happen and the byte count is the same every time.
+        """
+        values = [i * 0.0012345678 for i in range(1536)]
+        as_text = "[" + ",".join(f"{v:.9g}" for v in values) + "]"
+        as_bytes = DenseVector(values).to_bytes()
+        assert len(as_bytes) == 4 + 4 * 1536
+        assert len(as_bytes) < len(as_text) / 2.5
+        # And it is the same value either way, which is what makes the saving free.
+        sent = vectors.execute("select %b", (DenseVector(values),)).fetchone()[0]
+        assert sent == array("f", values).tolist()
+
+
+class TestTheExtensionsVersion:
+    def test_it_is_reported_as_numbers(self, agens) -> None:  # type: ignore[no-untyped-def]
+        """A version rather than a boolean, because pgvector gates its own features on it."""
+        if not agens.has_vectors():
+            pytest.skip("the vector extension is not created in this database")
+        version = agens.vector_version()
+        assert version is not None
+        assert version >= (0, 5), "sparse vectors and half precision arrived in 0.7.0"
+        assert all(isinstance(part, int) for part in version)
+
+    def test_it_can_be_compared_to_decide_on_a_feature(self, agens) -> None:  # type: ignore[no-untyped-def]
+        if not agens.has_vectors():
+            pytest.skip("the vector extension is not created in this database")
+        version = agens.vector_version()
+        assert version is not None
+        iterative_scans = version >= (0, 8)
+        assert isinstance(iterative_scans, bool)

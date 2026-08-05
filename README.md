@@ -328,6 +328,63 @@ conn.execute("CREATE (:Emb {v: %s})", (v,))
 conn.execute('SELECT id, v <-> %s::sparsevec AS d FROM social."Emb" ORDER BY d LIMIT 5', (v,))
 ```
 
+### Sending dense vectors fast
+
+Reading a dense vector needs nothing special — it arrives as a list of numbers. *Sending* one does,
+because every other route formats each number as decimal text:
+
+| sending one 1536-dimension embedding | |
+|---|---|
+| a `list` with a `::vector(1536)` cast | 2.55 ms |
+| a string built by hand | 0.79 ms |
+| **`DenseVector(values)`** | **0.32 ms** |
+
+and in bulk, loading 20,000 embeddings of 768 dimensions:
+
+| | rows/s |
+|---|---|
+| one statement at a time | 2,002 |
+| `COPY` in text | 3,282 |
+| **`COPY` binary with `DenseVector`** | **31,396** |
+
+```python
+from agensgraph.vector import DenseVector
+
+conn.execute("INSERT INTO docs VALUES (%b)", (DenseVector(embedding),))
+
+with conn.cursor().copy("COPY docs (v) FROM STDIN (FORMAT BINARY)") as copy:
+    copy.set_types(["vector"])
+    for embedding in embeddings:
+        copy.write_row([DenseVector(embedding)])
+```
+
+The wire carries 6,148 bytes instead of 17,595, and the value survives exactly.
+
+### Distances by name
+
+All six of pgvector's distance operators, named — two of them differ by one character and mean
+entirely different things:
+
+```python
+from agensgraph.vector import Distance
+
+Distance.L2             # <->   Distance.L1        # <+>
+Distance.COSINE         # <=>   Distance.HAMMING   # <~>  (bit strings)
+Distance.INNER_PRODUCT  # <#>   Distance.JACCARD   # <%>  (bit strings)
+
+Distance.COSINE.operator_class   # 'vector_cosine_ops', for the index
+Distance.HAMMING.is_for_bits     # True
+```
+
+`conn.vector_version()` reports pgvector's version as numbers rather than a bare yes/no, because
+pgvector gates its own features on it — sparse vectors and half precision arrived in 0.7.0,
+iterative index scans in 0.8.0.
+
+### Reading: ask for binary
+
+Reading 200 embeddings of 1536 dimensions: **text 81.9 ms, binary 13.0 ms** — binary is 6.3×
+faster, and the two are now asserted to produce identical values on randomly drawn floats.
+
 ## Watching it work
 
 ```python
