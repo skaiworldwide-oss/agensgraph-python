@@ -20,7 +20,7 @@ from ._protocol.labels import LabelCache
 from .adapters import graph_adapters, register_binary
 from .capabilities import Capabilities
 from .cypher import check_bindable_positions, quote_identifier
-from .errors import explain_string_type, translate
+from .errors import StaleLabelCache, explain_string_type, translate
 from .observability import QueryRecord, logging_wanted, report
 from .summary import GraphWriteCounts
 
@@ -187,6 +187,17 @@ class GraphMixin:
     def _check(self, statement: Any) -> None:
         """Refuse a statement the server would accept and read as something else."""
         check_bindable_positions(statement_text(statement))
+
+    def _check_binary(self) -> None:
+        """Refuse the composite rendering while nothing can read it.
+
+        The loaders for it are built around a label table, so until one has been filled the
+        connection has none registered, and a graph value in the composite rendering arrives
+        as the bytes it was sent as. Bytes where a vertex belongs is a wrong answer that says
+        nothing, so it is refused instead.
+        """
+        if not self._agens_binary_ready:
+            raise StaleLabelCache.for_binary()
 
     @staticmethod
     def _select_graph_statement(name: str) -> str:

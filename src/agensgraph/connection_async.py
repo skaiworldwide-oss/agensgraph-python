@@ -257,6 +257,7 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
         with query_span(text, graph=self.label_table.graph):
             async with self.cursor(row_factory=row_) if row_ else self.cursor() as cursor:
                 if binary_:
+                    self._check_binary()
                     cursor.format = psycopg.pq.Format.BINARY
                 before: Sequence[int] | None = None
                 if counts_:
@@ -345,6 +346,7 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
         async with self.cursor(name=name or "agens_stream") as cursor:
             cursor.itersize = size
             if binary_:
+                self._check_binary()
                 cursor.format = psycopg.pq.Format.BINARY
             try:
                 await cursor.execute(statement, params)

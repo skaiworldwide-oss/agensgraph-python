@@ -136,3 +136,45 @@ class TestRollingBackTheGraphPath:
             conn.commit()
             assert conn.label_table.graph == second_graph
             conn.rollback()
+
+
+@pytest.mark.server
+class TestTheCompositeRenderingWithNoTable:
+    """The loaders for it are built around a label table, so without one nothing reads it."""
+
+    def test_it_is_refused_rather_than_handing_back_the_wire_bytes(
+        self, dsn: str, second_graph: str
+    ) -> None:
+        with agensgraph.Connection.connect(dsn, autocommit=True) as conn:
+            conn.execute(f'set graph_path = "{second_graph}"')
+            conn.execute("create (:account {n: 'x'})-[:owns]->(:account {n: 'y'})")
+            assert conn.label_table.graph is None
+            for statement in [
+                "match (n:account) return n",
+                "match p = (:account)-[:owns]->() return p",
+                "match p = (:account)-[:owns]->() return nodes(p)",
+            ]:
+                with pytest.raises(StaleLabelCache, match="refresh_labels"):
+                    conn.execute_query(statement, binary_=True)
+
+    def test_reading_in_chunks_is_refused_too(self, dsn: str, second_graph: str) -> None:
+        with agensgraph.Connection.connect(dsn, autocommit=True) as conn:
+            conn.execute(f'set graph_path = "{second_graph}"')
+            conn.execute("create (:account {n: 'x'})")
+            with pytest.raises(StaleLabelCache, match="refresh_labels"):
+                list(conn.stream("match (n:account) return n", binary_=True))
+
+    def test_the_text_rendering_needs_no_table(self, dsn: str, second_graph: str) -> None:
+        with agensgraph.Connection.connect(dsn, autocommit=True) as conn:
+            conn.execute(f'set graph_path = "{second_graph}"')
+            conn.execute("create (:account {n: 'x'})")
+            (vertex,) = conn.execute_query("match (n:account) return n").records[0]
+            assert vertex.label == "account"
+
+    def test_filling_the_table_makes_it_available(self, dsn: str, second_graph: str) -> None:
+        with agensgraph.Connection.connect(dsn, autocommit=True) as conn:
+            conn.execute(f'set graph_path = "{second_graph}"')
+            conn.execute("create (:account {n: 'x'})")
+            conn.refresh_labels()
+            (vertex,) = conn.execute_query("match (n:account) return n", binary_=True).records[0]
+            assert vertex.label == "account"

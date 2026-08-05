@@ -321,13 +321,13 @@ class UnresolvedCommit(_pg.OperationalError):
 
 
 class StaleLabelCache(_pg.OperationalError):
-    """A label the connection's label table cannot name.
+    """The connection's label table cannot serve the composite rendering.
 
-    Only the composite rendering can reach this, because only it leaves the label name out
-    and asks for it to be resolved from the label id. Either the label was created after the
-    table was filled, or the session was moved to another graph and the table was dropped
-    because the ids of one graph mean nothing in another. Both are answered by filling the
-    table again, with ``refresh_labels()``, and running the statement once more.
+    Only that rendering can reach this, because only it leaves the label name out and asks
+    for it to be resolved from the label id. Three ways in: the label was created after the
+    table was filled, the session was moved to another graph so the table was dropped
+    because the ids of one graph mean nothing in another, or no table was ever filled. All
+    three are answered by filling one, with ``refresh_labels()``, and asking again.
     """
 
     labid: int | None = None
@@ -347,6 +347,15 @@ class StaleLabelCache(_pg.OperationalError):
         exc.labid = labid
         exc.graph = graph
         return exc
+
+    @classmethod
+    def for_binary(cls) -> StaleLabelCache:
+        """Build the report for asking the composite rendering of a connection with no table."""
+        return cls(
+            "the composite rendering needs a label table to name a label from, and this "
+            "connection has none. Call graph() or refresh_labels() first, or read the text "
+            "rendering, which carries the name the server wrote"
+        )
 
 
 class StaleGeneration(_pg.OperationalError):
