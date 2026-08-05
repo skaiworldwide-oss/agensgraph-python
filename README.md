@@ -264,22 +264,74 @@ collection skips the module-level objects that were never going to be collected 
 
 ## Handing a result to something columnar
 
-An escape hatch, not how results are held — taking a table apart into Python objects costs more than
-never having built one:
+Arrow is built a column at a time, from the values as they arrived — not by making a Python list per
+column first:
 
 ```python
 from agensgraph.columnar import to_arrow, to_pandas, to_polars
 
 result = conn.execute_query("MATCH (n:Person) RETURN n.name AS name, n.age AS age")
-frame = to_pandas(result.records, result.keys)
+frame = to_pandas(result)
 ```
 
 Installed as needed, and imported only where used: `agensgraph-python[arrow]`, `[pandas]`,
 `[polars]`.
 
-**A whole vertex is refused**, because it is an identity, a label and a map rather than one value —
-with a message saying to return the parts wanted instead. A `GraphId` becomes its text form, a
-`Vector` a list of numbers, a sparse vector its text form.
+Measured on 200,000 vertices of five properties, against building one list per column and letting
+Arrow infer the types:
+
+| | a value at a time | a column at a time |
+|---|---|---|
+| an Arrow table | 1248 ms | **104 ms** |
+| a pandas frame | 1335 ms | **150 ms** |
+| a polars frame | 1272 ms | **114 ms** |
+
+**A whole vertex is a struct** of its identity, its label and its property map — and the map is JSON
+text taken from the bytes it arrived in, so it is never decoded into a dict:
+
+```python
+table = to_arrow(conn.execute_query("MATCH (n:Person) RETURN n"))
+# n: struct<id: uint64, label: dictionary<values=string, indices=int32>, properties: string>
+```
+
+219 ms for those 200,000 rows, against 864 for building a dict per row. An edge carries `start` and
+`end` as the same `uint64` a vertex's `id` is, so the join is an integer join. A path is a struct of
+a list of vertices and a list of edges. `Layout` says what to do where more than one answer is
+defensible — `elements="columns"` to spread a vertex over `n.id`, `n.label` and `n.properties`,
+`identity="text"` for `3.1` rather than the packed value, `properties=<a pyarrow struct type>` to
+pull named fields out of the map, `properties="skip"` to leave it out.
+
+**An embedding becomes `FixedSizeList<float32>`** straight from the wire bytes, with no Python float
+in between. Ask for the binary rendering and 20,000 vectors of 384 dimensions export in 80 ms rather
+than 4881, in half the memory:
+
+```python
+result = conn.execute_query("MATCH (n:Emb) RETURN n.v AS v", binary_=True)
+table = to_arrow(result)          # v: fixed_size_list<item: float>[384]
+```
+
+**A large result is exported a chunk at a time.** `batches()` and `reader()` take a server-side
+cursor and never hold more than one chunk of Python objects — 88 MB of peak memory for those 20,000
+embeddings, against 168 MB for the whole result at once and 605 MB through lists of floats. The first
+chunk settles the schema and every later one is held to it, so the chunks concatenate:
+
+```python
+with conn.transaction(), conn.cursor(name="export") as cursor:
+    cursor.execute('SELECT id, v FROM "graph".emb')
+    pyarrow.dataset.write_dataset(columnar.reader(cursor, size=8192), "out", format="parquet")
+```
+
+**Loading the other way** goes through binary `COPY`, with the property maps written as JSON a chunk
+at a time and no row ever becoming a Python mapping:
+
+```python
+conn.load_vertex_frame("Person", table)               # each column is a property
+conn.load_edge_frame("KNOWS", edges)                  # start and end are packed identities
+```
+
+1.5× an Arrow table handed to `load_vertices()` as mappings, and no more than that: of 1879 ms for
+200,000 vertices, 1810 is the server's own ingest. The client's share is what falls, from 1024 ms to
+125.
 
 ## Numbers in a property map
 

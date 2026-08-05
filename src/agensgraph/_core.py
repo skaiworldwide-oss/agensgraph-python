@@ -54,11 +54,16 @@ class Result(NamedTuple):
     ``records`` are the rows as the row factory built them, ``keys`` the column names, and
     ``counts`` what the statement changed -- which for a statement that changed nothing is
     five ``None`` rather than five zeros, because it was never asked.
+
+    ``oids`` are the type of each column as the server described it, which is what lets a
+    columnar export give an empty result its schema. A Cypher expression is jsonb whatever it
+    evaluates to, so for most of a graph result these say only that.
     """
 
     records: list[Any]
     keys: list[str]
     counts: GraphWriteCounts
+    oids: tuple[int, ...] = ()
 
 
 KEEPALIVE_DEFAULTS = {

@@ -21,17 +21,28 @@ from typing import Any
 
 import msgspec
 
-__all__ = ["decode_json", "read_numbers_exactly", "reading_numbers_exactly"]
+__all__ = ["decode_json", "encode_json", "read_numbers_exactly", "reading_numbers_exactly"]
 
 _AS_FLOAT = msgspec.json.Decoder().decode
 _AS_DECIMAL = msgspec.json.Decoder(float_hook=Decimal).decode
 
 _decode: Any = _AS_FLOAT
 
+_encode = msgspec.json.Encoder(decimal_format="number").encode
+
 
 def decode_json(data: bytes) -> Any:
     """Read a property map, at whichever precision is currently asked for."""
     return _decode(data)
+
+
+def encode_json(value: Any) -> bytes:
+    """Write a value back as JSON.
+
+    A decimal is written as a number rather than as a string, so a map read with
+    :func:`read_numbers_exactly` and written again holds the numbers it held.
+    """
+    return _encode(value)
 
 
 def read_numbers_exactly(enabled: bool = True) -> None:
