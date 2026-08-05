@@ -20,12 +20,12 @@ they already know.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import psycopg
 from psycopg.rows import Row, tuple_row
 
-from ._core import GraphMixin, Result, with_keepalives
+from ._core import GraphMixin, Result, statement_text, with_keepalives
 from .bulk import (
     EDGE_COLUMN_TYPES,
     VERTEX_COLUMN_TYPES,
@@ -37,7 +37,7 @@ from .bulk import (
 )
 from .capabilities import VECTOR_AVAILABLE_QUERY, VECTOR_VERSION_QUERY
 from .columnar import CHUNK
-from .cypher import wrap_for_cursor
+from .cypher import check_bindable_positions, wrap_for_cursor
 from .errors import BatchFailed
 from .introspect import (
     CONSTRAINTS_QUERY,
@@ -71,13 +71,41 @@ from .vector import search_option_statements
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator, Mapping, Sequence
+    from typing import Self
 
-    from psycopg.abc import Params
+    from psycopg.abc import Params, Query, QueryNoTemplate
     from psycopg.rows import RowFactory
 
     from ._core import Statement
     from ._protocol.graphid import GraphId
-__all__ = ["Connection"]
+__all__ = ["Connection", "Cursor"]
+
+
+class Cursor(psycopg.Cursor[Row]):
+    """A cursor that refuses a statement the server would read as something else.
+
+    Every way of running a statement arrives here: ``execute_query`` builds a cursor,
+    ``connection.execute`` builds one, and a caller may take one and use it directly. So one
+    check here holds for all of them.
+    """
+
+    def execute(
+        self,
+        query: Query,
+        params: Params | None = None,
+        *,
+        prepare: bool | None = None,
+        binary: bool | None = None,
+    ) -> Self:
+        check_bindable_positions(statement_text(query))
+        super().execute(cast("QueryNoTemplate", query), params, prepare=prepare, binary=binary)
+        return self
+
+    def executemany(
+        self, query: Query, params_seq: Iterable[Params], *, returning: bool = False
+    ) -> None:
+        check_bindable_positions(statement_text(query))
+        super().executemany(query, params_seq, returning=returning)
 
 
 class Connection(GraphMixin, psycopg.Connection[Row]):
@@ -88,6 +116,10 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
     syntax for. What is added is the graph types, a graph to read them from, and a statement
     check for the one shape the server would misread.
     """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.cursor_factory = Cursor
 
     @classmethod
     def connect(cls, conninfo: str = "", **kwargs: Any) -> Connection[Any]:
@@ -159,9 +191,7 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
         still hold whatever an earlier statement left -- so without the earlier reading there
         is no way to tell a number this statement earned from one it inherited.
         """
-        if isinstance(query, str):
-            self._check(query)
-        text = query if isinstance(query, str) else str(query)
+        text = statement_text(query)
         timer = Timer()
         with query_span(text, graph=self.label_table.graph):
             with self.cursor(row_factory=row_) if row_ else self.cursor() as cursor:

@@ -37,8 +37,15 @@ __all__ = [
 # the way psycopg does, with %s or %(name)s, and those are turned into $1 and $2 on the way
 # out -- so a check that knew only the server's spelling would never fire on anything anyone
 # actually wrote.
+#
+# The star has to stand where the grammar puts a walk length, which is inside the brackets of
+# a relationship pattern: a dash, then a bracket holding at most a variable and a label. A
+# star anywhere else is multiplication or a count, and `return 2 * $1` is a statement the
+# server runs and answers.
 _PLACEHOLDER = r"(?:\$\d+|%(?:\([^)]*\))?[sbt])"
-_LENGTH_PARAMETER = re.compile(r"\*\s*(?:\d+\s*)?(?:\.\.\s*)?" + _PLACEHOLDER)
+_LENGTH_PARAMETER = re.compile(
+    r"-\s*\[\s*(?:[A-Za-z_]\w*)?\s*(?::[\w\s]*)?\*\s*(?:\d+\s*)?(?:\.\.\s*)?" + _PLACEHOLDER
+)
 
 # Lower case only: the lexer lowers an unquoted name, so anything holding a capital has to
 # be quoted to reach the server as it was written.

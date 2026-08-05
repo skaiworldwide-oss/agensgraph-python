@@ -177,9 +177,9 @@ class GraphMixin:
 
     # -- statements ---------------------------------------------------------------------
 
-    def _check(self, statement: str) -> None:
+    def _check(self, statement: Any) -> None:
         """Refuse a statement the server would accept and read as something else."""
-        check_bindable_positions(statement)
+        check_bindable_positions(statement_text(statement))
 
     @staticmethod
     def _select_graph_statement(name: str) -> str:
@@ -269,3 +269,24 @@ Statement = Union[str, bytes, "SQL", "Composed"]
 Narrower than what psycopg's own type allows, because a template is not something a cursor
 will take, and a caller should hear that from a type checker rather than at run time.
 """
+
+
+def statement_text(statement: Any) -> str:
+    """The text of a statement, however it was written.
+
+    A check that reads a statement has to reach every spelling of one, since the shape it
+    refuses is as reachable through bytes or a composed statement as through text. A
+    template is read by joining its literal parts around the placeholder each hole stands
+    for, which is the statement the server is going to be sent.
+    """
+    if type(statement) is str:
+        return statement
+    if isinstance(statement, bytes):
+        return statement.decode("utf-8", "replace")
+    as_string = getattr(statement, "as_string", None)
+    if as_string is not None:
+        return str(as_string(None))
+    strings = getattr(statement, "strings", None)
+    if strings is not None:
+        return "%s".join(strings)
+    return str(statement)

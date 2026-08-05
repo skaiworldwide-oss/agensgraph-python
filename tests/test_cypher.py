@@ -18,6 +18,10 @@ from agensgraph.cypher import (
 # and matches a walk of any length.
 MISREAD = [
     "match (a)-[r*1..$1]->(b) return a",
+    "match (a)<-[r*1..$1]-(b) return a",
+    'match (a)-[r:"my label"*1..$1]->(b) return a',
+    "match (a)-[r*1..%s]->(b) return a",
+    "match (a)-[r*1..%(bound)s]->(b) return a",
     "match (a)-[r*..$1]->(b) return a",
     "match (a)-[r*$1]->(b) return a",
     "match (a)-[r:knows*1..$1]->(b) return a",
@@ -46,6 +50,14 @@ FINE = [
     "/* /* [r*1..$1] */ */ match (n) return n",
     "return $$ [r*1..$1] $$",
     "return $tag$ [r*1..$1] $tag$",
+    # A star that is multiplication or a count, which the server runs and answers.
+    "return 2 * $1",
+    "match (n) return n.price * $1",
+    "match (n) where n.qty * $1 > 10 return n",
+    "match (n) return count(*) * $1",
+    "match (n) where n.tags[0] * $1 > 1 return n",
+    "return [2 * $1]",
+    "match (a)-[r*1..2]->(b) return count(*) * $1",
 ]
 
 
@@ -231,3 +243,57 @@ class TestCasePreservationAgainstAServer:
             if seen:
                 break
         assert [(item.channel, item.payload) for item in seen] == [("MyChannel", "hello")]
+
+
+class TestTheRefusalReachesEveryWayOfRunningAStatement:
+    """The shape is as reachable through a cursor or through bytes as through the one method
+    a caller was shown first, so the check lives on the cursor every route builds."""
+
+    BAD = "match (a)-[r*1..%s]->(b) return a"
+
+    def test_every_route_refuses_it(self, agens) -> None:  # type: ignore[no-untyped-def]
+        from psycopg import sql
+
+        routes = [
+            lambda: agens.execute(self.BAD, (1,)),
+            lambda: agens.cursor().execute(self.BAD, (1,)),
+            lambda: agens.cursor().executemany(self.BAD, [(1,)]),
+            lambda: agens.execute_query(self.BAD, (1,)),
+            lambda: agens.execute_query(self.BAD.encode(), (1,)),
+            lambda: agens.execute(self.BAD.encode(), (1,)),
+            lambda: agens.execute(sql.SQL(self.BAD), (1,)),  # type: ignore[arg-type]
+            lambda: agens.execute(
+                sql.SQL("match (a)-[r*1..{}]->(b) return a").format(sql.SQL("%s")), (1,)
+            ),
+        ]
+        for run in routes:
+            with pytest.raises(ValueError, match="length of a variable-length relationship"):
+                run()
+
+    def test_a_bound_written_into_the_statement_is_not_refused(self, agens) -> None:  # type: ignore[no-untyped-def]
+        """Which is what the refusal tells a caller to do, so it has to be allowed."""
+        from psycopg import sql
+
+        agens.execute("match (a)-[r*1..2]->(b) return a")
+        agens.execute(sql.SQL("match (a)-[r*1..{}]->(b) return a").format(sql.Literal(2)))
+
+
+@pytest.mark.server
+class TestMultiplicationByAParameter:
+    """Every one of these was refused as a walk length, and the server runs them all."""
+
+    @pytest.mark.parametrize(
+        ("statement", "expected"),
+        [
+            ("return 2 * %s", 6),
+            ("match (n:m) return n.price * %s", 30),
+            ("match (n:m) return count(*) * %s", 3),
+            ("match (n:m) where n.tags[0] * %s > 1 return n.qty", 4),
+        ],
+    )
+    def test_the_server_answers_it(self, agens, statement: str, expected: int) -> None:  # type: ignore[no-untyped-def]
+        agens.execute("create vlabel m")
+        agens.refresh_labels()
+        agens.execute("create (:m %s)", ({"price": 10, "qty": 4, "tags": [7]},))
+        (got,) = agens.execute_query(statement, (3,)).records[0]
+        assert got == expected
