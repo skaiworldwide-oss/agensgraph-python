@@ -42,9 +42,9 @@ from .types import GraphId as GraphId
 from .types import Label as Label
 from .types import Path as Path
 from .types import Vertex as Vertex
-from .vector import DenseVector as DenseVector
 from .vector import Distance as Distance
 from .vector import SparseVector as SparseVector
+from .vector import Vector as Vector
 
 __all__ = [
     "LABID_MAX",
@@ -59,7 +59,6 @@ __all__ = [
     "Constraint",
     "Deadline",
     "DeclaredProperty",
-    "DenseVector",
     "Distance",
     "Edge",
     "Expired",
@@ -79,6 +78,7 @@ __all__ = [
     "SparseVector",
     "TokenBucket",
     "Unspecified",
+    "Vector",
     "Vertex",
     "add_query_logger",
     "connect",

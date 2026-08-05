@@ -18,9 +18,9 @@ import pytest_asyncio
 import agensgraph
 from agensgraph.vector import (
     TYPES,
-    DenseVector,
     Distance,
     SparseVector,
+    Vector,
     expression_index,
     generated_column,
     nearest,
@@ -124,8 +124,9 @@ class TestPromotionChangesWhatAPropertyReadsAs:
         """Registering is what makes this a list of numbers rather than the string it prints as."""
         vectors.execute("create (:emb {v: [1,2,3,4]})")
         (value,) = vectors.execute_query("match (n:emb) return n.v").records[0]
-        assert value == EMBEDDING
-        assert isinstance(value, list)
+        assert value == EMBEDDING, "and it compares equal to a plain list, which is the point"
+        assert isinstance(value, Vector), "not a list -- a value that only unpacks if asked"
+        assert value.tolist() == EMBEDDING
         assert all(isinstance(each, float) for each in value)
 
     def test_without_registering_it_would_be_a_string(self, agens) -> None:  # type: ignore[no-untyped-def]
@@ -550,22 +551,22 @@ class TestNamedDistances:
         )
 
 
-class TestSendingADenseVector:
+class TestSendingAVector:
     """Reading needs nothing like this. Sending does, because the alternatives format text."""
 
     def test_it_holds_what_it_was_given(self) -> None:
-        v = DenseVector([1.0, 2.0, 3.0])
+        v = Vector([1.0, 2.0, 3.0])
         assert len(v) == 3
         assert list(v.values) == [1.0, 2.0, 3.0]
 
     def test_it_is_a_value(self) -> None:
-        assert DenseVector([1.0]) == DenseVector([1.0])
-        assert hash(DenseVector([1.0])) == hash(DenseVector([1.0]))
+        assert Vector([1.0]) == Vector([1.0])
+        assert hash(Vector([1.0])) == hash(Vector([1.0]))
         with pytest.raises(AttributeError):
-            DenseVector([1.0]).values = [2.0]  # type: ignore[misc]
+            Vector([1.0]).values = [2.0]  # type: ignore[misc]
 
     def test_the_wire_form_is_the_dimension_then_the_numbers(self) -> None:
-        raw = DenseVector([1.0, 2.0]).to_bytes()
+        raw = Vector([1.0, 2.0]).to_bytes()
         assert len(raw) == 4 + 2 * 4
         assert struct.unpack_from(">HH", raw, 0) == (2, 0)
         assert struct.unpack_from(">2f", raw, 4) == (1.0, 2.0)
@@ -574,17 +575,17 @@ class TestSendingADenseVector:
         """Measured at 1536 dimensions: 6,148 bytes against 17,595."""
         values = [i * 0.0012345678 for i in range(1536)]
         text = "[" + ",".join(f"{v:.9g}" for v in values) + "]"
-        assert len(DenseVector(values).to_bytes()) < len(text) / 2
+        assert len(Vector(values).to_bytes()) < len(text) / 2
 
     def test_a_value_sent_this_way_survives_exactly(self, vectors) -> None:  # type: ignore[no-untyped-def]
         rng = random.Random(6)
         values = [random_single(rng) for _ in range(4)]
-        sent = DenseVector(values)
+        sent = Vector(values)
         back = vectors.execute("select %b", (sent,)).fetchone()[0]
         assert back == values
 
     def test_it_can_be_written_through_cypher(self, vectors) -> None:  # type: ignore[no-untyped-def]
-        vectors.execute("create (:emb {v: %s})", (DenseVector([1.0, 2.0, 3.0, 4.0]),))
+        vectors.execute("create (:emb {v: %s})", (Vector([1.0, 2.0, 3.0, 4.0]),))
         (stored,) = vectors.execute_query("match (n:emb) return n.v").records[0]
         assert stored == EMBEDDING
 
@@ -599,11 +600,11 @@ class TestSendingADenseVector:
         """
         values = [i * 0.0012345678 for i in range(1536)]
         as_text = "[" + ",".join(f"{v:.9g}" for v in values) + "]"
-        as_bytes = DenseVector(values).to_bytes()
+        as_bytes = Vector(values).to_bytes()
         assert len(as_bytes) == 4 + 4 * 1536
         assert len(as_bytes) < len(as_text) / 2.5
         # And it is the same value either way, which is what makes the saving free.
-        sent = vectors.execute("select %b", (DenseVector(values),)).fetchone()[0]
+        sent = vectors.execute("select %b", (Vector(values),)).fetchone()[0]
         assert sent == array("f", values).tolist()
 
 
@@ -624,3 +625,83 @@ class TestTheExtensionsVersion:
         assert version is not None
         iterative_scans = version >= (0, 8)
         assert isinstance(iterative_scans, bool)
+
+
+class TestVectorIsLazyAndStillBehavesLikeASequence:
+    """The bargain: nothing is unpacked until asked, and it still compares equal to a list.
+
+    An array of singles would have been four bytes a number and fast, and would have called itself
+    unequal to ``[1.0, 2.0]`` -- quietly, since comparing an array to a list is simply false. This
+    keeps the speed and the equality both.
+    """
+
+    def test_it_knows_its_length_without_unpacking_anything(self) -> None:
+        """The dimension is in the first two bytes, so counting is free."""
+        raw = Vector([1.0, 2.0, 3.0]).to_bytes()
+        held = Vector.from_wire(raw)
+        assert len(held) == 3
+        assert held._values is None, "still nothing unpacked"
+
+    def test_reading_a_number_unpacks_once_and_keeps_it(self) -> None:
+        held = Vector.from_wire(Vector([1.0, 2.0]).to_bytes())
+        assert held[0] == 1.0
+        assert held._values is not None
+        assert held._raw is None, "the bytes are let go once the numbers exist"
+
+    def test_it_equals_a_list_of_the_same_numbers(self) -> None:
+        assert Vector([1.0, 2.0]) == [1.0, 2.0]
+        assert Vector([1.0, 2.0]) == (1.0, 2.0)
+        assert Vector([1.0, 2.0]) == Vector([1.0, 2.0])
+
+    def test_and_differs_from_one_that_is_not(self) -> None:
+        assert Vector([1.0, 2.0]) != [1.0, 3.0]
+        assert Vector([1.0, 2.0]) != [1.0]
+        assert Vector([1.0]) != "one"
+
+    def test_the_sequence_operations_all_work(self) -> None:
+        v = Vector([1.0, 2.0, 3.0])
+        assert len(v) == 3
+        assert v[0] == 1.0
+        assert v[-1] == 3.0
+        assert list(v[0:2]) == [1.0, 2.0]
+        assert list(v) == [1.0, 2.0, 3.0]
+        assert 2.0 in v
+        assert v.index(2.0) == 1
+        assert v.count(2.0) == 1
+        assert sum(v) == 6.0
+        assert [x * 2 for x in v] == [2.0, 4.0, 6.0]
+
+    def test_the_numbers_are_an_array_numpy_can_take_without_copying(self) -> None:
+        v = Vector([1.0, 2.0])
+        assert v.values.typecode == "f"
+        assert len(memoryview(v.values)) == 2
+
+    def test_it_is_a_value(self) -> None:
+        assert hash(Vector([1.0])) == hash(Vector([1.0]))
+        assert {Vector([1.0]): "seen"}[Vector([1.0])] == "seen"
+        with pytest.raises(AttributeError):
+            Vector([1.0]).values = array("f", [2.0])  # type: ignore[misc]
+
+    def test_sending_back_what_was_read_reuses_the_bytes(self) -> None:
+        """Nothing is unpacked to send a vector straight back."""
+        raw = Vector([1.0, 2.0]).to_bytes()
+        held = Vector.from_wire(raw)
+        assert held.to_bytes() == raw
+        assert held._values is None, "and it still has not unpacked"
+
+    def test_a_text_reading_is_lazy_too(self) -> None:
+        """Parsing is the expensive half of the text form, so it waits as well."""
+        held = Vector.from_wire_text(b"[1,2,3]")
+        assert held._values is None
+        assert held == [1.0, 2.0, 3.0]
+        assert held._values is not None
+
+    def test_both_readings_of_a_vector_are_equal_to_each_other(self, vectors) -> None:  # type: ignore[no-untyped-def]
+        rng = random.Random(9)
+        values = [random_single(rng) for _ in range(8)]
+        literal = "[" + ",".join(f"{v:.9g}" for v in values) + "]"
+        text = vectors.execute("select %s::vector(8)", (literal,)).fetchone()[0]
+        binary = vectors.execute("select %s::vector(8)", (literal,), binary=True).fetchone()[0]
+        assert text == binary
+        assert text == values
+        assert text.tolist() == binary.tolist()

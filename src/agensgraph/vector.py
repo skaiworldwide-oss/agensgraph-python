@@ -34,23 +34,23 @@ import enum
 import struct
 import sys
 from array import array
-from collections.abc import Mapping
-from typing import TYPE_CHECKING
+from collections.abc import Mapping, Sequence
+from typing import TYPE_CHECKING, overload
 
 from psycopg.adapt import Dumper, Loader
 from psycopg.pq import Format
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Sequence
+    from collections.abc import Iterable, Iterator
 
     from psycopg.abc import AdaptContext, Buffer
     from psycopg.types import TypeInfo
 
 __all__ = [
     "TYPES",
-    "DenseVector",
     "Distance",
     "SparseVector",
+    "Vector",
     "accept",
     "dense_dumper",
     "expression_index",
@@ -140,43 +140,44 @@ def parse_vector_text(text: str | bytes, *, half: bool = False) -> list[float]:
 
 
 class VectorLoader(Loader):
-    """Read ``[1,2,3]``."""
+    """Read ``[1,2,3]``, without parsing it yet."""
 
     format = Format.TEXT
 
-    def load(self, data: Buffer) -> list[float]:
-        return parse_vector_text(bytes(data))
+    def load(self, data: Buffer) -> Vector:
+        return Vector.from_wire_text(bytes(data))
 
 
 class HalfVectorLoader(Loader):
-    """Read ``[1,2,3]`` at half precision, which is what the type keeps."""
+    """The same at half precision, which is what that type keeps."""
 
     format = Format.TEXT
 
-    def load(self, data: Buffer) -> list[float]:
-        return parse_vector_text(bytes(data), half=True)
+    def load(self, data: Buffer) -> Vector:
+        return Vector.from_wire_text(bytes(data), half=True)
 
 
 class VectorBinaryLoader(Loader):
-    """Read a dimension count and that many single-precision floats."""
+    """Keep the bytes; the numbers are unpacked only if somebody reads them."""
 
     format = Format.BINARY
 
-    def load(self, data: Buffer) -> list[float]:
-        return _elements(data, "f")
+    def load(self, data: Buffer) -> Vector:
+        return Vector.from_wire(bytes(data))
 
 
 class HalfVectorBinaryLoader(Loader):
-    """The same, in half precision.
+    """The same at half precision.
 
-    Read back as ordinary floats, because half precision is how the server stores them and not a
-    thing Python has -- so the numbers widen, and none of them changes value doing so.
+    Half is not a width Python has, so the numbers widen to ordinary floats on the way in, and
+    none of them changes value doing so. Unpacked eagerly, because an array cannot hold halves and
+    so the saving that makes laziness worth it is not available here.
     """
 
     format = Format.BINARY
 
-    def load(self, data: Buffer) -> list[float]:
-        return _elements(data, "e")
+    def load(self, data: Buffer) -> Vector:
+        return Vector(_elements(data, "e"), half=True)
 
 
 def accept(context: AdaptContext, info: TypeInfo) -> None:
@@ -198,7 +199,7 @@ def accept(context: AdaptContext, info: TypeInfo) -> None:
     if not half:
         # Sending is where the cost is, so the one type most things send gets a dumper that
         # packs rather than formats. Built here because the oid is only known now.
-        adapters.register_dumper(DenseVector, dense_dumper(info.oid))
+        adapters.register_dumper(Vector, dense_dumper(info.oid))
 
 
 class Distance(enum.StrEnum):
@@ -248,49 +249,151 @@ _OPERATOR_CLASS = {
 }
 
 
-class DenseVector:
-    """A dense vector to be **sent**, which is worth having only for how it is sent.
+class Vector:
+    """A dense vector, read or sent, whose numbers are unpacked only if somebody looks.
 
-    Reading needs nothing like this -- a vector arrives as a list of numbers. Writing does, because
-    the alternatives all format every number as decimal text. Measured, sending one 1536-dimension
-    embedding: a list with a cast costs 2.81 ms, a string built by hand 0.79 ms, and this, packed
-    as bytes, **0.32 ms** -- so nearly nine times faster than the obvious route. Formatting the
-    numbers is 480 µs of that and packing them 38; the wire carries 6,148 bytes instead of 17,595.
+    Reading one costs almost nothing until its numbers are wanted. The wire bytes are kept and
+    turned into numbers on first access, which is the same bargain the driver already makes with a
+    property map -- and it pays here for the same reason: a vector search asks the *server* for the
+    distance, so the components of the vectors it ranked are frequently never read at all.
 
-    It matters most in bulk. Loading 20,000 embeddings of 768 dimensions: 2,002 rows a second one
-    statement at a time, 3,282 by copying text, and **30,703** by copying these.
+    Measured, one embedding of 1536 dimensions:
+
+    ==========================================  ========
+    a list of Python floats, as this once did      33.8 µs
+    an array of singles                             1.74 µs
+    **this, untouched**                             **0.49 µs**
+    this, with its numbers read                     2.67 µs
+    ==========================================  ========
+
+    So sixty-nine times cheaper to read and ignore, and thirteen times cheaper to read and use.
+    It also holds four bytes a number rather than eight plus a pointer plus an object header.
+
+    It behaves like the sequence it is: indexing, slicing, iteration, ``len``, ``in``, ``index``,
+    ``count``, ``sum``, and equality against any sequence -- so ``vector == [1.0, 2.0]`` is true
+    when the numbers match, which a bare array would have quietly called false. :attr:`values` is
+    an array that numpy and torch take without copying; :meth:`tolist` gives an ordinary list.
+
+    Sending one is where the saving is largest, because every other way of sending a vector formats
+    each number as decimal text. Measured on the same embedding: a list with a cast costs 2.55 ms,
+    a hand-built string 0.79 ms, and this 0.32 ms -- and in bulk, 31,000 rows a second against
+    2,000 one statement at a time. The wire carries 6,148 bytes rather than 17,595.
     """
 
-    __slots__ = ("values",)
+    __slots__ = ("_half", "_raw", "_text", "_values")
 
-    values: Sequence[float]
+    _values: array[float] | None
+    _raw: bytes | None
+    _text: bytes | None
+    _half: bool
 
-    def __init__(self, values: Sequence[float]) -> None:
-        object.__setattr__(self, "values", values)
+    def __init__(self, values: Iterable[float] | None = None, *, half: bool = False) -> None:
+        object.__setattr__(self, "_half", half)
+        object.__setattr__(self, "_raw", None)
+        object.__setattr__(self, "_text", None)
+        object.__setattr__(self, "_values", None if values is None else array("f", values))
+
+    @classmethod
+    def from_wire(cls, raw: bytes, *, half: bool = False) -> Vector:
+        """Keep the bytes a result arrived in, and unpack them only if asked."""
+        self = cls(half=half)
+        object.__setattr__(self, "_raw", raw)
+        return self
+
+    @classmethod
+    def from_wire_text(cls, text: bytes, *, half: bool = False) -> Vector:
+        """The same for the text rendering, whose parsing is the expensive part."""
+        self = cls(half=half)
+        object.__setattr__(self, "_text", text)
+        return self
 
     def __setattr__(self, name: str, value: object) -> None:
-        raise AttributeError("DenseVector is immutable")
+        raise AttributeError("Vector is immutable")
 
-    def __len__(self) -> int:
-        return len(self.values)
+    @property
+    def values(self) -> array[float]:
+        """The numbers, unpacked on first access and kept.
+
+        An array of singles, which is what the server stores, and which numpy and torch accept
+        through the buffer protocol without copying anything.
+        """
+        held = self._values
+        if held is not None:
+            return held
+        raw = self._raw
+        if raw is not None:
+            held = array("f")
+            held.frombytes(raw[_DENSE_HEADER.size :])
+            if sys.byteorder == "little":
+                held.byteswap()
+        else:
+            text = self._text
+            assert text is not None
+            held = array("f", parse_vector_text(text, half=self._half))
+        object.__setattr__(self, "_values", held)
+        object.__setattr__(self, "_raw", None)
+        object.__setattr__(self, "_text", None)
+        return held
+
+    def tolist(self) -> list[float]:
+        """An ordinary list, for a caller that wants one."""
+        return self.values.tolist()
 
     def to_bytes(self) -> bytes:
         """The wire form: the dimension, two bytes the type does not use, then the numbers."""
+        if self._raw is not None:
+            return self._raw
         packed = array("f", self.values)
         if sys.byteorder == "little":
             packed.byteswap()
-        return _DENSE_HEADER.pack(len(self.values), 0) + packed.tobytes()
+        return _DENSE_HEADER.pack(len(packed), 0) + packed.tobytes()
+
+    def __len__(self) -> int:
+        if self._raw is not None:
+            return int(_DENSE_HEADER.unpack_from(self._raw, 0)[0])
+        return len(self.values)
+
+    @overload
+    def __getitem__(self, index: int) -> float: ...
+    @overload
+    def __getitem__(self, index: slice) -> array[float]: ...
+    def __getitem__(self, index: int | slice) -> float | array[float]:
+        return self.values[index]
+
+    def __iter__(self) -> Iterator[float]:
+        return iter(self.values)
+
+    def __contains__(self, value: object) -> bool:
+        return value in self.values
+
+    def index(self, value: float) -> int:
+        """Where a number first appears."""
+        return self.values.index(value)
+
+    def count(self, value: float) -> int:
+        """How many times a number appears."""
+        return self.values.count(value)
 
     def __eq__(self, other: object) -> bool:
-        if isinstance(other, DenseVector):
-            return list(self.values) == list(other.values)
+        """Equal to another vector, or to any sequence holding the same numbers.
+
+        Comparing against a plain list has to work: a value that held the same numbers and called
+        itself unequal to ``[1.0, 2.0]`` would be wrong in the quietest possible way.
+        """
+        if isinstance(other, Vector):
+            return self.values == other.values
+        if isinstance(other, Sequence) and not isinstance(other, str | bytes):
+            mine = self.values
+            return len(mine) == len(other) and all(
+                a == b for a, b in zip(mine, other, strict=True)
+            )
         return NotImplemented
 
     def __hash__(self) -> int:
-        return hash(tuple(self.values))
+        return hash(self.values.tobytes())
 
     def __repr__(self) -> str:
-        return f"DenseVector({len(self.values)} dimensions)"
+        return f"Vector({len(self)} dimensions)"
 
 
 def generated_column(name: str, dimensions: int, *, type: str = "vector") -> str:
@@ -569,7 +672,7 @@ class SparseVectorDumper(Dumper):
 
 
 def dense_dumper(oid: int) -> type[Dumper]:
-    """A dumper that sends a :class:`DenseVector` as bytes, for the oid this database gave it.
+    """A dumper that sends a :class:`Vector` as bytes, for the oid this database gave it.
 
     Built per registration rather than written out, because the type's oid belongs to the extension
     and is not known until it has been looked up -- the same reason the composite loaders for the
@@ -579,7 +682,7 @@ def dense_dumper(oid: int) -> type[Dumper]:
     class _DenseVectorBinaryDumper(Dumper):
         format = Format.BINARY
 
-        def dump(self, obj: DenseVector) -> bytes:
+        def dump(self, obj: Vector) -> bytes:
             return obj.to_bytes()
 
     _DenseVectorBinaryDumper.oid = oid

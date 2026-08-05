@@ -328,16 +328,42 @@ conn.execute("CREATE (:Emb {v: %s})", (v,))
 conn.execute('SELECT id, v <-> %s::sparsevec AS d FROM social."Emb" ORDER BY d LIMIT 5', (v,))
 ```
 
-### Sending dense vectors fast
+### Dense vectors
 
-Reading a dense vector needs nothing special — it arrives as a list of numbers. *Sending* one does,
-because every other route formats each number as decimal text:
+A dense vector arrives as a `Vector`, which keeps the bytes the server sent and turns them into
+numbers only if you look. That is the same bargain the driver makes with a property map, and it pays
+here for the same reason: a vector search asks the *server* for the distance, so the components of
+the vectors it ranked are often never read.
+
+```python
+(v,) = conn.execute("SELECT v FROM docs LIMIT 1", binary=True).fetchone()
+
+len(v)              # free -- the dimension is in the first two bytes
+v == [1.0, 2.0]     # True when the numbers match
+v[0], v[-1], v[0:2], list(v), sum(v), 2.0 in v, v.index(2.0)
+v.values            # an array('f') that numpy and torch take without copying
+v.tolist()          # an ordinary list, if you want one
+```
+
+It is not a `list` — `isinstance(v, list)` is `False` and `json.dumps(v)` raises — but it compares
+equal to one, which is the part that would otherwise go wrong quietly.
+
+| reading 200 embeddings of 1536 dimensions | |
+|---|---|
+| binary, values untouched | **5.8 ms** |
+| binary, one value read from each | 10.5 ms |
+| text, values untouched | 16.9 ms |
+
+Ask for `binary=True` where you can: even with the parse deferred, text costs 3× more.
+
+Sending is where the largest saving is, because every other route formats each number as decimal
+text:
 
 | sending one 1536-dimension embedding | |
 |---|---|
 | a `list` with a `::vector(1536)` cast | 2.55 ms |
 | a string built by hand | 0.79 ms |
-| **`DenseVector(values)`** | **0.32 ms** |
+| **`Vector(values)`** | **0.32 ms** |
 
 and in bulk, loading 20,000 embeddings of 768 dimensions:
 
@@ -345,18 +371,21 @@ and in bulk, loading 20,000 embeddings of 768 dimensions:
 |---|---|
 | one statement at a time | 2,002 |
 | `COPY` in text | 3,282 |
-| **`COPY` binary with `DenseVector`** | **31,396** |
+| **`COPY` binary with `Vector`** | **31,396** |
 
 ```python
-from agensgraph.vector import DenseVector
+from agensgraph.vector import Vector
 
-conn.execute("INSERT INTO docs VALUES (%b)", (DenseVector(embedding),))
+conn.execute("INSERT INTO docs VALUES (%b)", (Vector(embedding),))
 
 with conn.cursor().copy("COPY docs (v) FROM STDIN (FORMAT BINARY)") as copy:
     copy.set_types(["vector"])
     for embedding in embeddings:
-        copy.write_row([DenseVector(embedding)])
+        copy.write_row([Vector(embedding)])
 ```
+
+The same type goes both ways, so a vector read from one place can be sent to another without being
+unpacked at all.
 
 The wire carries 6,148 bytes instead of 17,595, and the value survives exactly.
 
@@ -380,10 +409,8 @@ Distance.HAMMING.is_for_bits     # True
 pgvector gates its own features on it — sparse vectors and half precision arrived in 0.7.0,
 iterative index scans in 0.8.0.
 
-### Reading: ask for binary
-
-Reading 200 embeddings of 1536 dimensions: **text 81.9 ms, binary 13.0 ms** — binary is 6.3×
-faster, and the two are now asserted to produce identical values on randomly drawn floats.
+Both renderings are asserted to produce identical values on floats drawn from the whole of single
+precision — not just on small whole numbers, which survive every conversion and so prove nothing.
 
 ## Watching it work
 
