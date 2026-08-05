@@ -26,6 +26,7 @@ from .introspect import DeclaredProperty as DeclaredProperty
 from .introspect import DesiredIndex as DesiredIndex
 from .introspect import Graph as Graph
 from .introspect import Index as Index
+from .introspect import IndexElement as IndexElement
 from .introspect import Label as LabelInfo
 from .introspect import Unique as Unique
 from .observability import Notice as Notice
@@ -71,6 +72,7 @@ __all__ = [
     "GraphId",
     "GraphWriteCounts",
     "Index",
+    "IndexElement",
     "Jsonb",
     "Label",
     "LabelInfo",

@@ -5,12 +5,15 @@ this needs no server: it is a list in, a list of statements out. The live half a
 things a pure test cannot -- that the statements are ones the server accepts, and that a second
 run has nothing left to do.
 
-Three of the server's rules shape what is being tested here, each read off a live server rather
-than assumed. A property index is btree and takes no method, so a vector index has to be made as
-plain SQL and turns up here as an index over an *expression* -- which is why ``drop_extra`` has to
-leave those alone. Uniqueness takes one property; ``ASSERT (a, b) IS UNIQUE`` is a syntax error.
-And an unnamed constraint is named after the label and a counter, so the name carries nothing
-about what the constraint is for.
+The server's rules that the tests turn on:
+
+* A definition is printed with every default left out. ``ASC`` never appears, ``NULLS LAST`` only
+  alongside ``DESC``, an operator class only when it is not the default.
+* A predicate is stored normalised: ``a > 0`` prints as ``(a) > cypher_to_jsonb(0)``.
+* A uniqueness assertion is over an expression. ``ASSERT lower(name) IS UNIQUE`` is accepted,
+  ``ASSERT (a, b) IS UNIQUE`` is not.
+* An unnamed constraint is named ``<label>_unique_constraint`` or ``<label>_properties_check``, then
+  the same with a counter.
 """
 
 from __future__ import annotations
@@ -24,11 +27,16 @@ from agensgraph.introspect import (
     Constraint,
     DesiredIndex,
     Index,
+    IndexElement,
     Unique,
     constraint_name,
     create_constraint_statement,
     create_index_statement,
+    index_elements,
+    index_is_partial,
+    index_method,
     index_properties,
+    parse_index_element,
     reconcile_constraints,
     reconcile_indexes,
 )
@@ -83,9 +91,10 @@ class TestReadingTheColumnsOffADefinition:
     def test_a_nested_property_path_is_not_a_plain_property(self) -> None:
         assert index_properties(an_index("doc", "a.b.c").definition) is None
 
-    def test_a_sort_order_makes_it_more_than_a_list_of_names(self) -> None:
-        assert index_properties(an_index("doc", "a DESC, b").definition) is None
-        assert index_properties(an_index("doc", "a, b NULLS FIRST").definition) is None
+    def test_a_sort_order_is_read_rather_than_refused(self) -> None:
+        """The names are still the names; how they are keyed is read separately."""
+        assert index_properties(an_index("doc", "a DESC, b").definition) == ("a", "b")
+        assert index_properties(an_index("doc", "a, b NULLS FIRST").definition) == ("a", "b")
 
     def test_a_partial_index_is_not_a_plain_index_over_its_properties(self) -> None:
         """It covers them conditionally, so reading it as a plain index would report a desired
@@ -176,20 +185,28 @@ class TestDiffingIndexes:
             # A vector index over a property still in the map, as the catalog prints it.
             "CREATE PROPERTY INDEX doc_v ON doc USING hnsw "
             "(((v)::vector(4)) vector_cosine_ops)",
-            # The same over a promoted column, which carries an operator class and so is not a
-            # plain property index either.
-            "CREATE PROPERTY INDEX doc_v ON doc USING hnsw (v vector_l2_ops)",
-            # And one made as plain SQL over the jsonb arrow operator.
+            # One made as plain SQL over the jsonb arrow operator, likewise an expression.
             "CREATE PROPERTY INDEX doc_v ON doc USING btree ((properties ->> 'v'))",
         ],
     )
-    def test_a_vector_index_survives_drop_extra(self, definition: str) -> None:
-        """The one that would hurt. None of these is an index over a list of plain properties, so
-        a reconciler that dropped whatever it did not recognise would take out somebody's vector
-        index while reconciling a list of property names."""
+    def test_an_index_over_an_expression_survives_drop_extra(self, definition: str) -> None:
+        """Nothing a desired index can say describes these, so they are neither matched nor
+        dropped -- otherwise reconciling a list of property names would take out a vector index."""
         existing = Index("doc", "doc_v", False, definition)
-        assert index_properties(definition) is None
+        assert index_elements(definition) is None
         assert reconcile_indexes([], [existing], drop_extra=True) == []
+
+    def test_a_vector_index_over_a_column_is_describable_and_so_is_dropped(self) -> None:
+        """It keys a plain property with an operator class, which a desired index can say, so
+        ``drop_extra`` reads the list it was given as the whole of what should exist."""
+        definition = "CREATE PROPERTY INDEX doc_v ON doc USING hnsw (v vector_l2_ops)"
+        existing = Index("doc", "doc_v", False, definition)
+        assert index_elements(definition) == (IndexElement("v", "vector_l2_ops", False, False),)
+        assert reconcile_indexes([], [existing], drop_extra=True) == [
+            "drop property index doc_v"
+        ]
+        wanted = [DesiredIndex("doc", (IndexElement("v", "vector_l2_ops"),), method="hnsw")]
+        assert reconcile_indexes(wanted, [existing], drop_extra=True) == []
 
     def test_a_name_is_used_when_one_is_given(self) -> None:
         statements = reconcile_indexes([DesiredIndex("doc", ("name",), name="my_idx")], [])
@@ -335,11 +352,10 @@ class TestAgainstAServer:
         ]
         assert graph.ensure_indexes([DesiredIndex("doc", ("c",))]) == []
 
-    def test_the_richer_index_forms_are_left_alone(self, graph) -> None:  # type: ignore[no-untyped-def]
-        """Each of these is accepted by the server and describable by no DesiredIndex, so none may
-        be dropped while reconciling a list of property names."""
+    def test_an_index_no_declaration_could_describe_is_left_alone(self, graph) -> None:  # type: ignore[no-untyped-def]
+        """A nested path and an expression cannot be written as a DesiredIndex, so neither may be
+        dropped while reconciling a list that could not have mentioned them."""
         graph.execute("create property index on doc (a.b.c)")
-        graph.execute("create property index on doc (d desc nulls first, e)")
         graph.execute("create property index on doc ((f + g))")
         before = {index.name for index in graph.indexes("doc")}
         graph.ensure_indexes([DesiredIndex("doc", ("name",))], drop_extra=True)
@@ -402,3 +418,170 @@ class TestTheAwaitingInterface:
         desired = [Unique("doc", "sku"), Check("doc", "age > 0", "doc_age_ok")]
         assert len(await conn.ensure_constraints(desired)) == 2
         assert await conn.ensure_constraints(desired) == []
+
+
+class TestReadingHowAnIndexKeysItsProperties:
+    """The server prints these canonically, omitting every default, so they round-trip."""
+
+    @pytest.mark.parametrize(
+        ("printed", "expected"),
+        [
+            # Ascending with nulls last is the default, so neither is printed.
+            ("a", IndexElement("a", None, False, False)),
+            ("a DESC", IndexElement("a", None, True, True)),
+            ("a NULLS FIRST", IndexElement("a", None, False, True)),
+            ("a DESC NULLS LAST", IndexElement("a", None, True, False)),
+            ("m jsonb_path_ops", IndexElement("m", "jsonb_path_ops", False, False)),
+            ("m jsonb_path_ops DESC", IndexElement("m", "jsonb_path_ops", True, True)),
+            ('"odd name"', IndexElement("odd name", None, False, False)),
+        ],
+    )
+    def test_an_element(self, printed: str, expected: IndexElement) -> None:
+        assert parse_index_element(printed) == expected
+
+    @pytest.mark.parametrize(
+        "printed", ["", "((a) + (b))", "a.b.c", 'a COLLATE "C"', "a b c d"]
+    )
+    def test_something_that_is_not_a_plain_element(self, printed: str) -> None:
+        assert parse_index_element(printed) is None
+
+    def test_the_defaults_an_element_leaves_implicit_are_resolved_before_comparing(
+        self,
+    ) -> None:
+        """Ascending puts nulls last and descending puts them first, so an element that says so
+        explicitly has to equal one that leaves it out -- otherwise the two would never match."""
+        assert IndexElement("a").resolved() == IndexElement("a", nulls_first=False).resolved()
+        assert (
+            IndexElement("a", descending=True).resolved()
+            == IndexElement("a", descending=True, nulls_first=True).resolved()
+        )
+
+    def test_the_method_is_read(self) -> None:
+        assert index_method("CREATE PROPERTY INDEX i ON doc USING gin (m)") == "gin"
+        assert index_method("CREATE PROPERTY INDEX i ON doc USING btree (a)") == "btree"
+        assert index_method("nonsense") is None
+
+    def test_a_predicate_is_noticed_and_only_after_the_key_list(self) -> None:
+        assert index_is_partial("CREATE PROPERTY INDEX i ON doc USING btree (a) WHERE (a) > 0")
+        assert not index_is_partial("CREATE PROPERTY INDEX i ON doc USING btree (a)")
+        assert not index_is_partial(an_index("doc", "where").definition)
+
+    def test_a_multi_element_key_list(self) -> None:
+        definition = "CREATE PROPERTY INDEX i ON doc USING btree (a, b DESC, c NULLS FIRST)"
+        assert index_elements(definition) == (
+            IndexElement("a", None, False, False),
+            IndexElement("b", None, True, True),
+            IndexElement("c", None, False, True),
+        )
+
+
+class TestDiffingTheWiderIndexes:
+    def test_the_method_is_part_of_what_an_index_is(self) -> None:
+        """A gin index over a property is not the btree index somebody asked for."""
+        gin = Index("doc", "g", False, "CREATE PROPERTY INDEX g ON doc USING gin (m)")
+        assert reconcile_indexes([DesiredIndex("doc", ("m",))], [gin]) == [
+            "create property index on doc (m)"
+        ]
+        assert reconcile_indexes([DesiredIndex("doc", ("m",), method="gin")], [gin]) == []
+
+    def test_a_sort_order_is_part_of_it_too(self) -> None:
+        plain = an_index("doc", "a")
+        descending = (DesiredIndex("doc", (IndexElement("a", descending=True),)),)
+        assert reconcile_indexes(descending, [plain]) == [
+            "create property index on doc (a desc)"
+        ]
+        assert reconcile_indexes(descending, [an_index("doc", "a DESC")]) == []
+
+    def test_an_operator_class_is_part_of_it(self) -> None:
+        actual = [Index("doc", "g", False, "CREATE PROPERTY INDEX g ON doc USING gin (m)")]
+        wanted = (DesiredIndex("doc", (IndexElement("m", "jsonb_path_ops"),), method="gin"),)
+        assert reconcile_indexes(wanted, actual) == [
+            "create property index on doc using gin (m jsonb_path_ops)"
+        ]
+
+    def test_a_partial_index_is_matched_by_name(self) -> None:
+        wanted = [DesiredIndex("doc", ("a",), name="doc_hot", where="a > 0")]
+        assert reconcile_indexes(wanted, []) == [
+            "create property index doc_hot on doc (a) where a > 0"
+        ]
+        existing = Index(
+            "doc",
+            "doc_hot",
+            False,
+            "CREATE PROPERTY INDEX doc_hot ON doc USING btree (a) WHERE (a) > cypher_to_jsonb(0)",
+        )
+        assert reconcile_indexes(wanted, [existing]) == []
+
+    def test_a_partial_index_without_a_name_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="needs a name"):
+            reconcile_indexes([DesiredIndex("doc", ("a",), where="a > 0")], [])
+
+    def test_a_partial_index_is_not_dropped_as_an_extra_one(self) -> None:
+        """It is not describable as an unconditional index, so it is not one to drop."""
+        existing = Index(
+            "doc",
+            "doc_hot",
+            False,
+            "CREATE PROPERTY INDEX doc_hot ON doc USING btree (a) WHERE (a) > cypher_to_jsonb(0)",
+        )
+        assert reconcile_indexes([], [existing], drop_extra=True) == []
+
+
+@pytest.mark.server
+class TestTheWiderFormsAgainstAServer:
+    """That each form is accepted, and that a second run of the same declaration does nothing."""
+
+    @pytest.fixture
+    def graph(self, agens):  # type: ignore[no-untyped-def]
+        agens.execute("create vlabel doc")
+        return agens
+
+    @pytest.mark.parametrize(
+        "wanted",
+        [
+            DesiredIndex("doc", ("a",)),
+            DesiredIndex("doc", ("a", "b")),
+            DesiredIndex("doc", ("a",), unique=True),
+            DesiredIndex("doc", (IndexElement("a", descending=True),)),
+            DesiredIndex("doc", (IndexElement("a", nulls_first=True),)),
+            DesiredIndex("doc", (IndexElement("a", descending=True, nulls_first=False),)),
+            DesiredIndex("doc", ("a", IndexElement("b", descending=True)), name="mixed"),
+            DesiredIndex("doc", (IndexElement("m", "jsonb_path_ops"),), method="gin"),
+            DesiredIndex("doc", ("h",), method="hash"),
+            DesiredIndex("doc", ("a",), name="doc_hot", where="a > 0"),
+            DesiredIndex("doc", ("a",), name="doc_hot2", where="a > 0 and b < 10"),
+        ],
+    )
+    def test_it_is_accepted_and_then_already_there(self, graph, wanted) -> None:  # type: ignore[no-untyped-def]
+        applied = graph.ensure_indexes([wanted])
+        assert len(applied) == 1, applied
+        assert graph.ensure_indexes([wanted]) == [], (
+            f"a second run repeated the work for {wanted!r}"
+        )
+
+    def test_naming_an_operator_class_that_is_already_the_default_is_reported(
+        self, graph
+    ) -> None:  # type: ignore[no-untyped-def]
+        """The server omits a default operator class when it prints a definition, so asking for one
+        by name can never be recognised afterwards. Without the check that follows a run, every run
+        would drop and remake the index; with it, the first run says so."""
+        wanted = [DesiredIndex("doc", (IndexElement("m", "jsonb_ops"),), method="gin")]
+        with pytest.raises(RuntimeError, match="still do not match"):
+            graph.ensure_indexes(wanted)
+
+    def test_a_gin_index_is_not_confused_with_a_btree_one_over_the_same_property(
+        self, graph
+    ) -> None:  # type: ignore[no-untyped-def]
+        both = [DesiredIndex("doc", ("m",)), DesiredIndex("doc", ("m",), method="gin")]
+        assert len(graph.ensure_indexes(both)) == 2
+        assert graph.ensure_indexes(both) == []
+        assert len(graph.indexes("doc")) == 2
+
+    def test_changing_the_predicate_of_a_partial_index_is_not_noticed(self, graph) -> None:  # type: ignore[no-untyped-def]
+        """Asserted because it is a limitation rather than a bug, and one a caller has to know:
+        the predicate is stored normalised, so it cannot be compared against the one written."""
+        graph.ensure_indexes([DesiredIndex("doc", ("a",), name="doc_hot", where="a > 0")])
+        assert (
+            graph.ensure_indexes([DesiredIndex("doc", ("a",), name="doc_hot", where="a > 5")])
+            == []
+        )

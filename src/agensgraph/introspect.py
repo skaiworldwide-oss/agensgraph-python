@@ -38,11 +38,16 @@ __all__ = [
     "DesiredIndex",
     "Graph",
     "Index",
+    "IndexElement",
     "Label",
     "Unique",
     "constraint_name",
     "element_count_query",
+    "index_elements",
+    "index_is_partial",
+    "index_method",
     "index_properties",
+    "parse_index_element",
     "reconcile_constraints",
     "reconcile_indexes",
 ]
@@ -202,33 +207,88 @@ class Constraint(NamedTuple):
     definition: str
 
 
+class IndexElement(NamedTuple):
+    """One property an index is keyed on, with how it is keyed.
+
+    The server omits every default when it prints a definition: ``ASC`` never appears, ``NULLS
+    LAST`` only with ``DESC``, ``NULLS FIRST`` only without it, and an operator class only when it
+    is not the default for the type. Name an operator class only when it differs from the default.
+    """
+
+    property: str
+    operator_class: str | None = None
+    descending: bool = False
+    nulls_first: bool | None = None
+    """``None`` for whichever way round the sort order implies: last ascending, first descending."""
+
+    def nulls_come_first(self) -> bool:
+        """Where nulls go, with the default resolved."""
+        return self.descending if self.nulls_first is None else self.nulls_first
+
+    def resolved(self) -> IndexElement:
+        """The same element with nothing left implicit."""
+        return self._replace(nulls_first=self.nulls_come_first())
+
+    def rendered(self) -> str:
+        """How this element is written into a statement."""
+        parts = [quote_identifier(self.property)]
+        if self.operator_class is not None:
+            parts.append(self.operator_class)
+        if self.descending:
+            parts.append("desc")
+        if self.nulls_first is not None and self.nulls_first != self.descending:
+            parts.append("nulls first" if self.nulls_first else "nulls last")
+        return " ".join(parts)
+
+
 class DesiredIndex(NamedTuple):
-    """A plain btree property index somebody wants to exist.
+    """A property index somebody wants to exist.
 
-    Matched against what is there by the properties it covers and whether it is unique, read off
-    the definition the server printed. Not by name: the server derives one from the columns, but
-    truncates it at the identifier limit and appends a counter on a collision.
+    Matched by the access method and the elements it is keyed on, read off the definition the
+    server printed. A difference in uniqueness is a drop and a remake.
 
-    A property index can be a good deal more than this -- over a nested path or an expression, with
-    a sort order, an operator class, an access method, ``INCLUDE`` columns, or a ``WHERE`` making it
-    partial. None of that is described here, and reconciliation leaves any such index alone rather
-    than treating it as one of these. Write those as DDL, or as :func:`agensgraph.vector.vector_index`
-    for a vector.
+    ``properties`` takes plain names, or :class:`IndexElement` for an operator class or a sort
+    order. The two can be mixed.
+
+    ``where`` makes the index partial and requires a ``name``, which it is then matched by. **A
+    change to the predicate of a partial index is not noticed**; change its name to have it rebuilt.
+
+    An index over a nested path or an expression, or one with ``INCLUDE`` columns, is not described
+    here, and is neither matched nor dropped. Write those as DDL, or
+    :func:`agensgraph.vector.vector_index` for a vector.
     """
 
     label: str
-    properties: tuple[str, ...]
+    properties: tuple[str | IndexElement, ...]
     unique: bool = False
     name: str | None = None
     """A name to give it. The server picks one from the properties if this is ``None``."""
+    method: str = "btree"
+    """The access method. ``btree`` unless said otherwise, as it is for the server."""
+    where: str | None = None
+    """A predicate making the index partial. Requires ``name``; see above."""
+
+    @property
+    def elements(self) -> tuple[IndexElement, ...]:
+        """The elements, with a plain name read as an element with everything defaulted."""
+        return tuple(
+            IndexElement(item) if isinstance(item, str) else item for item in self.properties
+        )
+
+    def key(self) -> tuple[str, str, tuple[IndexElement, ...]]:
+        """What this index is matched on."""
+        return (
+            self.label,
+            self.method.lower(),
+            tuple(element.resolved() for element in self.elements),
+        )
 
 
 class Unique(NamedTuple):
     """An assertion that a property holds a different value on every element of a label.
 
-    The server asserts over an *expression*, so ``ASSERT lower(name) IS UNIQUE`` is accepted while
-    ``ASSERT (a, b) IS UNIQUE`` is not -- a parenthesised list is not an expression. Only a plain
-    property name is described here; an assertion over anything else is written as DDL.
+    The assertion is over an expression: ``ASSERT lower(name) IS UNIQUE`` is accepted,
+    ``ASSERT (a, b) IS UNIQUE`` is not. Only a plain property name is described here.
     """
 
     label: str
@@ -240,10 +300,10 @@ class Unique(NamedTuple):
 class Check(NamedTuple):
     """A condition every element of a label has to satisfy.
 
-    The name is required. An unnamed check is named ``<label>_properties_check``, then ``check1``
-    and ``check2`` as more are added, which identifies no condition in particular.
+    The name is required. An unnamed check is named ``<label>_properties_check``, then the same
+    with a counter.
 
-    The expression is Cypher, written into the statement as given rather than parsed or quoted.
+    The expression is Cypher, written into the statement as given.
     """
 
     label: str
@@ -252,11 +312,7 @@ class Check(NamedTuple):
 
 
 def _bare_property(token: str) -> str | None:
-    """The property a column of an index definition reads, if it reads one plainly.
-
-    ``None`` for an expression, which no desired property index matches and which
-    :func:`reconcile_indexes` therefore never drops.
-    """
+    """The property a column of an index definition reads, if it reads one plainly."""
     token = token.strip()
     if not token:
         return None
@@ -270,47 +326,147 @@ def _bare_property(token: str) -> str | None:
     return token if all(char == "_" or char.isalnum() for char in token) else None
 
 
-def index_properties(definition: str) -> tuple[str, ...] | None:
-    """The properties a plain index covers, read off the definition the server printed.
+def _split_top_level(text: str, separator: str) -> list[str]:
+    """Split on a separator that is not inside parentheses or quotes."""
+    depth, quoted, parts, current = 0, False, [], ""
+    for char in text:
+        if char == '"':
+            quoted = not quoted
+        elif not quoted:
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+            elif char == separator and depth == 0:
+                parts.append(current)
+                current = ""
+                continue
+        current += char
+    parts.append(current)
+    return parts
 
-    ``None`` for anything a desired index cannot describe, which reconciliation therefore leaves
-    alone. The grammar allows a great deal more than a list of property names: a nested path
-    (``a.b.c``), an expression (``((a) + (b))``), a sort or nulls order per element, an operator
-    class, an access method, ``INCLUDE``, and a ``WHERE`` making the index partial. All of those
-    read as ``None`` here.
+
+def _split_words(text: str) -> list[str]:
+    """Split on whitespace that is not inside a quoted name or parentheses.
+
+    A property whose name holds a space is printed quoted.
     """
-    start = definition.find("(", definition.find(" USING "))
-    if start < 0:
+    depth, quoted, words, current = 0, False, [], ""
+    for char in text:
+        if char == '"':
+            quoted = not quoted
+        elif not quoted:
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+            elif char.isspace() and depth == 0:
+                if current:
+                    words.append(current)
+                current = ""
+                continue
+        current += char
+    if current:
+        words.append(current)
+    return words
+
+
+def _key_list(definition: str) -> tuple[str, int] | None:
+    """The text between the parentheses an index is keyed on, and where it ends."""
+    using = definition.find(" USING ")
+    start = definition.find("(", using)
+    if using < 0 or start < 0:
         return None
-    depth, parts, current, end = 0, [], "", 0
+    depth = 0
     for offset, char in enumerate(definition[start:]):
         if char == "(":
             depth += 1
-            if depth == 1:
-                continue
         elif char == ")":
             depth -= 1
             if depth == 0:
-                parts.append(current)
-                end = start + offset + 1
-                break
-        if depth == 1 and char == ",":
-            parts.append(current)
-            current = ""
-            continue
-        current += char
-    else:
+                return definition[start + 1 : start + offset], start + offset + 1
+    return None
+
+
+def index_method(definition: str) -> str | None:
+    """The access method, which the server always prints."""
+    using = definition.find(" USING ")
+    if using < 0:
         return None
-    # A partial index, or one carrying extra columns, covers its properties conditionally or holds
-    # more than it is keyed on. Neither is the index a bare list of property names asks for, and
-    # reading one as though it were would report a desired index as already present.
-    rest = definition[end:].upper()
-    if " WHERE " in f" {rest} " or "INCLUDE" in rest:
+    rest = definition[using + len(" USING ") :].lstrip()
+    name = rest.split("(", 1)[0].split()[0] if rest else ""
+    return name.lower() or None
+
+
+def index_is_partial(definition: str) -> bool:
+    """Whether a predicate limits which elements the index covers."""
+    found = _key_list(definition)
+    if found is None:
+        return False
+    return " WHERE " in f" {definition[found[1] :].upper()} "
+
+
+def _has_included_columns(definition: str) -> bool:
+    found = _key_list(definition)
+    return found is not None and "INCLUDE" in definition[found[1] :].upper()
+
+
+def parse_index_element(token: str) -> IndexElement | None:
+    """One element of a printed key list, or ``None`` if it is not a plain property.
+
+    Read from the right: the nulls order, then the sort order, then an operator class. What is
+    left has to be a bare property name.
+    """
+    words = _split_words(token)
+    if not words:
         return None
-    properties = [_bare_property(part) for part in parts]
-    if not properties or any(name is None for name in properties):
+    nulls_first: bool | None = None
+    if (
+        len(words) >= 2
+        and words[-2].upper() == "NULLS"
+        and words[-1].upper() in ("FIRST", "LAST")
+    ):
+        nulls_first = words[-1].upper() == "FIRST"
+        words = words[:-2]
+    descending = bool(words) and words[-1].upper() == "DESC"
+    if descending or (words and words[-1].upper() == "ASC"):
+        words = words[:-1]
+    if not words:
         return None
-    return tuple(name for name in properties if name is not None)
+    operator_class: str | None = None
+    if len(words) > 1:
+        # A collation lands here too, and is not described.
+        if words[-2].upper() == "COLLATE":
+            return None
+        operator_class = words[-1]
+        words = words[:-1]
+    if len(words) != 1:
+        return None
+    name = _bare_property(words[0])
+    if name is None:
+        return None
+    return IndexElement(name, operator_class, descending, nulls_first).resolved()
+
+
+def index_elements(definition: str) -> tuple[IndexElement, ...] | None:
+    """The elements a plain index is keyed on, read off the definition the server printed.
+
+    ``None`` for anything a desired index cannot describe: a nested path, an expression, a
+    collation, ``INCLUDE`` columns, or a predicate.
+    """
+    found = _key_list(definition)
+    if found is None or index_is_partial(definition) or _has_included_columns(definition):
+        return None
+    elements = [parse_index_element(token) for token in _split_top_level(found[0], ",")]
+    if not elements or any(element is None for element in elements):
+        return None
+    return tuple(element for element in elements if element is not None)
+
+
+def index_properties(definition: str) -> tuple[str, ...] | None:
+    """The property names a plain index is keyed on, ignoring how it keys them."""
+    elements = index_elements(definition)
+    return None if elements is None else tuple(element.property for element in elements)
 
 
 def constraint_name(desired: Unique | Check) -> str:
@@ -325,11 +481,19 @@ def constraint_name(desired: Unique | Check) -> str:
 def create_index_statement(desired: DesiredIndex) -> str:
     if not desired.properties:
         raise ValueError(f"an index covers at least one property, got none for {desired.label}")
+    if desired.where is not None and not desired.name:
+        raise ValueError(
+            f"a partial index on {desired.label} needs a name, because its predicate is stored "
+            f"normalised and so cannot be compared against the one written here"
+        )
     unique = "unique " if desired.unique else ""
     name = f"{quote_identifier(desired.name)} " if desired.name else ""
-    columns = ", ".join(quote_identifier(prop) for prop in desired.properties)
+    method = "" if desired.method.lower() == "btree" else f"using {desired.method} "
+    keys = ", ".join(element.rendered() for element in desired.elements)
+    where = f" where {desired.where}" if desired.where is not None else ""
     return (
-        f"create {unique}property index {name}on {quote_identifier(desired.label)} ({columns})"
+        f"create {unique}property index {name}on {quote_identifier(desired.label)} "
+        f"{method}({keys}){where}"
     )
 
 
@@ -356,31 +520,52 @@ def reconcile_indexes(
 ) -> list[str]:
     """The statements that take the indexes that exist to the ones asked for.
 
-    Empty when they already agree. An index whose properties are asked for but whose uniqueness
-    differs is dropped and remade; uniqueness cannot be altered into an index.
+    Empty when they already agree. An index whose elements are asked for but whose uniqueness
+    differs is dropped and remade. A partial index is matched by name. Anything not describable as
+    a :class:`DesiredIndex` is neither matched nor dropped.
     """
-    have: dict[tuple[str, tuple[str, ...]], Index] = {}
+    by_key: dict[tuple[str, str, tuple[IndexElement, ...]], Index] = {}
+    by_name: dict[tuple[str, str], Index] = {}
     for index in actual:
-        properties = index_properties(index.definition)
-        if properties is not None:
-            have[index.label, properties] = index
+        by_name[index.label, index.name] = index
+        elements = index_elements(index.definition)
+        method = index_method(index.definition)
+        if elements is not None and method is not None:
+            by_key[index.label, method, elements] = index
 
     statements: list[str] = []
-    wanted: set[tuple[str, tuple[str, ...]]] = set()
+    matched: set[str] = set()
     for want in desired:
-        key = (want.label, tuple(want.properties))
-        wanted.add(key)
-        existing = have.get(key)
-        if existing is None:
+        if want.where is not None:
+            existing = by_name.get((want.label, constraint_name_of_index(want)))
+            if existing is None:
+                statements.append(create_index_statement(want))
+            else:
+                matched.add(existing.name)
+                if existing.unique != want.unique:
+                    statements.append(drop_index_statement(existing.name))
+                    statements.append(create_index_statement(want))
+            continue
+        found = by_key.get(want.key())
+        if found is None:
             statements.append(create_index_statement(want))
-        elif existing.unique != want.unique:
-            statements.append(drop_index_statement(existing.name))
+            continue
+        matched.add(found.name)
+        if found.unique != want.unique:
+            statements.append(drop_index_statement(found.name))
             statements.append(create_index_statement(want))
     if drop_extra:
-        for key, index in have.items():
-            if key not in wanted:
+        for index in by_key.values():
+            if index.name not in matched:
                 statements.append(drop_index_statement(index.name))
     return statements
+
+
+def constraint_name_of_index(desired: DesiredIndex) -> str:
+    """The name a partial index is matched by, which it has to have been given."""
+    if not desired.name:
+        raise ValueError(f"a partial index on {desired.label} needs a name")
+    return desired.name[:MAX_IDENTIFIER]
 
 
 def reconcile_constraints(
@@ -391,9 +576,8 @@ def reconcile_constraints(
 ) -> list[str]:
     """The statements that take the constraints that exist to the ones asked for.
 
-    Matched by name. A definition comes back normalised -- ``age > 0`` is printed as
-    ``ASSERT ((age) > cypher_to_jsonb(0))`` -- so an expression as written never equals one as
-    printed.
+    Matched by name. A definition comes back normalised: ``age > 0`` prints as
+    ``ASSERT ((age) > cypher_to_jsonb(0))``.
     """
     have = {(constraint.label, constraint.name): constraint for constraint in actual}
     statements: list[str] = []

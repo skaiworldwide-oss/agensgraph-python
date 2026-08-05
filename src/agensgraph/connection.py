@@ -403,21 +403,26 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
         drop_extra: bool = False,
         dry_run: bool = False,
     ) -> list[str]:
-        """Make the indexes that exist the ones asked for, and report what that took.
+        """Make the indexes that exist the ones asked for, and return the statements that took.
 
-        Returns the statements run, so an empty list means nothing had to change -- which is what
-        running this a second time gives. With ``dry_run`` the statements are worked out and
-        returned without being run.
+        An empty list means nothing had to change, which is what a second run gives. ``dry_run``
+        returns the statements without running them.
 
-        ``drop_extra`` removes indexes nobody asked for, and considers only indexes over plain
-        properties: one over an expression, which is what an index on a vector in the property
-        map is, is left alone rather than dropped for not appearing in a list of property names.
+        ``drop_extra`` also removes indexes nobody asked for, considering only indexes a
+        :class:`~agensgraph.DesiredIndex` could describe. One over an expression is left alone.
+
+        The state is read again afterwards and anything still outstanding is raised. Naming an
+        operator class that is already the default does this, since the server omits a default when
+        printing a definition.
         """
         name = self._graph_of(graph)
         statements = reconcile_indexes(desired, self.indexes(graph=name), drop_extra=drop_extra)
-        if not dry_run:
-            for statement in statements:
-                self._run(statement)
+        if dry_run:
+            return statements
+        for statement in statements:
+            self._run(statement)
+        if statements:
+            self._settled(reconcile_indexes(desired, self.indexes(graph=name)), "indexes")
         return statements
 
     def ensure_constraints(
@@ -428,21 +433,31 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
         drop_extra: bool = False,
         dry_run: bool = False,
     ) -> list[str]:
-        """Make the constraints that exist the ones asked for, and report what that took.
+        """Make the constraints that exist the ones asked for, and return the statements that took.
 
-        Matched by name, and a :class:`Unique` is named after the property it is about when it is
-        not given a name. A :class:`Check` has to be given one: the server names an unnamed check
-        after the label and a counter, which says nothing about the condition, so a second run
-        could not recognise the check it made on the first.
+        Matched by name. A :class:`~agensgraph.Unique` given no name is named after its property; a
+        :class:`~agensgraph.Check` has to be given one.
         """
         name = self._graph_of(graph)
         statements = reconcile_constraints(
             desired, self.constraints(graph=name), drop_extra=drop_extra
         )
-        if not dry_run:
-            for statement in statements:
-                self._run(statement)
+        if dry_run:
+            return statements
+        for statement in statements:
+            self._run(statement)
+        if statements:
+            self._settled(
+                reconcile_constraints(desired, self.constraints(graph=name)), "constraints"
+            )
         return statements
+
+    def _settled(self, outstanding: list[str], what: str) -> None:
+        """Raise if the state still differs from what was asked for."""
+        if outstanding:
+            raise RuntimeError(
+                f"the {what} asked for were applied but still do not match what the catalogs report, so running this again would repeat the same work. Still outstanding: {outstanding}"
+            )
 
     def element_counts(self, *, graph: str | None = None) -> dict[str, int]:
         """How many vertices and edges each label holds.

@@ -261,36 +261,46 @@ otherwise report a graph as having none while it has them.
 
 ### Saying what should exist, rather than what to do
 
-Creating an index that is already there is an error, not a no-op, so declaring a schema means
-first working out what is already true of it. Hand over the list instead and get back the
-statements that made it so — empty when nothing had to change, which is what makes a second run
-free:
+Creating an index that is already there is an error, not a no-op. Hand over the list instead and
+get back the statements that made it so — empty when nothing had to change:
 
 ```python
-from agensgraph import Check, DesiredIndex, Unique
+from agensgraph import Check, DesiredIndex, IndexElement, Unique
 
 conn.ensure_indexes([
     DesiredIndex("Person", ("name",)),
     DesiredIndex("Person", ("email",), unique=True),
+    DesiredIndex("Person", (IndexElement("surname"), IndexElement("age", descending=True))),
+    DesiredIndex("Person", (IndexElement("tags", "jsonb_path_ops"),), method="gin"),
+    DesiredIndex("Person", ("email",), name="person_active", where="active = true"),
 ])
 conn.ensure_constraints([
-    Unique("Person", "email"),              # named after its property
-    Check("Person", "age > 0", "person_age_positive"),   # names itself, see below
+    Unique("Person", "email"),
+    Check("Person", "age > 0", "person_age_positive"),
 ])
 ```
 
-Pass `dry_run=True` to see the statements without running them, and `drop_extra=True` to remove
-what was not asked for — which considers only indexes over plain properties, so it will not take
-out a vector index while reconciling a list of property names.
+`dry_run=True` returns the statements without running them; `drop_extra=True` also removes what was
+not asked for.
 
-Indexes are matched by the properties they cover, read off the definition the server printed, not
-by name: the server derives a name from the columns but truncates it and appends a counter on a
-collision, so matching on names would go wrong on exactly the long, similar names where losing an
-index costs most. Constraints are matched by name, because their definitions come back normalised
-(`age > 0` prints as `ASSERT ((age) > cypher_to_jsonb(0))`) and comparing written against printed
-would rebuild every check on every run. That is also why a `Check` must be given a name — the
-server's own name for an unnamed one is the label plus a counter, which says nothing about the
-condition, so a second run could not recognise it.
+An index is matched by its access method and the elements it keys, read off the definition the
+server printed. A constraint is matched by name. Both follow from how the server stores them:
+
+| | |
+|---|---|
+| a name | derived from the columns, then truncated, then a counter on collision — so names are not the key |
+| a definition | printed with defaults omitted (`ASC` never, `NULLS LAST` only with `DESC`, an operator class only when not the default) |
+| a predicate | stored normalised — `age > 0` prints as `(age) > cypher_to_jsonb(0)` |
+
+Three consequences worth knowing. **Name an operator class only when it differs from the default**,
+since the server omits a default when printing and the two would never compare equal — asking for
+one anyway raises after the first run rather than rebuilding the index for ever. **A partial index
+needs a `name` and is matched by it**, so a change to its predicate is not noticed; change the name
+to force a rebuild. And an index over a nested path, an expression, or with `INCLUDE` columns is not
+describable here — it is never matched and never dropped, so write those as DDL.
+
+A `Check` needs a name of its own because the server names an unnamed one `<label>_properties_check`
+and then adds a counter.
 
 ## Embedding vectors
 
