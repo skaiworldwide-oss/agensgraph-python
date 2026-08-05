@@ -13,9 +13,13 @@ from .capabilities import MINIMUM_VERSION as MINIMUM_VERSION
 from .capabilities import Capabilities as Capabilities
 from .connection import Connection as Connection
 from .connection_async import AsyncConnection as AsyncConnection
+from .deadline import Deadline as Deadline
+from .deadline import Expired as Expired
 from .errors import Retryability as Retryability
 from .errors import is_retryable as is_retryable
 from .errors import retryability as retryability
+from .retry import RetryPolicy as RetryPolicy
+from .retry import TokenBucket as TokenBucket
 from .summary import GraphWriteCounts as GraphWriteCounts
 from .types import Edge as Edge
 from .types import GraphId as GraphId
@@ -30,14 +34,18 @@ __all__ = [
     "AsyncConnection",
     "Capabilities",
     "Connection",
+    "Deadline",
     "Edge",
+    "Expired",
     "GraphId",
     "GraphWriteCounts",
     "Jsonb",
     "Label",
     "Path",
     "Result",
+    "RetryPolicy",
     "Retryability",
+    "TokenBucket",
     "Unspecified",
     "Vertex",
     "connect",
