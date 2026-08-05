@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from psycopg.types.json import Jsonb as Jsonb
 
+from . import dbapi as dbapi
 from . import errors as errors
 from ._core import Result as Result
 from ._protocol.graphid import LABID_MAX as LABID_MAX
@@ -74,6 +75,7 @@ __all__ = [
     "Vertex",
     "add_query_logger",
     "connect",
+    "dbapi",
     "disable_tracing",
     "enable_tracing",
     "errors",
