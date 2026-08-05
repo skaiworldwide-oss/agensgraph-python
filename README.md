@@ -715,8 +715,12 @@ unless you decide otherwise:
 {"keepalives": 1, "keepalives_idle": 30, "keepalives_interval": 10, "keepalives_count": 3}
 ```
 
-which ends the wait in about a minute. Setting any keepalive option, or `tcp_user_timeout`, means you
-have decided and nothing is added.
+which ends the wait in about a minute. Each is filled in on its own, so naming one does not leave the
+others at the system's values — an interval against the system's idle time of 7200 s would never be
+reached. `keepalives=0` turns all of it off.
+
+Setting `tcp_user_timeout` does **not** count as having decided, because it does not bound a hung read;
+keepalive is still filled in alongside it.
 
 **`tcp_user_timeout` alone does not do this**, which is worth knowing because it is the setting usually
 recommended for it. It bounds how long *transmitted* data may go unacknowledged, and a connection

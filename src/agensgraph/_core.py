@@ -73,6 +73,9 @@ Without these a connection whose network stops carrying packets waits for the ke
 hours and a quarter on Linux by default. Measured against a server whose traffic was dropped: with
 nothing set the wait had not ended after twenty-two seconds; with these it ends in about a minute.
 
+Each is filled in on its own, so naming one of them does not silently leave the others at the
+system's values. ``keepalives=0`` turns them all off.
+
 ``tcp_user_timeout`` is **not** among them, and it is worth saying why, because it is the setting
 usually recommended for this. It bounds how long *transmitted* data may go unacknowledged, and a
 connection waiting for a reply has transmitted nothing -- measured, ``tcp_user_timeout`` alone left
@@ -83,13 +86,21 @@ connection that is busy sending, where too small a value would end a healthy one
 
 
 def with_keepalives(kwargs: dict[str, Any]) -> dict[str, Any]:
-    """The connection arguments, with keepalive asked for if the caller did not decide.
+    """The connection arguments, with any keepalive setting the caller left out filled in.
 
-    A caller who sets any keepalive setting, or ``tcp_user_timeout``, has decided, and nothing is
-    added.
+    Filled in one key at a time rather than all or nothing, because the settings do nothing useful
+    apart: a caller who names ``keepalives_interval`` and not ``keepalives_idle`` would otherwise get
+    the system's idle time, which is two hours and a quarter, and their interval would never be
+    reached.
+
+    ``keepalives=0`` is the one thing that turns the rest off, since it says so.
+
+    ``tcp_user_timeout`` does **not** count as having decided. It bounds how long transmitted data may
+    go unacknowledged, and a connection waiting for a reply has transmitted nothing -- so a caller who
+    sets only that has asked for something that does not bound a hung read, and keepalive is still
+    filled in for them.
     """
-    decided = set(KEEPALIVE_DEFAULTS) | {"tcp_user_timeout"}
-    if decided & kwargs.keys():
+    if str(kwargs.get("keepalives", 1)) == "0":
         return kwargs
     return {**KEEPALIVE_DEFAULTS, **kwargs}
 

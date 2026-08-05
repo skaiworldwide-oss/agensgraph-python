@@ -243,3 +243,62 @@ class TestNothingIsLeftBehind:
             ["sudo", "-n", "/usr/sbin/iptables", "-S"], capture_output=True, text=True
         ).stdout
         assert COMMENT not in listed
+
+
+class TestWhatIsAskedForOnEveryConnection:
+    """The settings are filled in one at a time, because they do nothing useful apart."""
+
+    @staticmethod
+    def asked(dsn: str, **kwargs: object) -> dict[str, str]:
+        from psycopg.conninfo import conninfo_to_dict
+
+        with agensgraph.Connection.connect(dsn, **kwargs) as conn:  # type: ignore[arg-type]
+            given = conninfo_to_dict(conn.info.dsn)
+            return {
+                key: str(value)
+                for key, value in given.items()
+                if "keepal" in key or "tcp_user" in key
+            }
+
+    def test_nothing_given_gets_all_of_them(self, dsn: str) -> None:
+        assert self.asked(dsn) == {
+            "keepalives": "1",
+            "keepalives_idle": "30",
+            "keepalives_interval": "10",
+            "keepalives_count": "3",
+        }
+
+    def test_naming_one_does_not_leave_the_others_at_the_system_values(self, dsn: str) -> None:
+        """An interval with the system's idle time of two hours is never reached, so a caller who
+        names only the interval would have asked for nothing."""
+        asked = self.asked(dsn, keepalives_interval=5)
+        assert asked["keepalives_interval"] == "5"
+        assert asked["keepalives_idle"] == "30"
+
+    def test_naming_the_idle_time_keeps_it(self, dsn: str) -> None:
+        assert self.asked(dsn, keepalives_idle=60)["keepalives_idle"] == "60"
+
+    def test_the_setting_that_does_not_bound_a_read_does_not_count_as_deciding(
+        self, dsn: str
+    ) -> None:
+        """A caller who sets only ``tcp_user_timeout`` has asked for something that leaves a hung
+        read unbounded, so keepalive is still filled in for them."""
+        asked = self.asked(dsn, tcp_user_timeout=5000)
+        assert asked["tcp_user_timeout"] == "5000"
+        assert asked["keepalives_idle"] == "30"
+
+    @pytest.mark.parametrize("off", [0, "0"])
+    def test_turning_keepalive_off_turns_all_of_it_off(self, dsn: str, off: object) -> None:
+        assert self.asked(dsn, keepalives=off) == {"keepalives": "0"}
+
+    def test_the_pool_hands_out_connections_with_them_too(self, dsn: str) -> None:
+        from psycopg.conninfo import conninfo_to_dict
+
+        pool = agensgraph.ConnectionPool(dsn, min_size=1, max_size=1)
+        pool.open(wait=True)
+        try:
+            with pool.connection() as conn:
+                given = conninfo_to_dict(conn.info.dsn)
+                assert str(given.get("keepalives_idle")) == "30"
+        finally:
+            pool.close()
