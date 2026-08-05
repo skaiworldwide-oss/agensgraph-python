@@ -51,6 +51,17 @@ a serial id in the low forty-eight. It is what joins a vertex column to an edge'
 form costs twice as much to build -- 435 ms against 219 for the same vertex column -- and does not
 join as cheaply, so it is asked for rather than assumed.
 
+**Where nothing is copied, and where something is.** The way from the wire to Arrow is not
+zero-copy and the buffer route does not make it one: psycopg hands over the bytes of a row, each
+value becomes a Python object, and the column that object goes into is a buffer of its own. What the
+buffer route removes is the Python object *per number* -- a vector's bytes are copied into an
+``array('f')``, swapped in place, and held by Arrow through the buffer protocol without being copied
+a second time. Checked by address, two things share memory rather than copying it: that array and
+the Arrow column over it, and the Arrow column and the polars column made from it -- for numbers and
+for vectors, though not for strings, which polars holds its own way. pandas copies every column
+whichever dtypes it is asked for; what the Arrow-backed ones buy is the layout, since
+``dtypes="numpy"`` turns a struct, a list or a vector column back into Python objects.
+
 Nothing here is a dependency. Each backend is imported inside the function that uses it, so a program
 that does not export loads none of them.
 
@@ -1068,7 +1079,8 @@ def to_polars(
 ) -> Any:
     """A polars frame. Needs ``polars``.
 
-    Built from the Arrow table, which polars takes without copying the columns it can share.
+    Built from the Arrow table, whose number and vector columns polars takes over rather than
+    copying -- checked by buffer address. A string column it holds its own way and copies.
     """
     import polars
 
@@ -1084,8 +1096,8 @@ def _arrow_batches(source: Any, size: int) -> Iterator[Any]:
     """Anything columnar as Arrow record batches of at most *size* rows.
 
     An Arrow table, a polars frame, a pandas frame, a mapping of columns, or anything else offering
-    Arrow's C stream -- which is what a table and a polars frame both offer, so neither is copied to
-    be read here.
+    Arrow's C stream, which is how a polars frame is read without being turned into a table first.
+    Slicing a batch to *size* copies nothing.
     """
     import pyarrow
 
