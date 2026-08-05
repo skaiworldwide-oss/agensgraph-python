@@ -54,7 +54,14 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
         catalog the server has never had.
         """
         conn = await super().connect(conninfo, **kwargs)
-        _ = conn.capabilities
+        try:
+            _ = conn.capabilities
+        except BaseException:
+            # The connection is open by now, and refusing it here would otherwise leave it
+            # open with nobody holding it -- to be closed whenever it is collected, which is
+            # a warning at best and a backend sitting idle on the server at worst.
+            await conn.close()
+            raise
         return conn
 
     async def graph(self, name: str) -> None:

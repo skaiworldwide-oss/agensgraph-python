@@ -56,7 +56,11 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
         catalog the server has never had.
         """
         conn = super().connect(conninfo, **kwargs)
-        _ = conn.capabilities
+        try:
+            _ = conn.capabilities
+        except BaseException:
+            conn.close()
+            raise
         return conn
 
     def graph(self, name: str) -> None:
