@@ -33,6 +33,7 @@ from .bulk import (
     vertex_rows,
 )
 from .capabilities import VECTOR_AVAILABLE_QUERY, VECTOR_VERSION_QUERY
+from .columnar import CHUNK
 from .cypher import wrap_for_cursor
 from .errors import BatchFailed
 from .introspect import (
@@ -190,10 +191,11 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
                 described = cursor.description
                 records = await cursor.fetchall() if described is not None else []
                 keys = [column.name for column in described or ()]
+                oids = tuple(int(column.type_code) for column in described or ())
                 tag = cursor.statusmessage
         after = await self._counters() if counts_ else None
         self._report_query(text, timer, rows=len(records), error=None)
-        return Result(records, keys, self._counts_for(tag, before, after))
+        return Result(records, keys, self._counts_for(tag, before, after), oids)
 
     async def transaction_id(self, *, assign: bool = False) -> int | None:
         """The id of the transaction now open, so its fate can be asked about if it is lost.
@@ -369,6 +371,60 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
                 await copy.write_row(row)
                 loaded += 1
         return loaded
+
+    async def load_vertex_frame(
+        self, label: str, source: Any, *, graph: str | None = None, size: int = CHUNK
+    ) -> int:
+        """Copy vertices into a label from anything columnar, and report how many.
+
+        An Arrow table, a polars frame, a pandas frame, a mapping of columns -- anything offering
+        Arrow's C stream is read without being copied to be read. Each column becomes a property of
+        that name, except that a single column named ``properties`` holding text is taken as the
+        JSON of the whole map, which is what a round trip through
+        :func:`~agensgraph.columnar.to_arrow` reads back.
+
+        A chunk's property maps are written as JSON and the copy stream built from them, so no row
+        becomes a Python mapping and no value goes through a dumper.
+        """
+        from .bulk import vertex_blocks
+        from .columnar import vertex_payloads
+
+        name = self._graph_of(graph)
+        chunks = vertex_payloads(source, size=size)
+        # The count comes from the copy's command tag, which is set once the copy block has ended.
+        async with self.cursor() as cursor:
+            async with cursor.copy(vertex_copy_statement(name, label)) as copy:
+                for block in vertex_blocks(payload for chunk in chunks for payload in chunk):
+                    await copy.write(block)
+            return max(cursor.rowcount, 0)
+
+    async def load_edge_frame(
+        self,
+        label: str,
+        source: Any,
+        *,
+        start: str = "start",
+        end: str = "end",
+        graph: str | None = None,
+        size: int = CHUNK,
+    ) -> int:
+        """Copy edges into a label from anything columnar, and report how many.
+
+        Two of the columns are the identities each edge joins, named by *start* and *end*, and the
+        rest are its properties. An identity is either the packed 64-bit value -- which is what
+        :func:`~agensgraph.columnar.to_arrow` writes for an identity column -- or the
+        ``labid.locid`` text.
+        """
+        from .bulk import edge_blocks
+        from .columnar import edge_payloads
+
+        name = self._graph_of(graph)
+        chunks = edge_payloads(source, start=start, end=end, size=size)
+        async with self.cursor() as cursor:
+            async with cursor.copy(edge_copy_statement(name, label)) as copy:
+                for block in edge_blocks(row for chunk in chunks for row in chunk):
+                    await copy.write(block)
+            return max(cursor.rowcount, 0)
 
     async def identity_map(
         self, label: str, key: str, *, graph: str | None = None

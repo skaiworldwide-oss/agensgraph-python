@@ -19,11 +19,12 @@ from typing import Any
 from msgspec import Struct
 
 from ._protocol.graphid import GraphId
-from .numbers import decode_json
+from .numbers import decode_json, encode_json
 
 __all__ = ["Edge", "GraphId", "Label", "Path", "Vertex"]
 
 _decode_json = decode_json
+_encode_json = encode_json
 _EMPTY: dict[str, Any] = {}
 
 # Stands in for an identity an edge must be given. An edge always has both, so this is only ever
@@ -104,6 +105,18 @@ class _ElementBehaviour:
     def get(self, key: str, default: Any = None) -> Any:
         """Read one property, without requiring the caller to name the map."""
         return self.properties.get(key, default)
+
+    def properties_json(self) -> bytes:
+        """The property map as JSON, without decoding it.
+
+        The bytes the map arrived in, when it has not been decoded yet -- so asking costs nothing
+        and leaves it undecoded. A map that has been decoded, or that was supplied as a dict, is
+        written back out.
+        """
+        raw = self._raw
+        if type(raw) is bytes:
+            return raw
+        return _encode_json(self.properties)
 
     def __eq__(self, other: object) -> bool:
         if type(other) is type(self):

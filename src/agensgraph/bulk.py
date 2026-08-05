@@ -23,6 +23,7 @@ either a refusal or, worse, bytes read as the wrong type.
 from __future__ import annotations
 
 import gc
+import struct
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
 
@@ -31,15 +32,18 @@ from psycopg.types.json import Jsonb
 from .cypher import quote_identifier
 
 if TYPE_CHECKING:
-    from collections.abc import Generator, Iterable, Mapping
+    from collections.abc import Generator, Iterable, Iterator, Mapping
 
     from ._protocol.graphid import GraphId
 
 __all__ = [
+    "BLOCK_SIZE",
+    "edge_blocks",
     "edge_copy_statement",
     "freeze_after_import",
     "identity_map_statement",
     "paused_collection",
+    "vertex_blocks",
     "vertex_copy_statement",
 ]
 
@@ -104,6 +108,72 @@ VERTEX_COLUMN_TYPES = ["jsonb"]
 
 EDGE_COLUMN_TYPES = ["graphid", "graphid", "jsonb"]
 """What an edge copy sends: the two endpoints, then the property map."""
+
+
+BLOCK_SIZE = 1 << 16
+"""How much of the copy stream is handed to the socket at a time."""
+
+_COPY_SIGNATURE = b"PGCOPY\n\xff\r\n\0" + b"\0" * 8
+"""What a binary copy stream opens with: the signature, then a word of flags and a word of length,
+both zero."""
+
+_COPY_TRAILER = b"\xff\xff"
+"""A field count of -1, which is how a binary copy stream ends."""
+
+_JSONB_VERSION = b"\x01"
+"""The version byte a binary jsonb value carries ahead of its text."""
+
+_ONE_FIELD = struct.Struct("!hi").pack
+"""A field count of one, and that field's length."""
+
+_THREE_FIELDS = struct.Struct("!h").pack(3)
+
+_LENGTH = struct.Struct("!i").pack
+_ENDPOINT = struct.Struct("!iQ").pack
+"""A graphid field: its length, always eight, and the packed value."""
+
+
+def vertex_blocks(payloads: Iterable[bytes], *, block: int = BLOCK_SIZE) -> Iterator[bytes]:
+    """The whole binary copy stream for a vertex copy, from property maps already written as JSON.
+
+    For ``copy.write()`` rather than ``copy.write_row()``: psycopg's binary formatter treats a
+    written block as the complete format, so the signature and the trailer are here and it adds
+    neither. Nothing is converted on the way through -- a payload is the JSON text of one property
+    map, and the version byte a binary jsonb value needs is prepended.
+    """
+    out = bytearray(_COPY_SIGNATURE)
+    for payload in payloads:
+        out += _ONE_FIELD(1, len(payload) + 1)
+        out += _JSONB_VERSION
+        out += payload
+        if len(out) >= block:
+            yield bytes(out)
+            out.clear()
+    out += _COPY_TRAILER
+    yield bytes(out)
+
+
+def edge_blocks(
+    rows: Iterable[tuple[int, int, bytes]], *, block: int = BLOCK_SIZE
+) -> Iterator[bytes]:
+    """The same for an edge copy, from packed endpoint identities and JSON property maps.
+
+    An endpoint is the identity's single 64-bit value, as :attr:`~agensgraph.GraphId.packed` gives
+    it, because that is what the eight wire bytes of a graphid hold.
+    """
+    out = bytearray(_COPY_SIGNATURE)
+    for start, end, payload in rows:
+        out += _THREE_FIELDS
+        out += _ENDPOINT(8, start)
+        out += _ENDPOINT(8, end)
+        out += _LENGTH(len(payload) + 1)
+        out += _JSONB_VERSION
+        out += payload
+        if len(out) >= block:
+            yield bytes(out)
+            out.clear()
+    out += _COPY_TRAILER
+    yield bytes(out)
 
 
 def identity_map_statement(graph: str, label: str) -> str:

@@ -203,6 +203,28 @@ class TestTheAwaitingInterface:
         )
         assert result.records == [("a", "b", 1)]
 
+    @pytest.mark.asyncio
+    async def test_a_columnar_source(self, aloaded) -> None:  # type: ignore[no-untyped-def]
+        pyarrow = pytest.importorskip("pyarrow", reason="pyarrow is not installed")
+        table = pyarrow.table({"key": ["a", "b", "c"]})
+        assert await aloaded.load_vertex_frame("doc", table) == 3
+        result = await aloaded.execute_query("match (n:doc) return n.key order by n.key")
+        assert [key for (key,) in result.records] == ["a", "b", "c"]
+
+    @pytest.mark.asyncio
+    async def test_edges_from_a_columnar_source(self, aloaded) -> None:  # type: ignore[no-untyped-def]
+        pyarrow = pytest.importorskip("pyarrow", reason="pyarrow is not installed")
+        await aloaded.load_vertices("doc", [{"key": "a"}, {"key": "b"}])
+        by_key = await aloaded.identity_map("doc", "key")
+        edges = pyarrow.table(
+            {"start": [by_key["a"].packed], "end": [by_key["b"].packed], "w": [1]}
+        )
+        assert await aloaded.load_edge_frame("cites", edges) == 1
+        result = await aloaded.execute_query(
+            "match (x:doc)-[r:cites]->(y:doc) return x.key, y.key, r.w"
+        )
+        assert result.records == [("a", "b", 1)]
+
 
 class TestPausingTheCollector:
     def test_it_is_off_inside_and_on_again_after(self) -> None:
