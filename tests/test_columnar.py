@@ -9,6 +9,8 @@ the server reads.
 from __future__ import annotations
 
 import struct
+import subprocess
+import sys
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Any
@@ -623,6 +625,39 @@ class TestWritingPayloads:
         table = pyarrow.table({"start": [1.5], "end": [2.5]})
         with pytest.raises(TypeError, match="not an identity"):
             list(edge_payloads(table))
+
+
+class TestWhatIsNotADependency:
+    """Run in a subprocess, because this one has already imported all three backends."""
+
+    SOURCE = """
+import sys
+for name in ("pyarrow", "pandas", "polars"):
+    sys.modules[name] = None
+
+import agensgraph
+from agensgraph import columnar
+from agensgraph.bulk import vertex_blocks
+
+assert not [n for n in ("pyarrow", "pandas", "polars") if sys.modules[n] is not None]
+assert columnar.columns([(agensgraph.GraphId(3, 1),)], ["id"]) == {"id": ["3.1"]}
+assert len(b"".join(vertex_blocks([b'{"a":1}']))) == 35
+for call in ("to_arrow", "to_pandas", "to_polars"):
+    try:
+        getattr(columnar, call)([(1,)], ["i"])
+    except ImportError:
+        pass
+    else:
+        raise AssertionError(call + " did not need its backend")
+print("ok")
+"""
+
+    def test_no_backend_is_imported_until_it_is_used(self) -> None:
+        finished = subprocess.run(
+            [sys.executable, "-c", self.SOURCE], capture_output=True, text=True, check=False
+        )
+        assert finished.returncode == 0, finished.stderr
+        assert finished.stdout.strip() == "ok"
 
 
 class TestAnUndecodedPropertyMap:
