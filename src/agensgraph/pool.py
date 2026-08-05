@@ -182,11 +182,11 @@ class ConnectionPool:
     def closed(self) -> bool:
         return self._pool.closed
 
-    def __aenter__(self) -> ConnectionPool:
+    def __enter__(self) -> ConnectionPool:
         self.open()
         return self
 
-    def __aexit__(self, *exc: object) -> None:
+    def __exit__(self, *exc: object) -> None:
         self.close()
 
     def _configure(self, conn: Connection[Any]) -> None:

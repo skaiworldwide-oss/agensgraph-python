@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import ast
 import difflib
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -37,9 +38,14 @@ MODULES: dict[str, str] = {
     "pool_async.py": "pool.py",
 }
 
+
 # Names that differ between the two interfaces. The convention keeps this short: a class
 # whose name starts with Async loses it, and so does a function whose name starts with
 # async_, so most names need no entry at all.
+class Untranslatable(Exception):
+    """Something in the awaiting source has no blocking form the tool can produce."""
+
+
 RENAMES: dict[str, str] = {
     "AsyncConnection": "Connection",
     "AsyncCursor": "Cursor",
@@ -58,6 +64,10 @@ RENAMES: dict[str, str] = {
     "asynccontextmanager": "contextmanager",
     "aclose": "close",
     "anext": "next",
+    "__aenter__": "__enter__",
+    "__aexit__": "__exit__",
+    "__aiter__": "__iter__",
+    "__anext__": "__next__",
     "IS_ASYNC": "IS_ASYNC",
     "Awaitable": "Awaitable",
 }
@@ -67,8 +77,16 @@ HEADER = """\
 # Edit that file and run the tool; edits made here are lost on the next run.
 """
 
+# A name in prose, but not one that is part of a file name: ``tools/async_to_sync.py`` names a
+# file and is left as it is.
+_IDENTIFIER = re.compile(r"(?<![/\w.])[A-Za-z_][A-Za-z0-9_]*\b(?!\.py)")
+
 ONLY_ASYNC = "only_async"
 ASYNC_FLAG = "IS_ASYNC"
+
+AWAITING_ONLY = frozenset({"asyncio", "anyio", "trio"})
+"""Modules whose awaited calls have no blocking form, so dropping the ``await`` would leave a
+coroutine that is created and discarded."""
 
 
 class Blocking(ast.NodeTransformer):
@@ -101,6 +119,13 @@ class Blocking(ast.NodeTransformer):
         return self.generic_visit(node)
 
     def visit_Await(self, node: ast.Await) -> ast.AST:
+        root = _root_name(node.value)
+        if root in AWAITING_ONLY:
+            raise Untranslatable(
+                f"line {node.lineno}: 'await {root}...' has no blocking form. Dropping the await "
+                f"would leave a coroutine nobody runs. Write the two forms with "
+                f"'if {ASYNC_FLAG}:' instead."
+            )
         return self.visit(node.value)
 
     def visit_AsyncWith(self, node: ast.AsyncWith) -> ast.AST:
@@ -124,8 +149,13 @@ class Blocking(ast.NodeTransformer):
         twice, and the branch that does not apply is not carried into the generated file at
         all -- so nothing in it can be read as code that runs.
         """
-        if isinstance(node.test, ast.Name) and node.test.id == ASYNC_FLAG:
-            kept = [self.visit(child) for child in node.orelse]
+        test = node.test
+        negated = isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not)
+        if negated:
+            test = test.operand  # type: ignore[union-attr]
+        if isinstance(test, ast.Name) and test.id == ASYNC_FLAG:
+            branch = node.body if negated else node.orelse
+            kept = [self.visit(child) for child in branch]
             return kept or [ast.copy_location(ast.Pass(), node)]
         return self.generic_visit(node)
 
@@ -169,6 +199,19 @@ def _is_only_async(node: ast.AsyncFunctionDef | ast.FunctionDef) -> bool:
     )
 
 
+def _root_name(node: ast.expr) -> str | None:
+    """The leftmost name of an expression, so ``asyncio.sleep(1)`` reads as ``asyncio``."""
+    while True:
+        if isinstance(node, ast.Call):
+            node = node.func
+        elif isinstance(node, ast.Attribute):
+            node = node.value
+        elif isinstance(node, ast.Name):
+            return node.id
+        else:
+            return None
+
+
 def _rename(name: str) -> str:
     """The blocking name for an awaiting one.
 
@@ -186,11 +229,8 @@ def _rename(name: str) -> str:
 
 
 def _rename_text(text: str) -> str:
-    """Rename every known name inside a run of prose."""
-    for source, target in RENAMES.items():
-        if source != target:
-            text = text.replace(source, target)
-    return text
+    """Rename every name inside a run of prose, by the same table and conventions as code."""
+    return _IDENTIFIER.sub(lambda m: _rename(m.group()), text)
 
 
 def convert(source: Path, target_name: str) -> str:

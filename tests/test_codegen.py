@@ -139,3 +139,85 @@ class TestTheConversionItself:
         got = convert('async def f():\n    """Returns an AsyncConnection."""')
         assert "Returns a Connection" in got or "Connection." in got
         assert "AsyncConnection" not in got
+
+
+class TestWhatTheToolRefusesToTranslate:
+    """An await it cannot turn into a blocking call must stop the build, not vanish."""
+
+    @staticmethod
+    def _tool():  # type: ignore[no-untyped-def]
+        sys.path.insert(0, str(TOOL.parent))
+        try:
+            import async_to_sync
+
+            return async_to_sync
+        finally:
+            sys.path.pop(0)
+
+    @pytest.mark.parametrize(
+        "statement",
+        [
+            "await asyncio.sleep(1)",
+            "await asyncio.wait_for(f(), 1)",
+            "x = await asyncio.gather(a(), b())",
+            "await anyio.sleep(1)",
+            "await trio.sleep(1)",
+        ],
+    )
+    def test_an_await_with_no_blocking_form_is_refused(self, statement: str) -> None:
+        with pytest.raises(self._tool().Untranslatable, match="no blocking form"):
+            convert(f"async def f():\n    {statement}")
+
+    def test_the_refusal_names_the_line(self) -> None:
+        with pytest.raises(self._tool().Untranslatable, match="line 5"):
+            convert("async def f():\n    pass\n\nasync def g():\n    await asyncio.sleep(1)")
+
+    def test_an_ordinary_await_is_still_removed(self) -> None:
+        assert (
+            convert("async def f():\n    await self.execute(q)")
+            == "def f():\n    self.execute(q)"
+        )
+
+
+class TestTheTwoFormsOfTheFlag:
+    def test_the_negated_branch_is_kept(self) -> None:
+        got = convert("if not IS_ASYNC:\n    a = 1\nelse:\n    a = 2")
+        assert "a = 1" in got
+        assert "a = 2" not in got
+
+    def test_an_await_with_no_blocking_form_can_be_written_as_two_branches(self) -> None:
+        got = convert(
+            "async def f():\n"
+            "    if IS_ASYNC:\n"
+            "        await asyncio.sleep(1)\n"
+            "    else:\n"
+            "        time.sleep(1)"
+        )
+        assert "time.sleep(1)" in got
+        assert "asyncio" not in got
+
+
+class TestNamesTheConventionsCannotReach:
+    @pytest.mark.parametrize(
+        ("awaiting", "blocking"),
+        [
+            ("__aenter__", "__enter__"),
+            ("__aexit__", "__exit__"),
+            ("__aiter__", "__iter__"),
+            ("__anext__", "__next__"),
+        ],
+    )
+    def test_a_dunder_is_renamed(self, awaiting: str, blocking: str) -> None:
+        got = convert(f"class A:\n    async def {awaiting}(self):\n        pass")
+        assert f"def {blocking}(self)" in got
+        assert awaiting not in got
+
+    def test_a_string_annotation_follows_the_conventions(self) -> None:
+        """A quoted forward reference is prose to the parser, and was left behind."""
+        got = convert('async def f() -> "AsyncConnection":\n    pass')
+        assert "AsyncConnection" not in got
+        assert "Connection" in got
+
+    def test_a_file_name_in_prose_is_left_alone(self) -> None:
+        got = convert('def f():\n    """See tools/async_to_sync.py for it."""')
+        assert "tools/async_to_sync.py" in got
