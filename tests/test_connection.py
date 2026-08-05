@@ -60,13 +60,13 @@ class TestConnecting:
 
 class TestSelectingAGraph:
     def test_the_label_table_is_filled(self, conn, name: str) -> None:  # type: ignore[no-untyped-def]
-        assert conn.labels.graph == name
-        assert conn.labels.get(3) == "person"
+        assert conn.label_table.graph == name
+        assert conn.label_table.get(3) == "person"
 
     def test_selecting_the_same_graph_again_keeps_the_table(self, conn, name: str) -> None:  # type: ignore[no-untyped-def]
-        before = len(conn.labels)
+        before = len(conn.label_table)
         conn.graph(name)
-        assert len(conn.labels) == before
+        assert len(conn.label_table) == before
 
     @pytest.mark.parametrize("odd", ["g odd,name", "MATCH", "g space"])
     def test_a_name_needing_quoting(self, dsn: str, odd: str) -> None:
@@ -76,8 +76,8 @@ class TestSelectingAGraph:
             conn.execute(f'create graph "{odd}"')
             try:
                 conn.graph(odd)
-                assert conn.labels.graph == odd
-                assert len(conn.labels) == 2
+                assert conn.label_table.graph == odd
+                assert len(conn.label_table) == 2
             finally:
                 conn.execute("reset graph_path")
                 conn.execute(f'drop graph "{odd}" cascade')

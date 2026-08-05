@@ -18,6 +18,11 @@ from .deadline import Expired as Expired
 from .errors import Retryability as Retryability
 from .errors import is_retryable as is_retryable
 from .errors import retryability as retryability
+from .introspect import Constraint as Constraint
+from .introspect import DeclaredProperty as DeclaredProperty
+from .introspect import Graph as Graph
+from .introspect import Index as Index
+from .introspect import Label as LabelInfo
 from .pool import ConnectionPool as ConnectionPool
 from .pool_async import AsyncConnectionPool as AsyncConnectionPool
 from .retry import RetryPolicy as RetryPolicy
@@ -40,13 +45,18 @@ __all__ = [
     "CommitOutcome",
     "Connection",
     "ConnectionPool",
+    "Constraint",
     "Deadline",
+    "DeclaredProperty",
     "Edge",
     "Expired",
+    "Graph",
     "GraphId",
     "GraphWriteCounts",
+    "Index",
     "Jsonb",
     "Label",
+    "LabelInfo",
     "Path",
     "Result",
     "RetryPolicy",

@@ -105,7 +105,7 @@ class GraphMixin:
     # -- the label table ---------------------------------------------------------------
 
     @property
-    def labels(self) -> LabelCache:
+    def label_table(self) -> LabelCache:
         """The label ids and names of the graph this connection is reading.
 
         Only the composite rendering needs this, because only it leaves the label name out
@@ -120,9 +120,9 @@ class GraphMixin:
 
     def _accept_labels(self, graph: str, rows: Sequence[tuple[int, str]]) -> None:
         """Take the label table for a graph, and make the composite loaders available."""
-        self.labels.load(graph, list(rows))
+        self.label_table.load(graph, list(rows))
         if not self._agens_binary_ready:
-            register_binary(self, self.labels)  # type: ignore[arg-type]
+            register_binary(self, self.label_table)  # type: ignore[arg-type]
             self._agens_binary_ready = True
 
     # -- statements ---------------------------------------------------------------------

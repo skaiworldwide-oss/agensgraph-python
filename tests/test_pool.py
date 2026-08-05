@@ -118,7 +118,7 @@ class TestOpening:
 class TestUsingIt:
     def test_a_connection_comes_with_its_graph_selected(self, pool, graph_name: str) -> None:  # type: ignore[no-untyped-def]
         with pool.connection() as conn:
-            assert conn.labels.graph == graph_name
+            assert conn.label_table.graph == graph_name
             assert conn.execute_query("match (n:thing) return n").records
 
     def test_the_composite_rendering_works_without_further_setting_up(self, pool) -> None:  # type: ignore[no-untyped-def]
@@ -321,7 +321,7 @@ class TestTheAwaitingInterface:
         self, apool, graph_name: str
     ) -> None:  # type: ignore[no-untyped-def]
         async with apool.connection() as conn:
-            assert conn.labels.graph == graph_name
+            assert conn.label_table.graph == graph_name
             result = await conn.execute_query("match (n:thing) return n")
             assert result.records
 

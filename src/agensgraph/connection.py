@@ -26,6 +26,19 @@ import psycopg
 from psycopg.rows import Row, tuple_row
 
 from ._core import GraphMixin, Result
+from .introspect import (
+    CONSTRAINTS_QUERY,
+    DECLARED_PROPERTIES_QUERY,
+    GRAPHS_QUERY,
+    INDEXES_QUERY,
+    LABELS_QUERY,
+    Constraint,
+    DeclaredProperty,
+    Graph,
+    Index,
+    Label,
+    element_count_query,
+)
 from .summary import (
     ASSIGNED_TRANSACTION_QUERY,
     COUNTER_QUERY,
@@ -78,7 +91,7 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
         table is what the composite rendering needs to name a label, and filling it here
         means asking for that rendering later does not have to stop and ask.
         """
-        if self.labels.graph == name:
+        if self.label_table.graph == name:
             self._run(self._select_graph_statement(name))
             return
         self._run(self._select_graph_statement(name))
@@ -93,7 +106,7 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
         unknown label would repeat whatever else it did, which for a write that returned rows
         is not something a driver may decide on a caller's behalf.
         """
-        graph = self.labels.graph
+        graph = self.label_table.graph
         if graph is None:
             return
         self._accept_labels(graph, self._fetch(self._label_statement(), (graph,)))
@@ -171,6 +184,74 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
             cursor.execute(TRANSACTION_STATUS_QUERY, (str(transaction_id),))
             row = cursor.fetchone()
         return read_outcome(None if row is None else row[0])
+
+    def graphs(self) -> list[Graph]:
+        """Every graph, since there is no ``\\d`` that knows about them."""
+        return [Graph(*row) for row in self._fetch(GRAPHS_QUERY, ())]
+
+    def labels(self, *, graph: str | None = None) -> list[Label]:
+        """Every label of a graph, in the order the server gave them ids.
+
+        Defaults to the graph this connection is reading. The two a graph is created with are
+        included and say so, because a caller counting labels should not have to know that two
+        of them were never asked for.
+        """
+        return [Label(*row) for row in self._fetch(LABELS_QUERY, (self._graph_of(graph),))]
+
+    def declared_properties(
+        self, label: str | None = None, *, graph: str | None = None
+    ) -> list[DeclaredProperty]:
+        """Every property given a column of its own, with that column's type.
+
+        A property living in the JSON map is not declared anywhere and so cannot be listed;
+        before 2.18 nothing can be promoted at all and this is always empty.
+        """
+        name = self._graph_of(graph)
+        rows = self._fetch(DECLARED_PROPERTIES_QUERY, (name, label, label))
+        return [DeclaredProperty(*row) for row in rows]
+
+    def indexes(self, label: str | None = None, *, graph: str | None = None) -> list[Index]:
+        """Every property index. A uniqueness constraint is not one; see :meth:`constraints`."""
+        name = self._graph_of(graph)
+        return [Index(*row) for row in self._fetch(INDEXES_QUERY, (name, label, label))]
+
+    def constraints(
+        self, label: str | None = None, *, graph: str | None = None
+    ) -> list[Constraint]:
+        """Every constraint on a label's properties, uniqueness assertions included.
+
+        Read from the constraint catalog rather than from the property-index view, which filters
+        exclusion constraints out -- and a uniqueness assertion is kept as an exclusion, so it
+        would otherwise be invisible.
+        """
+        name = self._graph_of(graph)
+        rows = self._fetch(CONSTRAINTS_QUERY, (name, label, label))
+        return [Constraint(*row) for row in rows]
+
+    def element_counts(self, *, graph: str | None = None) -> dict[str, int]:
+        """How many vertices and edges each label holds.
+
+        Two statements and no property read: the label id is part of every element's identity,
+        so counting per label needs nothing from a row but its id.
+        """
+        name = self._graph_of(graph)
+        names = {label.id: label.name for label in self.labels(graph=name)}
+        counts: dict[str, int] = {}
+        for edges in (False, True):
+            for labid, count in self._fetch(element_count_query(name, edges=edges), ()):
+                counts[names.get(labid, str(labid))] = int(count)
+        return counts
+
+    def _graph_of(self, given: str | None) -> str:
+        """The graph to read about: the one named, or the one this connection is reading."""
+        if given is not None:
+            return given
+        graph = self.label_table.graph
+        if graph is None:
+            raise ValueError(
+                "no graph is selected on this connection, so name the one to read about"
+            )
+        return graph
 
     def _counters(self) -> Sequence[int]:
         with super().cursor(row_factory=tuple_row) as cursor:
