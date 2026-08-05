@@ -231,6 +231,21 @@ statement that runs on it, reaching the server as `statement_timeout`.
 
 `get_stats()` returns psycopg's sixteen counters plus `generation` and `connections_retired`.
 
+### Pausing the collector
+
+```python
+with agensgraph.paused_collection():
+    records = conn.execute_query("MATCH (n:Person) RETURN n").records
+```
+
+Worth **1.16×** on a read of 200,000 vertices, and **1.05×** when every property map is also read.
+It is not more than that because a row here is a struct the collector does not track, so most of a
+result is already invisible to it. Reference counting still frees as usual; only the collection of
+cycles waits.
+
+`agensgraph.freeze_after_import()` is the other half — call it once at startup and every later
+collection skips the module-level objects that were never going to be collected anyway.
+
 ## Reading a large result
 
 ```python

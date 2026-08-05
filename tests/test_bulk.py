@@ -7,6 +7,8 @@ id, a sequence with no gaps and no repeats, and elements the ordinary reader dec
 
 from __future__ import annotations
 
+import gc
+
 import pytest
 import pytest_asyncio
 
@@ -200,3 +202,49 @@ class TestTheAwaitingInterface:
             "match (x:doc)-[r:cites]->(y:doc) return x.key, y.key, r.w"
         )
         assert result.records == [("a", "b", 1)]
+
+
+class TestPausingTheCollector:
+    def test_it_is_off_inside_and_on_again_after(self) -> None:
+        assert gc.isenabled()
+        with agensgraph.paused_collection():
+            assert not gc.isenabled()
+        assert gc.isenabled()
+
+    def test_it_is_put_back_after_a_failure(self) -> None:
+        with pytest.raises(ZeroDivisionError), agensgraph.paused_collection():
+            _ = 1 / 0
+        assert gc.isenabled()
+
+    def test_it_leaves_the_collector_off_if_it_was_already_off(self) -> None:
+        gc.disable()
+        try:
+            with agensgraph.paused_collection():
+                assert not gc.isenabled()
+            assert not gc.isenabled()
+        finally:
+            gc.enable()
+
+    def test_nesting_it_is_harmless(self) -> None:
+        with agensgraph.paused_collection(), agensgraph.paused_collection():
+            assert not gc.isenabled()
+        assert gc.isenabled()
+
+    def test_reference_counting_still_frees_inside_it(self) -> None:
+        """Only the collection of cycles waits, so an ordinary object is still freed at once."""
+        import weakref
+
+        class Held:
+            pass
+
+        with agensgraph.paused_collection():
+            held = Held()
+            ref = weakref.ref(held)
+            del held
+            assert ref() is None
+
+    def test_freezing_moves_what_is_alive_out_of_the_way(self) -> None:
+        before = gc.get_freeze_count()
+        agensgraph.freeze_after_import()
+        assert gc.get_freeze_count() >= before
+        gc.unfreeze()

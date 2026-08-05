@@ -12,6 +12,8 @@ from ._core import Result as Result
 from ._protocol.graphid import LABID_MAX as LABID_MAX
 from ._protocol.graphid import LOCID_MAX as LOCID_MAX
 from .adapters import Unspecified as Unspecified
+from .bulk import freeze_after_import as freeze_after_import
+from .bulk import paused_collection as paused_collection
 from .capabilities import MINIMUM_VERSION as MINIMUM_VERSION
 from .capabilities import Capabilities as Capabilities
 from .connection import Connection as Connection
@@ -96,7 +98,9 @@ __all__ = [
     "disable_tracing",
     "enable_tracing",
     "errors",
+    "freeze_after_import",
     "is_retryable",
+    "paused_collection",
     "remove_query_logger",
     "retryability",
     "vector",
