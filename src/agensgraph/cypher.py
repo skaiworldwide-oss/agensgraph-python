@@ -47,6 +47,12 @@ _LENGTH_PARAMETER = re.compile(
     r"-\s*\[\s*(?:[A-Za-z_]\w*)?\s*(?::[\w\s]*)?\*\s*(?:\d+\s*)?(?:\.\.\s*)?" + _PLACEHOLDER
 )
 
+# The first character of anything the lexer does not read as syntax. A class of single
+# characters is scanned in one pass, so `--` and `/*` are found by their first character and
+# the second is read where the scan stops.
+_LITERAL_START = re.compile(r"['\"$/-]")
+_NOT_NEWLINE = re.compile(r"[^\n]")
+
 # Lower case only: the lexer lowers an unquoted name, so anything holding a capital has to
 # be quoted to reach the server as it was written.
 _UNQUOTED_IDENTIFIER = re.compile(r"[a-z_][a-z0-9_]*\Z")
@@ -143,44 +149,46 @@ def without_literals(statement: str) -> str:
     Strings, quoted identifiers, dollar-quoted bodies and comments are replaced by spaces
     of the same length, so that positions still line up and a scan of what is left cannot
     be fooled by something a person wrote inside a string.
+
+    One scan finds where a run can begin, and what is kept is joined from slices, so the cost
+    follows the number of literals a statement holds.
     """
-    out = list(statement)
+    out: list[str] = []
+    append = out.append
     length = len(statement)
     pos = 0
-    while pos < length:
-        ch = statement[pos]
+    for found in _LITERAL_START.finditer(statement):
+        start = found.start()
+        if start < pos:
+            continue  # Inside a run already taken.
+        ch = statement[start]
         if ch in "'\"":
-            end = _end_of_quoted(statement, pos, ch)
-            _blank(out, pos, end)
-            pos = end
+            end = _end_of_quoted(statement, start, ch)
         elif ch == "$":
-            tag_end = _dollar_tag_end(statement, pos)
+            tag_end = _dollar_tag_end(statement, start)
             if tag_end < 0:
-                pos += 1
-                continue
-            tag = statement[pos:tag_end]
+                continue  # A parameter, which is syntax and stays.
+            tag = statement[start:tag_end]
             close = statement.find(tag, tag_end)
             end = length if close < 0 else close + len(tag)
-            _blank(out, pos, end)
-            pos = end
-        elif statement.startswith("--", pos):
-            end = statement.find("\n", pos)
+        elif ch == "-":
+            if not statement.startswith("--", start):
+                continue  # A minus, or the arrow of a relationship pattern.
+            end = statement.find("\n", start)
             end = length if end < 0 else end
-            _blank(out, pos, end)
-            pos = end
-        elif statement.startswith("/*", pos):
-            end = _end_of_block_comment(statement, pos)
-            _blank(out, pos, end)
-            pos = end
         else:
-            pos += 1
+            if not statement.startswith("/*", start):
+                continue  # A division.
+            end = _end_of_block_comment(statement, start)
+        append(statement[pos:start])
+        run = statement[start:end]
+        # A newline is kept, so that a line comment does not swallow the lines after it.
+        append(" " * len(run) if "\n" not in run else _NOT_NEWLINE.sub(" ", run))
+        pos = end
+    if not pos:
+        return statement
+    append(statement[pos:])
     return "".join(out)
-
-
-def _blank(out: list[str], start: int, end: int) -> None:
-    for i in range(start, end):
-        if out[i] != "\n":
-            out[i] = " "
 
 
 def _end_of_quoted(statement: str, start: int, quote: str) -> int:
@@ -188,12 +196,13 @@ def _end_of_quoted(statement: str, start: int, quote: str) -> int:
     pos = start + 1
     length = len(statement)
     while pos < length:
-        if statement[pos] != quote:
-            pos += 1
-        elif statement.startswith(quote * 2, pos):
-            pos += 2
-        else:
-            return pos + 1
+        found = statement.find(quote, pos)
+        if found < 0:
+            return length
+        if statement.startswith(quote * 2, found):
+            pos = found + 2
+            continue
+        return found + 1
     return length
 
 
@@ -240,7 +249,12 @@ def check_bindable_positions(statement: str) -> None:
     a walk of any length, so nothing later in the round trip reveals that the length was
     never applied. Every other position the grammar will not take a parameter in reports a
     syntax error of its own, and is left to the server.
+
+    A statement holding no star cannot name a walk length, and blanking a literal only ever
+    takes a star away, so a statement without one is let through on the first read of it.
     """
+    if "*" not in statement:
+        return
     found = _LENGTH_PARAMETER.search(without_literals(statement))
     if found is None:
         return
