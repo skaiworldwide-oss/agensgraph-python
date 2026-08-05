@@ -11,82 +11,164 @@ on:
     paths-ignore:
       - 'README.md'
       - 'VERSION.md'
+
 jobs:
-  driver-ci:
+  # Everything that needs no server, on every version claimed to be supported. Kept apart from
+  # the job below so a lint or typing failure is reported in seconds rather than after a
+  # half-hour server build.
+  checks:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.12', '3.13', '3.14']
 
     steps:
-      - name: Get latest commit id of AgensGraph
-        run: |
-          echo "AG_COMMIT_HASH=$(git ls-remote https://github.com/skaiworldwide-oss/agensgraph.git HEAD | awk '{print $1}')" >> $GITHUB_ENV
+      - uses: actions/checkout@v4
+        with:
+          # The version comes from the tags, so a shallow clone would bake in a wrong one.
+          fetch-depth: 0
 
-      - name: Cache AgensGraph Build
-        uses: actions/cache@v3
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install
+        run: uv sync --group dev --python ${{ matrix.python-version }}
+
+      - name: Format and lint
+        run: |
+          uv run ruff format --check src tests tools
+          uv run ruff check src tests tools
+
+      - name: Types
+        run: uv run mypy
+
+      # Three separate things go wrong here, so all three are checked: a generated file edited
+      # directly, a generated file left behind by an edit to its source, and an awaiting module
+      # added without being listed for conversion at all.
+      - name: The generated interface is what its source says
+        run: uv run python tools/async_to_sync.py --check
+
+      # -X dev makes ResourceWarning visible, which is the only way an unclosed socket is found,
+      # and turns on asyncio's own debug mode. It does not imply -W error, so both are passed.
+      - name: Tests
+        run: uv run python -X dev -W error -m pytest -q
+
+      - name: Import time
+        run: uv run python -X importtime -c "import agensgraph" 2>&1 | tail -1
+
+  # A declared floor is only a claim until something resolves to it.
+  lowest-versions:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v5
+      - name: Resolve to the lowest declared versions, and test against those
+        run: |
+          uv sync --group dev --resolution lowest-direct
+          uv run python -m pytest -q
+
+  # A package that type-checks in its own tree can still ship without the marker saying so, and a
+  # source distribution built away from the tags can still carry a wrong version. Neither is found
+  # except by installing what would actually be published.
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Build both distributions
+        run: uv build
+
+      - name: Install the wheel into a clean environment
+        run: |
+          uv venv /tmp/from-wheel
+          VIRTUAL_ENV=/tmp/from-wheel uv pip install dist/*.whl
+          VIRTUAL_ENV=/tmp/from-wheel uv run python - <<'EOF'
+          import pathlib
+          import agensgraph
+          print("version", agensgraph.__version__)
+          assert not agensgraph.__version__.startswith("0.0.0"), (
+              "the version did not come from the tags"
+          )
+          marker = pathlib.Path(agensgraph.__file__).parent / "py.typed"
+          assert marker.exists(), "the typing marker is missing, so nothing downstream is checked"
+          EOF
+
+      - name: Install from the source distribution too
+        run: |
+          uv venv /tmp/from-sdist
+          VIRTUAL_ENV=/tmp/from-sdist uv pip install dist/*.tar.gz
+          VIRTUAL_ENV=/tmp/from-sdist uv run python -c "import agensgraph; print(agensgraph.__version__)"
+
+  # The full suite, against a server built from the engine's own tree.
+  against-a-server:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Find the engine's latest commit
+        run: echo "AG_COMMIT_HASH=$(git ls-remote https://github.com/skaiworldwide-oss/agensgraph.git HEAD | awk '{print $1}')" >> $GITHUB_ENV
+
+      - name: Cache the build
+        uses: actions/cache@v4
         id: agcache
         with:
           path: ~/agensgraph_build
-          key: ${{ runner.os }}-v1-agensgraph-${{ env.AG_COMMIT_HASH }}
+          key: ${{ runner.os }}-v2-agensgraph-${{ env.AG_COMMIT_HASH }}
 
-      - name: Install System Dependencies
+      - name: System dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            libreadline-dev \
-            zlib1g-dev \
-            flex \
-            bison \
-            python3-dev \
-            libpq-dev \
-            git
+          sudo apt-get install -y build-essential libreadline-dev zlib1g-dev flex bison \
+            python3-dev libpq-dev git
 
-      - name: Clone and Build AgensGraph
+      - name: Build the engine
         if: steps.agcache.outputs.cache-hit != 'true'
         run: |
-          git clone https://github.com/skaiworldwide-oss/agensgraph.git ~/agensgraph_source
+          git clone --depth 1 https://github.com/skaiworldwide-oss/agensgraph.git ~/agensgraph_source
           cd ~/agensgraph_source
           ./configure --prefix=$HOME/agensgraph_build
           make -j$(nproc)
           make install
 
-      - name: Set Environment Variables
+      - name: Start it
         run: |
-          echo "AGDATA=$HOME/agens_data" >> $GITHUB_ENV
           echo "LD_LIBRARY_PATH=$HOME/agensgraph_build/lib:$LD_LIBRARY_PATH" >> $GITHUB_ENV
           echo "PATH=$HOME/agensgraph_build/bin:$PATH" >> $GITHUB_ENV
-
-      - name: Initialize DB Cluster
-        run: |
           mkdir -p "$HOME/agens_data"
-          $HOME/agensgraph_build/bin/initdb -D "$HOME/agens_data"
-
-      - name: Start AgensGraph
-        run: |
-          $HOME/agensgraph_build/bin/ag_ctl start -D "$HOME/agens_data" -l "$HOME/agens_data/server.log"
-          sleep 10
-
-      - name: Create test database
-        run: |
+          $HOME/agensgraph_build/bin/initdb -D "$HOME/agens_data" -A trust
+          $HOME/agensgraph_build/bin/ag_ctl start -D "$HOME/agens_data" \
+            -l "$HOME/agens_data/server.log"
+          for _ in $(seq 30); do
+            $HOME/agensgraph_build/bin/pg_isready -q && break
+            sleep 1
+          done
           $HOME/agensgraph_build/bin/createdb agensgraph_test
 
-      - name: Checkout Python Driver
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v4
+      - uses: actions/checkout@v4
         with:
-          python-version: '3.10'
-          
-      - name: Build package
-        run: |
-          python setup.py install
+          fetch-depth: 0
 
-      - name: Run regression tests
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install
+        run: uv sync --group dev
+
+      # The tests needing a server are skipped without this variable, so its absence would turn
+      # the whole live half of the suite into a silent pass. That is checked, not assumed.
+      - name: The full suite, against the server
         env:
-          AGENGRAPH_TESTDB: agensgraph_test
-          AGENGRAPH_TESTDB_HOST: localhost
-          AGENGRAPH_TESTDB_PORT: 5432
-          AGENGRAPH_TESTDB_USER: runner
-          AGENGRAPH_TESTDB_PASSWORD: runner
+          AGENSGRAPH_TEST_DSN: host=localhost dbname=agensgraph_test
         run: |
-          python setup.py test
+          uv run python -X dev -W error -m pytest -q
+          uv run python -m pytest -q --collect-only -m server | tail -2
+
+      - name: The server's own log, if anything failed
+        if: failure()
+        run: tail -100 "$HOME/agens_data/server.log"

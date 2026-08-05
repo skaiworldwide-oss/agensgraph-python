@@ -192,6 +192,96 @@ caps.has_element_ordering()     # ORDER BY on a vertex or an edge
 caps.has_endpoint_elision()     # visible in a plan
 ```
 
+## A pool
+
+```python
+pool = agensgraph.ConnectionPool("host=localhost dbname=graph", graph="social",
+                                 min_size=4, max_size=16)
+pool.open(wait=True)          # fails here if the server is wrong, not later under load
+
+with pool.connection(deadline=agensgraph.Deadline(5.0)) as conn:
+    result = conn.execute_query("MATCH (n:Person) RETURN n")
+
+pool.close()
+```
+
+It wraps psycopg's pool rather than reimplementing it, and adds four things psycopg has no
+equivalent for. A server this driver cannot read is refused by `open()` before any worker
+starts. `invalidate()` retires every connection now held in one call, so a server restart costs
+one event rather than one failure per connection. `configure` runs once per new connection and
+`setup` once per handout — psycopg has only the first, and a graph or a statement timeout belongs
+to the second. And a `Deadline` threaded through covers both the wait for a connection and the
+statement that runs on it, reaching the server as `statement_timeout`.
+
+`get_stats()` returns psycopg's sixteen counters plus `generation` and `connections_retired`.
+
+## Reading a large result
+
+```python
+with conn.transaction():
+    for (person,) in conn.stream("MATCH (n:Person) RETURN n", size=500):
+        ...
+```
+
+The rows stay on the server. `DECLARE ... CURSOR FOR MATCH` is a syntax error, so the statement
+is placed where a subquery goes — which takes only the read-only subset. A statement that writes
+is refused by name before anything is sent; a trailing `LIMIT` or `ORDER BY` is fine, one in the
+middle is not, and the server says so. A transaction is required, and that is also what makes
+abandoning the iterator safe: leaving the transaction closes the cursor with it.
+
+## Loading a lot at once
+
+```python
+conn.load_vertices("Doc", [{"key": "a", "title": "..."}, ...])
+by_key = conn.identity_map("Doc", "key")
+conn.load_edges("Cites", [(by_key["a"], by_key["b"], {"weight": 1})])
+```
+
+Copying rather than a statement per row: measured at **223,000 vertices a second**, against
+140,000 for a single `UNWIND ... CREATE` and 47,000 one at a time. No identity is supplied — the
+column's default produces exactly the identities a `CREATE` would. Edges need the two they join,
+which is what `identity_map` reads, in one statement for the whole label.
+
+## What is in the database
+
+There is no `\d` for a graph, so this is the way:
+
+```python
+conn.graphs()                     # every graph, with its schema and label count
+conn.labels()                     # id, name, kind, and what it inherits
+conn.indexes("Person")            # property indexes
+conn.constraints("Person")        # including uniqueness, which the index view hides
+conn.declared_properties()        # properties with a column of their own
+conn.element_counts()             # per label, reading no property at all
+```
+
+`constraints()` reads the constraint catalog rather than `ag_property_indexes`, because that view
+filters exclusion constraints out and a uniqueness assertion is kept as one — so it would
+otherwise report a graph as having none while it has them.
+
+## Watching it work
+
+```python
+def log(record):
+    print(record.statement, record.elapsed, record.rows, record.failed)
+
+agensgraph.add_query_logger(log)
+agensgraph.enable_tracing()      # needs agensgraph-python[otel]
+```
+
+Off costs a boolean test — measured at 165 µs per statement with a logger attached against 165
+with none. A clock is not read unless something is going to ask for the number. Spans are per
+statement and never per row, the tracing API is imported only when asked for and the SDK never,
+the record carries an opaque connection number rather than the connection's settings, and no
+parameter value ever reaches a span.
+
+## Using it from a generic tool
+
+`agensgraph.dbapi` provides the PEP 249 names, so an ORM or migration tool can drive the driver
+without knowing anything about graphs — and `connect()` there still returns a connection that
+reads a vertex as a vertex. `connection.closed` and `connection.broken` are psycopg's entire
+judgement about a lost connection, so nothing has to match on an error message.
+
 ## Failures
 
 What kind of error something is comes from psycopg, so a graph failure is caught by the
@@ -215,13 +305,21 @@ connection from a stale statement cache, and anything unrecognised is treated as
 
 ```sh
 uv sync --group dev
-uv run pytest
+uv run python -X dev -W error -m pytest      # -X dev is how an unclosed socket is found
 uv run mypy
-uv run ruff check
+uv run ruff check src tests tools
+uv run python tools/async_to_sync.py --check  # the blocking interface is generated
 ```
 
-The test suite runs against no server. Tests that need a live AgensGraph carry the
-`server` marker and read their connection string from `AGENSGRAPH_TEST_DSN`.
+Most of the suite runs against no server. Tests that need a live AgensGraph carry the `server`
+marker and read their connection string from `AGENSGRAPH_TEST_DSN`; without it they are skipped,
+so CI asserts that they were collected rather than trusting a green run.
+
+The blocking interface is **generated** from the awaiting one by `tools/async_to_sync.py`. Edit
+`connection_async.py` and `pool_async.py`, never `connection.py` or `pool.py`, and run the tool.
+Three separate checks enforce it: that a generated file matches its source, that no awaiting
+module was added without being listed for conversion, and that nothing awaiting survives in a
+generated file.
 
 ## Relationship to 1.x
 
