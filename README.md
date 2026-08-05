@@ -262,6 +262,27 @@ Reference counting still frees as usual; only the collection of cycles waits.
 `agensgraph.freeze_after_import()` is the other half — call it once at startup and every later
 collection skips the module-level objects that were never going to be collected anyway.
 
+## Committing in two phases
+
+Works, with graph writes, unchanged from psycopg — including a write that returned rows, which the
+server plans differently:
+
+```python
+conn.tpc_begin("order-4711")
+conn.execute("CREATE (:Order {id: 4711})")
+conn.tpc_prepare()
+...
+conn.tpc_commit()          # or from any other connection, via tpc_recover()
+```
+
+Two things to know. The connection must not be in autocommit. And `max_prepared_transactions` is
+**0 by default**, so on an untouched server `tpc_prepare()` raises `NotSupportedError` carrying the
+server's own message and the name of the setting to change.
+
+A prepared transaction holds its locks until it is committed or rolled back, so one left behind
+blocks a later `DROP GRAPH`. `tpc_recover()` lists what is waiting — but ask it from another
+connection, since one that already has something prepared cannot run the query.
+
 ## Reading a large result
 
 ```python
