@@ -19,9 +19,12 @@ those reports an invalid constraint type rather than returning nothing. Both are
 
 from __future__ import annotations
 
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 from .cypher import quote_identifier
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 __all__ = [
     "CONSTRAINTS_QUERY",
@@ -29,13 +32,23 @@ __all__ = [
     "GRAPHS_QUERY",
     "INDEXES_QUERY",
     "LABELS_QUERY",
+    "Check",
     "Constraint",
     "DeclaredProperty",
+    "DesiredIndex",
     "Graph",
     "Index",
     "Label",
+    "Unique",
+    "constraint_name",
     "element_count_query",
+    "index_properties",
+    "reconcile_constraints",
+    "reconcile_indexes",
 ]
+
+MAX_IDENTIFIER = 63
+"""How long a name the server will keep. A longer one is truncated rather than refused."""
 
 GRAPHS_QUERY = """
 select g.graphname::text,
@@ -187,3 +200,211 @@ class Constraint(NamedTuple):
     unique: bool
     """Whether this is a uniqueness assertion, which the server keeps as an exclusion."""
     definition: str
+
+
+class DesiredIndex(NamedTuple):
+    """A property index somebody wants to exist.
+
+    Matched against what is there by the properties it covers and whether it is unique, not by
+    its name. The server derives a name from the columns -- ``(a, b)`` on ``doc`` becomes
+    ``doc_a_b_idx`` -- but it also truncates at the identifier limit and appends a counter on a
+    collision, so reimplementing that rule to match on names would go wrong on exactly the
+    long-and-similar names where it matters. Reading the columns back off the definition the
+    server itself printed compares like with like instead.
+    """
+
+    label: str
+    properties: tuple[str, ...]
+    unique: bool = False
+    name: str | None = None
+    """A name to give it. The server picks one from the properties if this is ``None``."""
+
+
+class Unique(NamedTuple):
+    """An assertion that a property holds a different value on every element of a label.
+
+    One property, because ``ASSERT (a, b) IS UNIQUE`` is a syntax error -- the server takes a
+    single property here and nothing wider.
+    """
+
+    label: str
+    property: str
+    name: str | None = None
+    """A name to give it. Derived from the label and property if this is ``None``."""
+
+
+class Check(NamedTuple):
+    """A condition every element of a label has to satisfy.
+
+    The name is required, unlike a uniqueness assertion's, and the reason is the server's
+    naming: an unnamed check becomes ``<label>_properties_check``, then ``check1``, ``check2``
+    as more are added. That counter says nothing about which condition it belongs to, so a
+    second reconcile could not tell an existing check apart from one it was asked for. A
+    uniqueness assertion has a natural name because it has a property; a condition does not, so
+    it is asked for.
+
+    The expression is Cypher and is not parsed or quoted -- it is written into the statement as
+    given.
+    """
+
+    label: str
+    expression: str
+    name: str
+
+
+def _bare_property(token: str) -> str | None:
+    """The property a column of an index definition reads, if it reads one plainly.
+
+    ``None`` for anything else, which means an expression. An expression index is not a
+    candidate for any desired property index and is never dropped as an extra one -- a vector
+    index over a property map is exactly that shape, and dropping it while reconciling a list of
+    property names would be an unpleasant surprise.
+    """
+    token = token.strip()
+    if not token:
+        return None
+    if token.startswith('"') and token.endswith('"') and len(token) > 2:
+        inner = token[1:-1]
+        # A doubled quote stands for one quote. A lone one means the name was split across
+        # tokens by the comma scan, so this is not a name that can be read plainly.
+        return None if '"' in inner.replace('""', "") else inner.replace('""', '"')
+    if token[0].isdigit():
+        return None
+    return token if all(char == "_" or char.isalnum() for char in token) else None
+
+
+def index_properties(definition: str) -> tuple[str, ...] | None:
+    """The properties an index covers, read off the definition the server printed.
+
+    ``None`` when the index is over an expression rather than over plain properties.
+    """
+    start = definition.find("(", definition.find(" USING "))
+    if start < 0:
+        return None
+    depth, parts, current = 0, [], ""
+    for char in definition[start:]:
+        if char == "(":
+            depth += 1
+            if depth == 1:
+                continue
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                parts.append(current)
+                break
+        if depth == 1 and char == ",":
+            parts.append(current)
+            current = ""
+            continue
+        current += char
+    else:
+        return None
+    properties = [_bare_property(part) for part in parts]
+    if not properties or any(name is None for name in properties):
+        return None
+    return tuple(name for name in properties if name is not None)
+
+
+def constraint_name(desired: Unique | Check) -> str:
+    """The name a constraint will be given, which is what makes reconciling it possible."""
+    if desired.name is not None:
+        return desired.name[:MAX_IDENTIFIER]
+    if isinstance(desired, Check):  # unreachable: Check requires a name
+        raise ValueError("a check constraint needs a name")
+    return f"{desired.label}_{desired.property}_unique"[:MAX_IDENTIFIER]
+
+
+def create_index_statement(desired: DesiredIndex) -> str:
+    if not desired.properties:
+        raise ValueError(f"an index covers at least one property, got none for {desired.label}")
+    unique = "unique " if desired.unique else ""
+    name = f"{quote_identifier(desired.name)} " if desired.name else ""
+    columns = ", ".join(quote_identifier(prop) for prop in desired.properties)
+    return (
+        f"create {unique}property index {name}on {quote_identifier(desired.label)} ({columns})"
+    )
+
+
+def drop_index_statement(name: str) -> str:
+    return f"drop property index {quote_identifier(name)}"
+
+
+def create_constraint_statement(desired: Unique | Check) -> str:
+    name = quote_identifier(constraint_name(desired))
+    label = quote_identifier(desired.label)
+    if isinstance(desired, Unique):
+        assertion = f"{quote_identifier(desired.property)} is unique"
+    else:
+        assertion = desired.expression
+    return f"create constraint {name} on {label} assert {assertion}"
+
+
+def drop_constraint_statement(label: str, name: str) -> str:
+    return f"drop constraint {quote_identifier(name)} on {quote_identifier(label)}"
+
+
+def reconcile_indexes(
+    desired: Sequence[DesiredIndex], actual: Sequence[Index], *, drop_extra: bool = False
+) -> list[str]:
+    """The statements that take the indexes that exist to the ones asked for.
+
+    Empty when they already agree, which is what makes running this twice a no-op rather than a
+    second round of work. An index whose properties are asked for but whose uniqueness differs
+    is dropped and remade, because uniqueness is not something an index can be altered into.
+    """
+    have: dict[tuple[str, tuple[str, ...]], Index] = {}
+    for index in actual:
+        properties = index_properties(index.definition)
+        if properties is not None:
+            have[index.label, properties] = index
+
+    statements: list[str] = []
+    wanted: set[tuple[str, tuple[str, ...]]] = set()
+    for want in desired:
+        key = (want.label, tuple(want.properties))
+        wanted.add(key)
+        existing = have.get(key)
+        if existing is None:
+            statements.append(create_index_statement(want))
+        elif existing.unique != want.unique:
+            statements.append(drop_index_statement(existing.name))
+            statements.append(create_index_statement(want))
+    if drop_extra:
+        for key, index in have.items():
+            if key not in wanted:
+                statements.append(drop_index_statement(index.name))
+    return statements
+
+
+def reconcile_constraints(
+    desired: Sequence[Unique | Check],
+    actual: Sequence[Constraint],
+    *,
+    drop_extra: bool = False,
+) -> list[str]:
+    """The statements that take the constraints that exist to the ones asked for.
+
+    Matched by name, since that is the only thing both sides can agree on: the definition comes
+    back normalised -- ``age > 0`` is printed as ``ASSERT ((age) > cypher_to_jsonb(0))`` -- so
+    comparing an expression as written against one as printed would call every check different
+    and rebuild it on every run.
+    """
+    have = {(constraint.label, constraint.name): constraint for constraint in actual}
+    statements: list[str] = []
+    wanted: set[tuple[str, str]] = set()
+    for want in desired:
+        key = (want.label, constraint_name(want))
+        if key in wanted:
+            raise ValueError(f"two constraints asked for the same name {key[1]!r} on {key[0]}")
+        wanted.add(key)
+        existing = have.get(key)
+        if existing is None:
+            statements.append(create_constraint_statement(want))
+        elif existing.unique != isinstance(want, Unique):
+            statements.append(drop_constraint_statement(*key))
+            statements.append(create_constraint_statement(want))
+    if drop_extra:
+        for label, name in have:
+            if (label, name) not in wanted:
+                statements.append(drop_constraint_statement(label, name))
+    return statements

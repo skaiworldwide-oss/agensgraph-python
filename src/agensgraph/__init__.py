@@ -20,11 +20,14 @@ from .deadline import Expired as Expired
 from .errors import Retryability as Retryability
 from .errors import is_retryable as is_retryable
 from .errors import retryability as retryability
+from .introspect import Check as Check
 from .introspect import Constraint as Constraint
 from .introspect import DeclaredProperty as DeclaredProperty
+from .introspect import DesiredIndex as DesiredIndex
 from .introspect import Graph as Graph
 from .introspect import Index as Index
 from .introspect import Label as LabelInfo
+from .introspect import Unique as Unique
 from .observability import Notice as Notice
 from .observability import QueryRecord as QueryRecord
 from .observability import add_query_logger as add_query_logger
@@ -53,12 +56,14 @@ __all__ = [
     "AsyncConnection",
     "AsyncConnectionPool",
     "Capabilities",
+    "Check",
     "CommitOutcome",
     "Connection",
     "ConnectionPool",
     "Constraint",
     "Deadline",
     "DeclaredProperty",
+    "DesiredIndex",
     "Distance",
     "Edge",
     "Expired",
@@ -77,6 +82,7 @@ __all__ = [
     "Retryability",
     "SparseVector",
     "TokenBucket",
+    "Unique",
     "Unspecified",
     "Vector",
     "Vertex",

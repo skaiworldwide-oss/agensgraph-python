@@ -259,6 +259,39 @@ conn.element_counts()             # per label, reading no property at all
 filters exclusion constraints out and a uniqueness assertion is kept as one — so it would
 otherwise report a graph as having none while it has them.
 
+### Saying what should exist, rather than what to do
+
+Creating an index that is already there is an error, not a no-op, so declaring a schema means
+first working out what is already true of it. Hand over the list instead and get back the
+statements that made it so — empty when nothing had to change, which is what makes a second run
+free:
+
+```python
+from agensgraph import Check, DesiredIndex, Unique
+
+conn.ensure_indexes([
+    DesiredIndex("Person", ("name",)),
+    DesiredIndex("Person", ("email",), unique=True),
+])
+conn.ensure_constraints([
+    Unique("Person", "email"),              # named after its property
+    Check("Person", "age > 0", "person_age_positive"),   # names itself, see below
+])
+```
+
+Pass `dry_run=True` to see the statements without running them, and `drop_extra=True` to remove
+what was not asked for — which considers only indexes over plain properties, so it will not take
+out a vector index while reconciling a list of property names.
+
+Indexes are matched by the properties they cover, read off the definition the server printed, not
+by name: the server derives a name from the columns but truncates it and appends a counter on a
+collision, so matching on names would go wrong on exactly the long, similar names where losing an
+index costs most. Constraints are matched by name, because their definitions come back normalised
+(`age > 0` prints as `ASSERT ((age) > cypher_to_jsonb(0))`) and comparing written against printed
+would rebuild every check on every run. That is also why a `Check` must be given a name — the
+server's own name for an unnamed one is the label plus a counter, which says nothing about the
+condition, so a second run could not recognise it.
+
 ## Embedding vectors
 
 Vectors need pgvector, and unlike every other type here their oid comes from the extension rather

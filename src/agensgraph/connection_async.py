@@ -40,12 +40,17 @@ from .introspect import (
     GRAPHS_QUERY,
     INDEXES_QUERY,
     LABELS_QUERY,
+    Check,
     Constraint,
     DeclaredProperty,
+    DesiredIndex,
     Graph,
     Index,
     Label,
+    Unique,
     element_count_query,
+    reconcile_constraints,
+    reconcile_indexes,
 )
 from .observability import Timer, query_span
 from .summary import (
@@ -414,6 +419,57 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
         name = self._graph_of(graph)
         rows = await self._fetch(CONSTRAINTS_QUERY, (name, label, label))
         return [Constraint(*row) for row in rows]
+
+    async def ensure_indexes(
+        self,
+        desired: Sequence[DesiredIndex],
+        *,
+        graph: str | None = None,
+        drop_extra: bool = False,
+        dry_run: bool = False,
+    ) -> list[str]:
+        """Make the indexes that exist the ones asked for, and report what that took.
+
+        Returns the statements run, so an empty list means nothing had to change -- which is what
+        running this a second time gives. With ``dry_run`` the statements are worked out and
+        returned without being run.
+
+        ``drop_extra`` removes indexes nobody asked for, and considers only indexes over plain
+        properties: one over an expression, which is what an index on a vector in the property
+        map is, is left alone rather than dropped for not appearing in a list of property names.
+        """
+        name = self._graph_of(graph)
+        statements = reconcile_indexes(
+            desired, await self.indexes(graph=name), drop_extra=drop_extra
+        )
+        if not dry_run:
+            for statement in statements:
+                await self._run(statement)
+        return statements
+
+    async def ensure_constraints(
+        self,
+        desired: Sequence[Unique | Check],
+        *,
+        graph: str | None = None,
+        drop_extra: bool = False,
+        dry_run: bool = False,
+    ) -> list[str]:
+        """Make the constraints that exist the ones asked for, and report what that took.
+
+        Matched by name, and a :class:`Unique` is named after the property it is about when it is
+        not given a name. A :class:`Check` has to be given one: the server names an unnamed check
+        after the label and a counter, which says nothing about the condition, so a second run
+        could not recognise the check it made on the first.
+        """
+        name = self._graph_of(graph)
+        statements = reconcile_constraints(
+            desired, await self.constraints(graph=name), drop_extra=drop_extra
+        )
+        if not dry_run:
+            for statement in statements:
+                await self._run(statement)
+        return statements
 
     async def element_counts(self, *, graph: str | None = None) -> dict[str, int]:
         """How many vertices and edges each label holds.
