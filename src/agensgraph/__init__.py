@@ -5,6 +5,7 @@ from __future__ import annotations
 from psycopg import Notify as Notify
 from psycopg.types.json import Jsonb as Jsonb
 
+from . import columnar as columnar
 from . import dbapi as dbapi
 from . import errors as errors
 from . import vector as vector
@@ -97,6 +98,7 @@ __all__ = [
     "Vector",
     "Vertex",
     "add_query_logger",
+    "columnar",
     "connect",
     "dbapi",
     "disable_tracing",

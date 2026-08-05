@@ -262,6 +262,25 @@ Reference counting still frees as usual; only the collection of cycles waits.
 `agensgraph.freeze_after_import()` is the other half — call it once at startup and every later
 collection skips the module-level objects that were never going to be collected anyway.
 
+## Handing a result to something columnar
+
+An escape hatch, not how results are held — taking a table apart into Python objects costs more than
+never having built one:
+
+```python
+from agensgraph.columnar import to_arrow, to_pandas, to_polars
+
+result = conn.execute_query("MATCH (n:Person) RETURN n.name AS name, n.age AS age")
+frame = to_pandas(result.records, result.keys)
+```
+
+Installed as needed, and imported only where used: `agensgraph-python[arrow]`, `[pandas]`,
+`[polars]`.
+
+**A whole vertex is refused**, because it is an identity, a label and a map rather than one value —
+with a message saying to return the parts wanted instead. A `GraphId` becomes its text form, a
+`Vector` a list of numbers, a sparse vector its text form.
+
 ## Numbers in a property map
 
 jsonb keeps an arbitrary-precision decimal; Python's float does not. Where they part company,

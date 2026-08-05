@@ -106,3 +106,10 @@ files = ["src/agensgraph"]
 [[tool.mypy.overrides]]
 module = "opentelemetry.*"
 ignore_missing_imports = true
+
+# The columnar backends are optional and imported where they are used. Their own stubs are not
+# followed: numpy's need a newer Python than the floor checked here.
+[[tool.mypy.overrides]]
+module = ["pyarrow.*", "pandas.*", "polars.*"]
+ignore_missing_imports = true
+follow_imports = "skip"
