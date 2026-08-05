@@ -52,12 +52,15 @@ says so.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from math import inf as _INFINITY
 from typing import TYPE_CHECKING, Any
 
+import msgspec
 from psycopg import postgres, pq
 from psycopg.adapt import AdaptersMap, Dumper, Loader
 from psycopg.types import TypeInfo
-from psycopg.types.json import JsonbBinaryDumper, JsonbDumper
+from psycopg.types import json as _json
 from psycopg.types.string import StrBinaryDumper, StrDumper
 
 from ._protocol import decode
@@ -74,6 +77,7 @@ __all__ = [
     "OIDS",
     "Unspecified",
     "assert_oids",
+    "dump_jsonb",
     "graph_adapters",
     "register_binary",
     "register_text",
@@ -199,6 +203,48 @@ class Unspecified(str):
 
     def __repr__(self) -> str:
         return f"Unspecified({str.__repr__(self)})"
+
+
+_encode_json = msgspec.json.Encoder().encode
+
+
+def _has_non_finite(obj: Any) -> bool:
+    """Whether a value holds a float that jsonb has no way to store."""
+    if isinstance(obj, float):
+        return obj != obj or obj in (_INFINITY, -_INFINITY)
+    if isinstance(obj, Mapping):
+        return any(_has_non_finite(value) for value in obj.values())
+    if isinstance(obj, list | tuple | set | frozenset):
+        return any(_has_non_finite(value) for value in obj)
+    return False
+
+
+def dump_jsonb(obj: Any) -> bytes:
+    """Render a property map, refusing a float jsonb cannot hold.
+
+    ``NaN`` and the infinities encode as ``null``, which would store the wrong value rather than
+    report anything, so they are refused. The check runs only when the output holds a ``null`` at
+    all, so a map of numbers pays nothing for it.
+    """
+    out = _encode_json(obj)
+    if b"null" in out and _has_non_finite(obj):
+        raise ValueError(
+            "a property map cannot hold NaN or an infinity: jsonb has no way to store one, and "
+            "encoding it would silently write null instead"
+        )
+    return out
+
+
+class JsonbDumper(_json.JsonbDumper):
+    """Send a property map as jsonb."""
+
+    _dumps = staticmethod(dump_jsonb)
+
+
+class JsonbBinaryDumper(_json.JsonbBinaryDumper):
+    """The same in the binary rendering, which is the version byte and then the same text."""
+
+    _dumps = staticmethod(dump_jsonb)
 
 
 class UnspecifiedDumper(Dumper):

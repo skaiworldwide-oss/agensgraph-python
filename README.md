@@ -137,6 +137,22 @@ The server accepts that and reads the parameter as a property map, so the statem
 reports its parameter as `jsonb`, and matches a walk of *any* length. Every other position
 that cannot take a parameter reports a syntax error of its own and is left to the server.
 
+### Sending a property map
+
+Rendered with msgspec, which is where most of the cost of a write is:
+
+| | `json.dumps` | this |
+|---|---|---|
+| a 1024-float embedding | 681 µs | **61 µs** |
+| a small map | 2.22 µs | **0.52 µs** |
+
+`NaN` and the infinities are refused. jsonb has no way to store one, and encoding it would write
+`null` instead — which is the wrong value rather than an error. The check runs only when the output
+holds a `null` at all, so a map of numbers never pays for it.
+
+A `datetime`, `date`, `UUID`, `Decimal`, `bytes` or `set` is rendered rather than refused —
+respectively an ISO string, a string, a string, a base64 string and a list.
+
 ## What a write changed
 
 ```python
