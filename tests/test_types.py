@@ -43,14 +43,23 @@ class TestIdentity:
         assert vertex not in [object(), None, "x"]
 
 
-class TestImmutability:
-    def test_cannot_assign(self):
-        with pytest.raises(AttributeError):
-            v().label = "other"  # type: ignore[misc]
+class TestTheReadOnlySurface:
+    """The public surface has no setters. The fields behind it are named privately instead of being
+    guarded, since routing every write through a guard is most of what building one costs."""
 
-    def test_cannot_delete(self):
+    @pytest.mark.parametrize("name", ["id", "label", "properties"])
+    def test_nothing_public_can_be_assigned(self, name: str) -> None:
         with pytest.raises(AttributeError):
-            del v()._label  # type: ignore[attr-defined]
+            setattr(v(), name, "other")
+
+    @pytest.mark.parametrize("name", ["start", "end"])
+    def test_nor_on_an_edge(self, name: str) -> None:
+        with pytest.raises(AttributeError):
+            setattr(e(), name, GraphId(9, 9))
+
+    def test_an_unknown_attribute_is_refused(self) -> None:
+        with pytest.raises(AttributeError):
+            v().whatever = 1  # type: ignore[attr-defined]
 
 
 class TestLazyProperties:

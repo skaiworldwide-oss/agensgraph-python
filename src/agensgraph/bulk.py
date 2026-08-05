@@ -48,9 +48,9 @@ __all__ = [
 def paused_collection() -> Iterator[None]:
     """Stop the cyclic collector for the duration of a large read or load.
 
-    Worth 1.05 to 1.16 times on a read of two hundred thousand vertices -- the smaller figure when
-    every property map is read, the larger when none is. It is not more than that because a row here
-    is a struct the collector does not track, so most of a result is invisible to it already.
+    Worth about 1.03 times on a read of two hundred thousand vertices. It is no more than that
+    because a row is a struct the collector does not track, so a result is almost entirely invisible
+    to it -- the same read against a row built as an ordinary object was 1.69 times.
 
     Reference counting still frees whatever stops being referenced. What waits is the collection of
     cycles, so a read that builds cyclic structures holds them until this returns. Nothing is

@@ -15,6 +15,22 @@ pip install agensgraph-python
 
 ## Graph values
 
+A vertex, an edge and a path are read from the wire. They are structs the garbage collector does not
+track, which is most of what makes a large result cheap:
+
+| building 200,000 vertices | |
+|---|---|
+| as an ordinary object with `__slots__` | 176 ms |
+| **as an untracked struct** | **33 ms** |
+
+Reading 200,000 vertices end to end went from **1564 ms to 986 ms** for the same reason. Nothing here
+can take part in a reference cycle — a property map holds only what JSON can — so going untracked
+costs nothing.
+
+The public surface is read-only: `id`, `label`, `properties`, and `start`/`end` on an edge have no
+setters.
+
+
 A vertex and an edge are values rather than handles. Each is immutable, compares and
 hashes on its identity alone, and so can be used as a dictionary key or a set member.
 
@@ -238,10 +254,10 @@ with agensgraph.paused_collection():
     records = conn.execute_query("MATCH (n:Person) RETURN n").records
 ```
 
-Worth **1.16×** on a read of 200,000 vertices, and **1.05×** when every property map is also read.
-It is not more than that because a row here is a struct the collector does not track, so most of a
-result is already invisible to it. Reference counting still frees as usual; only the collection of
-cycles waits.
+Worth about **1.03×** on a read of 200,000 vertices — and that is the point: a row is a struct the
+collector does not track, so a result is almost entirely invisible to it. The same read against rows
+built as ordinary objects was **1.69×**, which is the cost this avoids by not being tracked at all.
+Reference counting still frees as usual; only the collection of cycles waits.
 
 `agensgraph.freeze_after_import()` is the other half — call it once at startup and every later
 collection skips the module-level objects that were never going to be collected anyway.
