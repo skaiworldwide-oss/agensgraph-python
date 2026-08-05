@@ -21,10 +21,10 @@ from agensgraph.vector import (
     Distance,
     SparseVector,
     Vector,
-    expression_index,
     generated_column,
     nearest,
     parse_vector_text,
+    vector_index,
 )
 
 pytestmark = pytest.mark.server
@@ -92,23 +92,83 @@ class TestTheStatementsItBuilds:
         with pytest.raises(ValueError, match="expected one of"):
             generated_column("v", 4, type=unknown)
 
-    def test_an_expression_index_carries_the_dimension_in_the_cast(self) -> None:
-        """Which is the difference between an index and 'column does not have dimensions'."""
-        statement = expression_index("g", "doc", "v", 4)
-        assert "::vector(4)" in statement
+    def test_an_index_over_a_property_in_the_map_is_a_property_index(self) -> None:
+        """Not a plain SQL index. The route is what makes the planner match it."""
+        statement = vector_index("movie", "embedding", dimensions=4)
+        assert statement.startswith("create property index on movie")
         assert "using hnsw" in statement
+        assert "((embedding::vector(4)) vector_cosine_ops)" in statement
+        assert "->>" not in statement, "the SQL spelling is never matched by a Cypher query"
+
+    def test_an_index_over_a_promoted_column_needs_no_cast(self) -> None:
+        statement = vector_index("emb", "v", operator_class="vector_l2_ops")
+        assert "((v) vector_l2_ops)" in statement
+        assert "::" not in statement
+
+    def test_the_method_and_its_options(self) -> None:
+        statement = vector_index(
+            "movie", "embedding", dimensions=4, method="ivfflat", options={"lists": 10}
+        )
+        assert "using ivfflat" in statement
+        assert statement.endswith("with (lists=10)")
+
+    def test_a_name_can_be_given(self) -> None:
+        assert vector_index("movie", "e", dimensions=4, name="my_idx").startswith(
+            "create property index my_idx on movie"
+        )
+
+    def test_the_operator_class_comes_from_the_operator_being_searched(self) -> None:
+        """A cosine index answers ``<=>`` alone, so this pairing is not decoration."""
+        statement = vector_index(
+            "movie", "e", dimensions=4, operator_class=Distance.L2.operator_class
+        )
+        assert "vector_l2_ops" in statement
 
     def test_a_name_needing_quoting_is_quoted(self) -> None:
-        assert '"odd graph"."odd label"' in expression_index("odd graph", "odd label", "v", 4)
+        statement = vector_index("odd label", "odd prop", dimensions=4)
+        assert '"odd label"' in statement
+        assert '"odd prop"::vector(4)' in statement
 
-    def test_the_nearest_statement_is_sql_because_cypher_has_no_operator(self) -> None:
-        statement = nearest("g", "emb", "v", limit=5)
-        assert "<->" in statement
+    def test_half_precision_goes_through_the_same_route(self) -> None:
+        statement = vector_index(
+            "movie", "e", dimensions=4, type="halfvec", operator_class="halfvec_l2_ops"
+        )
+        assert "((e::halfvec(4)) halfvec_l2_ops)" in statement
+
+    @pytest.mark.parametrize("bad", [0, -1])
+    def test_a_dimension_below_one_is_refused(self, bad: int) -> None:
+        with pytest.raises(ValueError, match="at least one dimension"):
+            vector_index("movie", "e", dimensions=bad)
+
+    def test_a_type_this_driver_cannot_read_is_refused_here_too(self) -> None:
+        with pytest.raises(ValueError, match="expected one of"):
+            vector_index("movie", "e", dimensions=4, type="bit")
+
+    def test_the_nearest_statement_is_cypher(self) -> None:
+        """Cypher has words for a distance operator, so the search does not drop to SQL."""
+        statement = nearest("movie", "embedding", dimensions=4, limit=5)
+        assert statement.startswith("match (n:movie)")
+        assert "<=>" in statement
         assert "limit 5" in statement
 
-    def test_and_it_casts_its_parameter(self) -> None:
-        """Because this driver says a string is text, and there is no vector-to-text operator."""
-        assert "%s::vector" in nearest("g", "emb", "v")
+    def test_and_it_casts_its_parameter_carrying_the_dimension(self) -> None:
+        """Because this driver says a string is text, and because a bare cast loses the index."""
+        assert "%s::vector(4)" in nearest("movie", "embedding", dimensions=4)
+
+    def test_a_promoted_column_is_searched_without_a_cast_on_the_column(self) -> None:
+        statement = nearest("emb", "v")
+        assert "n.v <=>" in statement
+        assert "%s::vector" in statement
+
+    def test_the_index_and_the_search_spell_the_cast_identically(self) -> None:
+        """The trap this pairing exists to prevent: a dimension in one and not the other, or two
+        different dimensions, costs the index silently -- the planner sorts a scan and says
+        nothing. Asserted by taking the spelling out of one and finding it in the other."""
+        for dimensions in (None, 1, 4, 1536):
+            index = vector_index("movie", "embedding", dimensions=dimensions)
+            search = nearest("movie", "embedding", dimensions=dimensions)
+            expression = index.split("((")[1].split(") vector_cosine_ops")[0]
+            assert f"n.{expression} <=>" in search
 
 
 class TestPromotionChangesWhatAPropertyReadsAs:
@@ -164,37 +224,151 @@ class TestTheServerEnforcesTheDimension:
         assert vectors.declared_properties("loose") == []
 
 
-class TestIndexing:
-    def test_a_column_can_be_indexed(self, vectors) -> None:  # type: ignore[no-untyped-def]
-        graph = vectors.label_table.graph
-        vectors.execute("create (:emb {v: [1,2,3,4]})")
-        vectors.execute(f'create index on "{graph}".emb using hnsw (v vector_l2_ops)')
-        found = vectors.execute(
-            "select count(*) from pg_indexes where schemaname = %s and indexdef like %s",
-            (graph, "%hnsw%"),
-        ).fetchone()[0]
-        assert found == 1
+def plan_of(conn, statement: str, params: tuple[object, ...] = ()) -> str:  # type: ignore[no-untyped-def]
+    """The plan for a statement, as one string.
 
-    def test_a_bare_cast_cannot_be_indexed(self, vectors) -> None:  # type: ignore[no-untyped-def]
-        """The trap. Without a dimension the server refuses outright."""
+    Read with sequential scans switched off. That is deliberate: what is being asserted is whether
+    the planner *matches* an index expression at all, and with a sequential scan available a plan
+    showing one proves only that it looked cheaper on a small table. Penalised, a sequential scan
+    means the index genuinely could not be used.
+    """
+    if "%s" in statement and not params:
+        raise AssertionError("this statement takes a parameter, so the plan needs one too")
+    conn.execute("set enable_seqscan = off")
+    try:
+        rows = conn.execute(f"explain (costs off) {statement}", params or None).fetchall()
+    finally:
+        conn.execute("reset enable_seqscan")
+    return "\n".join(row[0] for row in rows)
+
+
+class TestIndexing:
+    """Which indexes a vector search actually uses, asserted on the plan rather than on the DDL
+    being accepted. An index that is created and never matched is the failure mode here, and it is
+    silent -- so every one of these reads a plan."""
+
+    def test_a_property_in_the_map_is_indexed_and_the_index_is_used(self, vectors) -> None:  # type: ignore[no-untyped-def]
+        """The documented route, and the one a caller reaches for first: no promotion at all."""
+        vectors.execute(vector_index("loose", "v", dimensions=4))
+        for value in ([1, 2, 3, 4], [9, 9, 9, 9], [4, 3, 2, 1]):
+            vectors.execute(f"create (:loose {{v: {value}}})")
+        plan = plan_of(vectors, nearest("loose", "v", dimensions=4, limit=1), ("[1,2,3,4]",))
+        assert "Index Scan" in plan, f"the index was not used:\n{plan}"
+
+    def test_a_promoted_column_is_indexed_and_the_index_is_used(self, vectors) -> None:  # type: ignore[no-untyped-def]
+        """The other route. Same statement builder, no cast."""
+        vectors.execute(vector_index("emb", "v", operator_class="vector_l2_ops"))
+        for value in ([1, 2, 3, 4], [9, 9, 9, 9]):
+            vectors.execute(f"create (:emb {{v: {value}}})")
+        plan = plan_of(
+            vectors, nearest("emb", "v", operator=Distance.L2, limit=1), ("[1,2,3,4]",)
+        )
+        assert "Index Scan" in plan, f"the index was not used:\n{plan}"
+
+    def test_the_sql_spelling_of_the_same_index_is_never_matched(self, vectors) -> None:  # type: ignore[no-untyped-def]
+        """Why :func:`vector_index` builds a property index and not a plain one.
+
+        The index is accepted and is dead weight: Cypher compiles ``n.v`` to its own access
+        operator, so an index over the jsonb arrow operator holds a different expression and is
+        never a candidate. This is the mistake that motivated the whole helper.
+        """
         graph = vectors.label_table.graph
+        vectors.execute(
+            f'create index loose_arrow on "{graph}".loose using hnsw '
+            f"(((properties ->> 'v')::vector(4)) vector_l2_ops)"
+        )
+        vectors.execute("create (:loose {v: [1,2,3,4]})")
+        plan = plan_of(
+            vectors, nearest("loose", "v", dimensions=4, operator=Distance.L2), ("[1,2,3,4]",)
+        )
+        assert "loose_arrow" not in plan, "an arrow-operator index was matched after all"
+        assert "Seq Scan" in plan
+
+    def test_a_bare_cast_cannot_be_indexed_at_all(self, vectors) -> None:  # type: ignore[no-untyped-def]
+        """Without a dimension the server refuses outright, which is the loud half of the trap."""
         with pytest.raises(agensgraph.errors.Error, match="does not have dimensions"):
             vectors.execute(
-                f'create index on "{graph}".loose using hnsw '
-                f"(((properties ->> 'v')::vector) vector_l2_ops)"
+                "create property index on loose using hnsw ((v::vector) vector_l2_ops)"
             )
 
-    def test_a_cast_carrying_the_dimension_can_be(self, vectors) -> None:  # type: ignore[no-untyped-def]
-        graph = vectors.label_table.graph
-        vectors.execute(expression_index(graph, "loose", "v", 4))
+    def test_a_search_casting_to_a_bare_vector_loses_the_index(self, vectors) -> None:  # type: ignore[no-untyped-def]
+        """And the quiet half. The dimension is part of what the expression is, so a search that
+        drops it sorts a scan and says nothing about having done so."""
+        vectors.execute(vector_index("loose", "v", dimensions=4))
+        vectors.execute("create (:loose {v: [1,2,3,4]})")
+        plan = plan_of(
+            vectors,
+            "match (n:loose) return n order by n.v::vector <=> '[1,2,3,4]'::vector limit 1",
+        )
+        assert "Seq Scan" in plan
 
-    def test_a_nearest_neighbour_search_runs(self, vectors) -> None:  # type: ignore[no-untyped-def]
-        graph = vectors.label_table.graph
-        vectors.execute("create (:emb {v: [1,2,3,4]})")
-        vectors.execute("create (:emb {v: [9,9,9,9]})")
-        rows = vectors.execute(nearest(graph, "emb", "v", limit=1), ("[1,2,3,4]",)).fetchall()
-        assert len(rows) == 1
-        assert rows[0][1] == 0.0, "the closest thing to a vector is itself"
+    def test_a_search_casting_to_another_dimension_loses_it_too(self, vectors) -> None:  # type: ignore[no-untyped-def]
+        vectors.execute(vector_index("loose", "v", dimensions=4))
+        vectors.execute("create (:loose {v: [1,2,3,4]})")
+        plan = plan_of(
+            vectors,
+            "match (n:loose) return n order by n.v::vector(3) <=> '[1,2,1]'::vector(3) limit 1",
+        )
+        assert "Seq Scan" in plan
+
+    def test_an_operator_the_index_does_not_serve_falls_back(self, vectors) -> None:  # type: ignore[no-untyped-def]
+        """A cosine index answers ``<=>``. Ordering by L2 against it sorts a scan, which is why the
+        operator class has to match the operator rather than merely be present."""
+        vectors.execute(vector_index("loose", "v", dimensions=4))  # cosine, by default
+        vectors.execute("create (:loose {v: [1,2,3,4]})")
+        plan = plan_of(
+            vectors, nearest("loose", "v", dimensions=4, operator=Distance.L2), ("[1,2,3,4]",)
+        )
+        assert "Sort" in plan
+
+    def test_an_ivfflat_index_with_its_list_count(self, vectors) -> None:  # type: ignore[no-untyped-def]
+        vectors.execute(
+            vector_index(
+                "loose",
+                "v",
+                dimensions=4,
+                method="ivfflat",
+                operator_class="vector_l2_ops",
+                options={"lists": 4},
+            )
+        )
+        vectors.execute("create (:loose {v: [1,2,3,4]})")
+        plan = plan_of(
+            vectors,
+            nearest("loose", "v", dimensions=4, operator=Distance.L2, limit=1),
+            ("[1,2,3,4]",),
+        )
+        assert "Index Scan" in plan, f"the index was not used:\n{plan}"
+
+    def test_a_half_precision_index_over_a_property_in_the_map(self, vectors) -> None:  # type: ignore[no-untyped-def]
+        vectors.execute(
+            vector_index(
+                "loose", "v", dimensions=4, type="halfvec", operator_class="halfvec_l2_ops"
+            )
+        )
+        vectors.execute("create (:loose {v: [1,2,3,4]})")
+        statement = nearest(
+            "loose", "v", dimensions=4, type="halfvec", operator=Distance.L2, limit=1
+        )
+        assert "Index Scan" in plan_of(vectors, statement, ("[1,2,3,4]",))
+
+    def test_the_index_is_reported_by_the_catalogs(self, vectors) -> None:  # type: ignore[no-untyped-def]
+        vectors.execute(vector_index("loose", "v", dimensions=4, name="loose_v_cos"))
+        found = {index.name: index for index in vectors.indexes("loose")}
+        assert "loose_v_cos" in found
+        assert "hnsw" in found["loose_v_cos"].definition
+
+    def test_a_search_finds_the_nearest_thing_first(self, vectors) -> None:  # type: ignore[no-untyped-def]
+        vectors.execute(vector_index("loose", "v", dimensions=4))
+        vectors.execute("create (:loose {v: [1,2,3,4]})")
+        vectors.execute("create (:loose {v: [9,9,9,9]})")
+        result = vectors.execute_query(
+            nearest("loose", "v", dimensions=4, limit=1), ("[1,2,3,4]",)
+        )
+        assert len(result.records) == 1
+        assert result.records[0][0].properties["v"] == EMBEDDING, (
+            "the closest thing to a vector is itself"
+        )
 
 
 class TestRegistering:

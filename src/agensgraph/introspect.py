@@ -205,12 +205,9 @@ class Constraint(NamedTuple):
 class DesiredIndex(NamedTuple):
     """A property index somebody wants to exist.
 
-    Matched against what is there by the properties it covers and whether it is unique, not by
-    its name. The server derives a name from the columns -- ``(a, b)`` on ``doc`` becomes
-    ``doc_a_b_idx`` -- but it also truncates at the identifier limit and appends a counter on a
-    collision, so reimplementing that rule to match on names would go wrong on exactly the
-    long-and-similar names where it matters. Reading the columns back off the definition the
-    server itself printed compares like with like instead.
+    Matched against what is there by the properties it covers and whether it is unique, read off
+    the definition the server printed. Not by name: the server derives one from the columns, but
+    truncates it at the identifier limit and appends a counter on a collision.
     """
 
     label: str
@@ -223,8 +220,7 @@ class DesiredIndex(NamedTuple):
 class Unique(NamedTuple):
     """An assertion that a property holds a different value on every element of a label.
 
-    One property, because ``ASSERT (a, b) IS UNIQUE`` is a syntax error -- the server takes a
-    single property here and nothing wider.
+    One property. ``ASSERT (a, b) IS UNIQUE`` is a syntax error.
     """
 
     label: str
@@ -236,15 +232,10 @@ class Unique(NamedTuple):
 class Check(NamedTuple):
     """A condition every element of a label has to satisfy.
 
-    The name is required, unlike a uniqueness assertion's, and the reason is the server's
-    naming: an unnamed check becomes ``<label>_properties_check``, then ``check1``, ``check2``
-    as more are added. That counter says nothing about which condition it belongs to, so a
-    second reconcile could not tell an existing check apart from one it was asked for. A
-    uniqueness assertion has a natural name because it has a property; a condition does not, so
-    it is asked for.
+    The name is required. An unnamed check is named ``<label>_properties_check``, then ``check1``
+    and ``check2`` as more are added, which identifies no condition in particular.
 
-    The expression is Cypher and is not parsed or quoted -- it is written into the statement as
-    given.
+    The expression is Cypher, written into the statement as given rather than parsed or quoted.
     """
 
     label: str
@@ -255,10 +246,8 @@ class Check(NamedTuple):
 def _bare_property(token: str) -> str | None:
     """The property a column of an index definition reads, if it reads one plainly.
 
-    ``None`` for anything else, which means an expression. An expression index is not a
-    candidate for any desired property index and is never dropped as an extra one -- a vector
-    index over a property map is exactly that shape, and dropping it while reconciling a list of
-    property names would be an unpleasant surprise.
+    ``None`` for an expression, which no desired property index matches and which
+    :func:`reconcile_indexes` therefore never drops.
     """
     token = token.strip()
     if not token:
@@ -306,7 +295,7 @@ def index_properties(definition: str) -> tuple[str, ...] | None:
 
 
 def constraint_name(desired: Unique | Check) -> str:
-    """The name a constraint will be given, which is what makes reconciling it possible."""
+    """The name a constraint is given, and matched by."""
     if desired.name is not None:
         return desired.name[:MAX_IDENTIFIER]
     if isinstance(desired, Check):  # unreachable: Check requires a name
@@ -348,9 +337,8 @@ def reconcile_indexes(
 ) -> list[str]:
     """The statements that take the indexes that exist to the ones asked for.
 
-    Empty when they already agree, which is what makes running this twice a no-op rather than a
-    second round of work. An index whose properties are asked for but whose uniqueness differs
-    is dropped and remade, because uniqueness is not something an index can be altered into.
+    Empty when they already agree. An index whose properties are asked for but whose uniqueness
+    differs is dropped and remade; uniqueness cannot be altered into an index.
     """
     have: dict[tuple[str, tuple[str, ...]], Index] = {}
     for index in actual:
@@ -384,10 +372,9 @@ def reconcile_constraints(
 ) -> list[str]:
     """The statements that take the constraints that exist to the ones asked for.
 
-    Matched by name, since that is the only thing both sides can agree on: the definition comes
-    back normalised -- ``age > 0`` is printed as ``ASSERT ((age) > cypher_to_jsonb(0))`` -- so
-    comparing an expression as written against one as printed would call every check different
-    and rebuild it on every run.
+    Matched by name. A definition comes back normalised -- ``age > 0`` is printed as
+    ``ASSERT ((age) > cypher_to_jsonb(0))`` -- so an expression as written never equals one as
+    printed.
     """
     have = {(constraint.label, constraint.name): constraint for constraint in actual}
     statements: list[str] = []

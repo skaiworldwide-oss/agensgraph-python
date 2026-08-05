@@ -16,16 +16,23 @@ property given a column of its own arrives as that column's type -- and with no 
 the *string* ``'[1,2,3,4]'``. Both were measured. So a driver that reads vectors correctly without
 promotion silently reads them wrongly with it, which is the promotion warning made concrete.
 
-Two ways to index one, and only one of them is a trap:
+A searchable vector is held one of two ways, and both are indexed by a property index:
 
-* **A generated column carrying the dimension**, ``create vlabel emb (v vector(4) generated)``.
-  The dimension lives on the column, so the server refuses a wrong-length value when it is
-  written -- verified: four dimensions declared, three offered, *expected 4 dimensions, not 3* --
-  and an index binds to a real column.
-* **An expression index over a cast that carries the dimension.** ``(properties->>'v')::vector``
-  cannot be indexed at all -- *column does not have dimensions* -- while
-  ``(properties->>'v')::vector(4)`` can. The dimension in the cast is not decoration; it is the
-  whole difference between an index that exists and one that does not.
+* **In the property map**, cast where it is used.
+  ``create property index on movie using hnsw ((embedding::vector(4)) vector_cosine_ops)``,
+  searched by ``order by m.embedding::vector(4) <=> %s::vector(4)``.
+* **In a column of its own**, ``create vlabel emb (v vector(4) generated)``, which needs no cast and
+  refuses a wrong-length value when it is written.
+
+``CREATE PROPERTY INDEX`` compiles its expression through the Cypher parser, so the index holds the
+expression a query builds -- ``((properties.'embedding'::text)::vector(4))``. An index over the SQL
+spelling, ``(properties ->> 'embedding')::vector(4)``, holds a different expression and is never
+matched by a Cypher query.
+
+Three things have to agree for the index to be used. The cast in the search carries the same
+dimension as the cast in the index; a bare ``vector`` or another dimension sorts a sequential scan
+instead. The operator class serves the operator being searched with: ``vector_cosine_ops`` answers
+``<=>`` alone. :func:`vector_index` and :func:`nearest` spell the cast with one function.
 """
 
 from __future__ import annotations
@@ -53,10 +60,10 @@ __all__ = [
     "Vector",
     "accept",
     "dense_dumper",
-    "expression_index",
     "generated_column",
     "nearest",
     "parse_vector_text",
+    "vector_index",
 ]
 
 TYPES = ("vector", "halfvec", "sparsevec")
@@ -404,6 +411,8 @@ def generated_column(name: str, dimensions: int, *, type: str = "vector") -> str
     an index binds to.
 
     ``generated`` is not optional -- a promoted column that is not generated is refused outright.
+
+    :func:`vector_index` indexes a column built this way, and a property left in the map alike.
     """
     if dimensions < 1:
         raise ValueError(f"a vector has at least one dimension, got {dimensions}")
@@ -412,48 +421,101 @@ def generated_column(name: str, dimensions: int, *, type: str = "vector") -> str
     return f"{name} {type}({dimensions}) generated"
 
 
-def expression_index(
-    graph: str,
-    label: str,
-    property: str,
-    dimensions: int,
-    *,
-    method: str = "hnsw",
-    operator: str = "vector_l2_ops",
-) -> str:
-    """An index over a vector still living in the property map.
+def _searched_expression(property: str, dimensions: int | None, type: str) -> str:
+    """How a searched vector is spelled, for the index and for the search alike.
 
-    The dimension in the cast is what makes this work. Without it the server refuses the index
-    outright -- *column does not have dimensions* -- so it is required here rather than optional.
+    An index over ``(embedding::vector(4))`` is matched only by a search casting to ``vector(4)``.
+    A bare ``vector``, or another dimension, sorts a sequential scan.
+
+    ``dimensions`` of ``None`` means the property has a column of its own, which needs no cast.
     """
     from .cypher import quote_identifier
 
+    name = quote_identifier(property)
+    if dimensions is None:
+        return name
     if dimensions < 1:
         raise ValueError(f"a vector has at least one dimension, got {dimensions}")
-    table = f"{quote_identifier(graph)}.{quote_identifier(label)}"
-    cast = f"((properties ->> '{property}')::vector({dimensions}))"
-    return f"create index on {table} using {method} ({cast} {operator})"
+    if type not in TYPES:
+        raise ValueError(f"expected one of {TYPES}, got {type!r}")
+    return f"{name}::{type}({dimensions})"
+
+
+def _with_options(options: Mapping[str, object] | None) -> str:
+    """The ``WITH`` clause a method's settings go in, such as an ivfflat list count."""
+    if not options:
+        return ""
+    settings = ", ".join(
+        f"{key}={value}" if isinstance(value, int) else f"{key}='{value}'"
+        for key, value in options.items()
+    )
+    return f" with ({settings})"
+
+
+def vector_index(
+    label: str,
+    property: str,
+    *,
+    dimensions: int | None = None,
+    type: str = "vector",
+    method: str = "hnsw",
+    operator_class: str = "vector_cosine_ops",
+    name: str | None = None,
+    options: Mapping[str, object] | None = None,
+) -> str:
+    """A property index over a vector, in the property map or in a column of its own.
+
+    A property index carries the expression a Cypher search builds, so the planner matches the two.
+    An index over the SQL spelling of the same property, ``(properties ->> 'embedding')::vector(4)``,
+    is never matched.
+
+    Pass ``dimensions`` for a property in the map, which is cast in the index and in the search
+    alike; leave it out for a property with a column of its own.
+
+    ``method`` is ``hnsw`` or ``ivfflat``, and ``options`` becomes the ``WITH`` clause an ivfflat
+    index takes, as ``options={"lists": 10}``. The operator class serves one operator:
+    ``vector_cosine_ops`` answers ``<=>`` and a search ordering by ``<->`` against it sorts a
+    sequential scan. :attr:`Distance.operator_class` gives the one for an operator.
+    """
+    from .cypher import quote_identifier
+
+    expression = _searched_expression(property, dimensions, type)
+    given = f"{quote_identifier(name)} " if name else ""
+    return (
+        f"create property index {given}on {quote_identifier(label)} "
+        f"using {method} (({expression}) {operator_class}){_with_options(options)}"
+    )
 
 
 def nearest(
-    graph: str, label: str, column: str, *, limit: int = 10, operator: str = "<->"
+    label: str,
+    property: str,
+    *,
+    dimensions: int | None = None,
+    type: str = "vector",
+    limit: int = 10,
+    operator: str = "<=>",
+    variable: str = "n",
 ) -> str:
-    """The statement that finds the closest rows to a given vector.
+    """The Cypher statement that finds the closest elements to a given vector.
 
-    Written as SQL against the label's own table, because Cypher has no syntax for a distance
-    operator -- and reaching for SQL where Cypher has no words for something is what a graph
-    connection is expected to allow.
+    A distance operator is an ordinary operator to Cypher, so this is a match with an order by and a
+    vertex comes back as a vertex. It plans as an index scan over the index :func:`vector_index`
+    builds, including under ``plan_cache_mode = force_generic_plan``.
+
+    ``dimensions`` and ``type`` are the ones the index was built with, spelled by the function the
+    index uses.
     """
     from .cypher import quote_identifier
 
-    table = f"{quote_identifier(graph)}.{quote_identifier(label)}"
-    name = quote_identifier(column)
-    # The parameter is cast, because this driver says a string is text and there is no operator
-    # between a vector and text -- which is the same cast a caller writes for a date, met here in
-    # the driver's own statement.
+    who = quote_identifier(variable)
+    searched = f"{who}.{_searched_expression(property, dimensions, type)}"
+    # The parameter is cast because this driver declares a string as text, and there is no operator
+    # between a vector and text. It carries the dimension, as the index does.
+    against = f"%s::{type}({dimensions})" if dimensions is not None else f"%s::{type}"
     return (
-        f"select id, {name} {operator} %s::vector as distance "
-        f"from {table} order by distance limit {int(limit)}"
+        f"match ({who}:{quote_identifier(label)}) return {who} "
+        f"order by {searched} {operator} {against} limit {int(limit)}"
     )
 
 

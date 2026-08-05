@@ -307,22 +307,39 @@ arrives as a list of numbers. Give the property a column of its own and it arriv
 column's type — and with no loader for it, as the *string* `'[1,2,3,4]'`. So a driver that reads
 vectors correctly without promotion reads them wrongly with it. Both are asserted in the suite.
 
-Two ways to index one, and only one of them is a trap:
+**Two ways to hold a searchable vector**, and both are indexed as a *property* index. Leave it in
+the property map and cast it, or give it a column of its own:
 
 ```python
-from agensgraph.vector import generated_column, expression_index, nearest
+from agensgraph.vector import Distance, generated_column, nearest, vector_index
 
-# the dimension lives on the column, so a wrong-length value is refused when written
+# in the property map -- the cast carries the dimension, in the index and in the search alike
+conn.execute(vector_index("Doc", "v", dimensions=1024))
+result = conn.execute_query(nearest("Doc", "v", dimensions=1024, limit=10), (query_text,))
+
+# or with a column of its own, which needs no cast and refuses a wrong-length value on write
 conn.execute(f"CREATE VLABEL Emb ({generated_column('v', 1024)})")
-conn.execute('CREATE INDEX ON social."Emb" USING hnsw (v vector_l2_ops)')
-
-# or index the property where it is -- but the cast must carry the dimension
-conn.execute(expression_index("social", "Doc", "v", 1024))
-#   (properties->>'v')::vector      -> "column does not have dimensions"
-#   (properties->>'v')::vector(1024) -> indexes
-
-rows = conn.execute(nearest("social", "Emb", "v", limit=10), (query_vector_text,)).fetchall()
+conn.execute(vector_index("Emb", "v", operator_class=Distance.L2.operator_class))
+result = conn.execute_query(nearest("Emb", "v", operator=Distance.L2, limit=10), (query_text,))
 ```
+
+**It has to be a property index.** `CREATE PROPERTY INDEX` compiles its expression through the
+Cypher parser, so the index holds the same expression a Cypher query builds. An index written as
+plain SQL over `(properties ->> 'v')::vector(1024)` holds the *SQL* expression instead and is
+**never matched** — measured with sequential scans switched off, where the planner chose a
+penalised sequential scan rather than the index it could not use.
+
+Two more things cost the index silently, both measured, and the second is why `vector_index` and
+`nearest` share one spelling of the cast:
+
+| | plan |
+|---|---|
+| the search casts to `vector(1024)`, as the index does | **Index Scan** |
+| the search casts to a bare `vector`, or to `vector(3)` | Sort over Seq Scan |
+| the operator class does not serve the operator asked | Sort over Seq Scan |
+
+`Distance.operator_class` gives the right class for an operator. `hnsw` and `ivfflat` both work;
+pass `options={"lists": 100}` for the `WITH` clause an ivfflat index wants.
 
 ### Sparse vectors
 
