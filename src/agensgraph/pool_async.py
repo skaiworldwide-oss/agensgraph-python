@@ -43,6 +43,7 @@ from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any
 
 import psycopg_pool
+from psycopg.pq import TransactionStatus
 
 from .connection_async import AsyncConnection
 from .deadline import Deadline
@@ -205,12 +206,19 @@ class AsyncConnectionPool:
     # -- the hooks psycopg has, and the one it does not ---------------------------------
 
     async def _configure(self, conn: AsyncConnection[Any]) -> None:
-        """Once per new connection: everything that follows the socket rather than the caller."""
+        """Once per new connection: everything that follows the socket rather than the caller.
+
+        psycopg discards a connection this hook does not leave idle, so a statement run here
+        outside autocommit -- selecting the graph, or anything a caller's own hook does -- is
+        committed before the connection goes into the pool.
+        """
         conn._agens_generation = self._generation
         if self._graph is not None:
             await conn.graph(self._graph)
         if self._user_configure is not None:
             await self._user_configure(conn)
+        if conn.pgconn.transaction_status != TransactionStatus.IDLE:
+            await conn.commit()
 
     async def _reset(self, conn: AsyncConnection[Any]) -> None:
         """Once per returning connection, and where a retired one is refused.

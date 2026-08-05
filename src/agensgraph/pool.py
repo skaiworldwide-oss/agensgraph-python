@@ -46,6 +46,7 @@ from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
 
 import psycopg_pool
+from psycopg.pq import TransactionStatus
 
 from .connection import Connection
 from .deadline import Deadline
@@ -189,12 +190,19 @@ class ConnectionPool:
         self.close()
 
     def _configure(self, conn: Connection[Any]) -> None:
-        """Once per new connection: everything that follows the socket rather than the caller."""
+        """Once per new connection: everything that follows the socket rather than the caller.
+
+        psycopg discards a connection this hook does not leave idle, so a statement run here
+        outside autocommit -- selecting the graph, or anything a caller's own hook does -- is
+        committed before the connection goes into the pool.
+        """
         conn._agens_generation = self._generation
         if self._graph is not None:
             conn.graph(self._graph)
         if self._user_configure is not None:
             self._user_configure(conn)
+        if conn.pgconn.transaction_status != TransactionStatus.IDLE:
+            conn.commit()
 
     def _reset(self, conn: Connection[Any]) -> None:
         """Once per returning connection, and where a retired one is refused.

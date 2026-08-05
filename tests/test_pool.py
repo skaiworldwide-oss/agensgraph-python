@@ -375,3 +375,67 @@ class TestTheAwaitingInterface:
             await p.wait()
             assert not p.closed
         assert p.closed
+
+
+class TestTheDefaultsWithoutAutocommit:
+    """Selecting the graph runs a statement, which outside autocommit opens a transaction, and
+    psycopg discards a connection its configure hook does not leave idle."""
+
+    def test_a_pool_naming_a_graph_opens(self, dsn: str, graph_name: str) -> None:
+        p = agensgraph.ConnectionPool(
+            dsn, graph=graph_name, min_size=2, max_size=2, timeout=5.0
+        )
+        p.open(wait=True, timeout=10.0)
+        try:
+            with p.connection() as conn:
+                assert conn.execute("show graph_path").fetchone()[0] == graph_name
+                assert conn.execute_query("return 1").records == [(1,)]
+        finally:
+            p.close()
+
+    def test_a_connection_comes_back_idle(self, dsn: str, graph_name: str) -> None:
+        from psycopg.pq import TransactionStatus
+
+        p = agensgraph.ConnectionPool(
+            dsn, graph=graph_name, min_size=1, max_size=1, timeout=5.0
+        )
+        p.open(wait=True, timeout=10.0)
+        try:
+            with p.connection() as conn:
+                assert conn.pgconn.transaction_status == TransactionStatus.IDLE
+        finally:
+            p.close()
+
+    def test_a_configure_hook_that_runs_a_statement_keeps_its_work(
+        self, dsn: str, graph_name: str
+    ) -> None:
+        def configure(conn: object) -> None:
+            conn.execute("set application_name = 'from the hook'")  # type: ignore[attr-defined]
+
+        p = agensgraph.ConnectionPool(
+            dsn, graph=graph_name, min_size=1, max_size=1, configure=configure, timeout=5.0
+        )
+        p.open(wait=True, timeout=10.0)
+        try:
+            with p.connection() as conn:
+                assert conn.execute("show application_name").fetchone()[0] == "from the hook"
+        finally:
+            p.close()
+
+
+@pytest.mark.asyncio
+async def test_the_awaiting_pool_opens_without_autocommit(dsn: str) -> None:
+    name = "pool_async_defaults"
+    async with await agensgraph.AsyncConnection.connect(dsn, autocommit=True) as conn:
+        await conn.execute(f'drop graph if exists "{name}" cascade')
+        await conn.execute(f'create graph "{name}"')
+    p = agensgraph.AsyncConnectionPool(dsn, graph=name, min_size=2, max_size=2, timeout=5.0)
+    await p.open(wait=True, timeout=10.0)
+    try:
+        async with p.connection() as conn:
+            result = await conn.execute_query("return 1")
+            assert result.records == [(1,)]
+    finally:
+        await p.close()
+        async with await agensgraph.AsyncConnection.connect(dsn, autocommit=True) as conn:
+            await conn.execute(f'drop graph "{name}" cascade')
