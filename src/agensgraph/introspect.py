@@ -233,7 +233,7 @@ class IndexElement(NamedTuple):
         """How this element is written into a statement."""
         parts = [quote_identifier(self.property)]
         if self.operator_class is not None:
-            parts.append(self.operator_class)
+            parts.append(quote_identifier(self.operator_class))
         if self.descending:
             parts.append("desc")
         if self.nulls_first is not None and self.nulls_first != self.descending:
@@ -488,7 +488,10 @@ def create_index_statement(desired: DesiredIndex) -> str:
         )
     unique = "unique " if desired.unique else ""
     name = f"{quote_identifier(desired.name)} " if desired.name else ""
-    method = "" if desired.method.lower() == "btree" else f"using {desired.method} "
+    # An access method is named by an identifier, and the server takes it quoted.
+    method = (
+        "" if desired.method.lower() == "btree" else f"using {quote_identifier(desired.method)} "
+    )
     keys = ", ".join(element.rendered() for element in desired.elements)
     where = f" where {desired.where}" if desired.where is not None else ""
     return (

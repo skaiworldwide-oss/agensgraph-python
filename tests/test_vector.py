@@ -906,11 +906,20 @@ class TestTuningASearch:
         ]
 
     def test_every_documented_setting_is_accepted(self) -> None:
-        from agensgraph.vector import SEARCH_OPTIONS
+        from agensgraph.vector import SEARCH_OPTION_VALUES, SEARCH_OPTIONS
 
         for name, kind in SEARCH_OPTIONS.items():
-            value: object = 1 if kind is not str else "on"
+            value: object = 1 if kind is not str else SEARCH_OPTION_VALUES[name][0]
             assert search_option_statements({name: value})
+
+    def test_and_the_server_accepts_every_one_of_them(self, vectors) -> None:  # type: ignore[no-untyped-def]
+        """Which is the point of checking a word against a list rather than quoting it."""
+        from agensgraph.vector import SEARCH_OPTION_VALUES, SEARCH_OPTIONS
+
+        vectors.execute("create (:loose {v: [1,2,3,4]})")
+        for name, kind in SEARCH_OPTIONS.items():
+            for value in [1] if kind is not str else SEARCH_OPTION_VALUES[name]:
+                vectors.vector_search_options({name: value})
 
     def test_a_name_that_is_not_one_of_them_is_refused(self) -> None:
         """The server takes an unknown ``hnsw.`` name without complaint, so a typo would look as
@@ -964,3 +973,62 @@ class TestBinaryQuantisation:
             ("v",),
         ).fetchone()
         assert distance == 0.0
+
+
+class TestNothingCallerSuppliedReachesTheStatementUnchecked:
+    """A label or a setting taken from somebody else's input is what these guard against.
+
+    A name is quoted, because a name is an identifier and the server takes a quoted one. A method
+    and an operator class are identifiers too. Everything else -- an operator, a type, a setting
+    that takes a word -- is not an identifier and cannot be quoted, so it is checked against the
+    values that exist.
+    """
+
+    HOSTILE = "x'); drop graph y cascade --"
+
+    def test_a_search_option_takes_only_what_the_server_defines(self) -> None:
+        with pytest.raises(ValueError, match="takes one of"):
+            search_option_statements({"hnsw.iterative_scan": self.HOSTILE})
+        with pytest.raises(ValueError, match="whole number"):
+            search_option_statements({"hnsw.ef_search": self.HOSTILE})
+        assert search_option_statements({"hnsw.iterative_scan": "relaxed_order"}) == [
+            "set local hnsw.iterative_scan = 'relaxed_order'"
+        ]
+
+    def test_an_index_quotes_its_method_and_operator_class(self) -> None:
+        built = vector_index("l", "p", dimensions=4, method=self.HOSTILE)
+        assert f'using "{self.HOSTILE}"' in built
+        built = vector_index("l", "p", dimensions=4, operator_class=self.HOSTILE)
+        assert f'"{self.HOSTILE}"' in built
+
+    def test_an_index_option_is_quoted_by_what_it_is(self) -> None:
+        built = vector_index("l", "p", dimensions=4, options={"lists": "1') ; drop --"})
+        assert "lists='1'') ; drop --'" in built
+        built = vector_index("l", "p", dimensions=4, options={self.HOSTILE: 1})
+        assert f'"{self.HOSTILE}"=1' in built
+
+    def test_a_search_takes_only_a_distance_operator(self) -> None:
+        with pytest.raises(ValueError, match="not a distance operator"):
+            nearest("l", "p", operator="<=> ); drop --")
+        for known in Distance:
+            assert str(known) in nearest("l", "p", operator=known)
+
+    def test_a_type_is_checked_even_with_no_dimension_to_cast_to(self) -> None:
+        """The check sat after the early return for a property with a column of its own."""
+        with pytest.raises(ValueError, match="expected one of"):
+            nearest("l", "p", type="vector); drop --")
+        with pytest.raises(ValueError, match="expected one of"):
+            nearest("l", "p", dimensions=4, type="vector); drop --")
+
+    def test_a_generated_column_quotes_its_name(self) -> None:
+        assert generated_column(self.HOSTILE, 4).startswith(f'"{self.HOSTILE}"')
+
+    def test_an_ordinary_call_is_unchanged(self) -> None:
+        assert vector_index("movie", "embedding", dimensions=4) == (
+            "create property index on movie using hnsw "
+            "((embedding::vector(4)) vector_cosine_ops)"
+        )
+        assert nearest("movie", "embedding", dimensions=4) == (
+            "match (n:movie) return n order by n.embedding::vector(4) <=> "
+            "%s::vector(4) limit 10"
+        )

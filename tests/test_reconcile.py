@@ -585,3 +585,28 @@ class TestTheWiderFormsAgainstAServer:
             graph.ensure_indexes([DesiredIndex("doc", ("a",), name="doc_hot", where="a > 5")])
             == []
         )
+
+
+class TestAnIndexDeclarationQuotesEveryNameInIt:
+    """A method and an operator class are identifiers, and sat beside a quoted label unquoted."""
+
+    HOSTILE = "x) ; drop graph y cascade --"
+
+    def test_the_method_is_quoted(self) -> None:
+        (statement,) = reconcile_indexes(
+            [DesiredIndex("doc", ("name",), method=self.HOSTILE)], []
+        )
+        assert f'using "{self.HOSTILE}"' in statement
+
+    def test_the_operator_class_is_quoted(self) -> None:
+        element = IndexElement("name", operator_class=self.HOSTILE)
+        (statement,) = reconcile_indexes([DesiredIndex("doc", (element,))], [])
+        assert f'"{self.HOSTILE}"' in statement
+
+    def test_an_ordinary_declaration_is_unchanged(self) -> None:
+        (statement,) = reconcile_indexes([DesiredIndex("doc", ("name",))], [])
+        assert statement == "create property index on doc (name)"
+        (statement,) = reconcile_indexes(
+            [DesiredIndex("doc", ("tags",), method="gin")], []
+        )
+        assert statement == "create property index on doc using gin (tags)"

@@ -416,11 +416,13 @@ def generated_column(name: str, dimensions: int, *, type: str = "vector") -> str
 
     :func:`vector_index` indexes a column built this way, and a property left in the map alike.
     """
+    from .cypher import quote_identifier
+
     if dimensions < 1:
         raise ValueError(f"a vector has at least one dimension, got {dimensions}")
     if type not in TYPES:
         raise ValueError(f"expected one of {TYPES}, got {type!r}")
-    return f"{name} {type}({dimensions}) generated"
+    return f"{quote_identifier(name)} {type}({dimensions}) generated"
 
 
 SEARCH_OPTIONS: Mapping[str, type] = {
@@ -438,6 +440,20 @@ Defaults on pgvector 0.8.5: ``ef_search`` 40, ``max_scan_tuples`` 20000, ``scan_
 ``probes`` 1, ``max_probes`` 32768, and both ``iterative_scan`` settings off. They do not appear in
 ``pg_settings`` until the extension's library is loaded, which the first vector operation in a session
 does.
+"""
+
+_OPERATORS = frozenset(Distance)
+"""Every distance operator, so that one written as a symbol is checked against the same list."""
+
+SEARCH_OPTION_VALUES: Mapping[str, tuple[str, ...]] = {
+    "hnsw.iterative_scan": ("off", "relaxed_order", "strict_order"),
+    "ivfflat.iterative_scan": ("off", "relaxed_order"),
+}
+"""What the options that take a word will take, read from the server's own ``pg_settings``.
+
+Every other option takes a number, which is written into the statement as one. A word is checked
+against this rather than quoted, because these are not identifiers and a value the server does not
+know is a typo worth hearing about rather than something to send.
 """
 
 
@@ -463,6 +479,10 @@ def search_option_statements(options: Mapping[str, object], *, local: bool = Tru
             raise ValueError(f"{name} takes a whole number, got {value!r}")
         if wanted is float and not isinstance(value, int | float):
             raise ValueError(f"{name} takes a number, got {value!r}")
+        if wanted is str:
+            allowed = SEARCH_OPTION_VALUES[name]
+            if value not in allowed:
+                raise ValueError(f"{name} takes one of {allowed}, got {value!r}")
         rendered = value if isinstance(value, int | float) else f"'{value}'"
         statements.append(f"set {scope}{name} = {rendered}")
     return statements
@@ -478,22 +498,29 @@ def _searched_expression(property: str, dimensions: int | None, type: str) -> st
     """
     from .cypher import quote_identifier
 
+    if type not in TYPES:
+        raise ValueError(f"expected one of {TYPES}, got {type!r}")
     name = quote_identifier(property)
     if dimensions is None:
         return name
     if dimensions < 1:
         raise ValueError(f"a vector has at least one dimension, got {dimensions}")
-    if type not in TYPES:
-        raise ValueError(f"expected one of {TYPES}, got {type!r}")
     return f"{name}::{type}({dimensions})"
 
 
 def _with_options(options: Mapping[str, object] | None) -> str:
-    """The ``WITH`` clause a method's settings go in, such as an ivfflat list count."""
+    """The ``WITH`` clause a method's settings go in, such as an ivfflat list count.
+
+    A setting's name is an identifier and is quoted as one; a value that is not a number is a
+    string and is quoted as one.
+    """
     if not options:
         return ""
+    from .cypher import quote_identifier, quote_string
+
     settings = ", ".join(
-        f"{key}={value}" if isinstance(value, int) else f"{key}='{value}'"
+        f"{quote_identifier(key)}="
+        + (f"{value}" if isinstance(value, int | float) else quote_string(str(value)))
         for key, value in options.items()
     )
     return f" with ({settings})"
@@ -528,9 +555,12 @@ def vector_index(
 
     expression = _searched_expression(property, dimensions, type)
     given = f"{quote_identifier(name)} " if name else ""
+    # An access method and an operator class are both named by an identifier, and the server
+    # takes either quoted.
     return (
         f"create property index {given}on {quote_identifier(label)} "
-        f"using {method} (({expression}) {operator_class}){_with_options(options)}"
+        f"using {quote_identifier(method)} "
+        f"(({expression}) {quote_identifier(operator_class)}){_with_options(options)}"
     )
 
 
@@ -555,6 +585,13 @@ def nearest(
     """
     from .cypher import quote_identifier
 
+    # An operator is not an identifier and cannot be quoted, so it is checked against the ones
+    # the extension defines.
+    if operator not in _OPERATORS:
+        raise ValueError(
+            f"not a distance operator: {operator!r}. "
+            f"One of {sorted(str(known) for known in _OPERATORS)}"
+        )
     who = quote_identifier(variable)
     searched = f"{who}.{_searched_expression(property, dimensions, type)}"
     # The parameter is cast because this driver declares a string as text, and there is no operator
