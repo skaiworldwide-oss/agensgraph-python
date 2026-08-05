@@ -1,8 +1,8 @@
 """Handling the text of a statement, in the two places it cannot be avoided.
 
 A statement is never rewritten. It is sent as it was written, and its results are read as
-the server chose to send them. Two things still have to be done to the text, and both are
-here so that neither is done anywhere else.
+the server chose to send them. Three things still have to be done to the text, and all three
+are here so that none of them is done anywhere else.
 
 A label or a property key cannot be bound as a parameter -- the grammar has no place for
 one there -- so a statement that names either dynamically has to carry it in its text. That
@@ -22,6 +22,7 @@ import re
 
 __all__ = [
     "WRAP",
+    "changes_graph_path",
     "check_bindable_positions",
     "check_can_wrap",
     "quote_identifier",
@@ -29,6 +30,11 @@ __all__ = [
     "without_literals",
     "wrap_for_cursor",
 ]
+
+# What clears the graph path without naming it. Measured against a server, along with the
+# statements that do name it: `SET ROLE`, `SET SESSION AUTHORIZATION`, `DISCARD PLANS` and
+# `DISCARD SEQUENCES` leave it alone.
+_CLEARS_EVERYTHING = re.compile(r"\b(?:reset|discard)\s+all\b")
 
 # A parameter standing where a walk length belongs: directly after the star, after the
 # range, or after a lower bound and the range. All three prepare without complaint.
@@ -239,6 +245,24 @@ def _end_of_block_comment(statement: str, start: int) -> int:
         else:
             pos += 1
     return length
+
+
+def changes_graph_path(statement: str) -> bool:
+    """Whether this statement may leave the session reading a different graph.
+
+    ``SET``, ``RESET`` and ``set_config`` name the setting; ``RESET ALL`` and ``DISCARD ALL``
+    clear it without naming it. Read from the statement as written, so a mention inside a
+    string counts. Saying yes to a statement that changes nothing costs a reload of the label
+    table; saying no to one that does costs a wrong label on every binary read after it.
+
+    Every statement is read, so what it costs matters. Lowering once and then asking whether
+    two literals appear is what a substring search does in one pass, and the pattern is
+    reached only by a statement holding the word it needs.
+    """
+    lowered = statement.lower()
+    if "graph_path" in lowered:
+        return True
+    return "all" in lowered and _CLEARS_EVERYTHING.search(lowered) is not None
 
 
 def check_bindable_positions(statement: str) -> None:

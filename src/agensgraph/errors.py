@@ -321,12 +321,13 @@ class UnresolvedCommit(_pg.OperationalError):
 
 
 class StaleLabelCache(_pg.OperationalError):
-    """A label the connection's label table has not heard of.
+    """A label the connection's label table cannot name.
 
     Only the composite rendering can reach this, because only it leaves the label name out
-    and asks for it to be resolved from the label id. An id that is not in the table is one
-    whose label was created after the table was filled, so the remedy is to fill it again
-    and run the statement once more on the same connection.
+    and asks for it to be resolved from the label id. Either the label was created after the
+    table was filled, or the session was moved to another graph and the table was dropped
+    because the ids of one graph mean nothing in another. Both are answered by filling the
+    table again, with ``refresh_labels()``, and running the statement once more.
     """
 
     labid: int | None = None
@@ -335,11 +336,14 @@ class StaleLabelCache(_pg.OperationalError):
     @classmethod
     def for_label(cls, labid: int, *, graph: str | None) -> StaleLabelCache:
         """Build the report, naming the label id that could not be resolved."""
-        where = f"graph {graph!r}" if graph else "no graph"
-        exc = cls(
-            f"label id {labid} is not in the label table for {where}; "
-            f"it was created after the table was filled"
-        )
+        if graph is None:
+            reason = (
+                "the label table names no graph, so either it was never filled or the "
+                "session was moved to another graph"
+            )
+        else:
+            reason = f"it is not a label of graph {graph!r}, which the table was filled from"
+        exc = cls(f"label id {labid} cannot be named: {reason}. Call refresh_labels() first")
         exc.labid = labid
         exc.graph = graph
         return exc

@@ -126,6 +126,13 @@ class GraphMixin:
     on closes it instead of handing it to somebody else.
     """
 
+    _agens_graph_path_in_transaction: bool = False
+    """Whether the graph path was set inside the transaction now open.
+
+    Setting it is part of the transaction, so a rollback puts it back and takes the label
+    table out of step with the session.
+    """
+
     @property
     def adapters(self) -> AdaptersMap:
         """The map this connection reads and writes through, which starts from the graph one.

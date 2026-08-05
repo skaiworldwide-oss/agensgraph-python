@@ -23,6 +23,7 @@ import psycopg
 from psycopg.rows import Row, tuple_row
 
 from ._core import GraphMixin, Result, statement_text, with_keepalives
+from ._protocol.labels import CURRENT_GRAPH_QUERY
 from .bulk import (
     EDGE_COLUMN_TYPES,
     VERTEX_COLUMN_TYPES,
@@ -34,7 +35,7 @@ from .bulk import (
 )
 from .capabilities import VECTOR_AVAILABLE_QUERY, VECTOR_VERSION_QUERY
 from .columnar import CHUNK
-from .cypher import check_bindable_positions, wrap_for_cursor
+from .cypher import changes_graph_path, check_bindable_positions, wrap_for_cursor
 from .errors import BatchFailed
 from .introspect import (
     CONSTRAINTS_QUERY,
@@ -85,11 +86,16 @@ __all__ = ["AsyncConnection", "AsyncCursor"]
 
 
 class AsyncCursor(psycopg.AsyncCursor[Row]):
-    """A cursor that refuses a statement the server would read as something else.
+    """A cursor that watches the statements going past it.
 
     Every way of running a statement arrives here: ``execute_query`` builds a cursor,
     ``connection.execute`` builds one, and a caller may take one and use it directly. So one
     check here holds for all of them.
+
+    Two things are watched for. A statement whose parameter the server would read as something
+    else is refused before it is sent. A statement that moves the session to another graph
+    leaves the label table describing a graph the session is no longer reading, so the table
+    is dropped once such a statement has run.
     """
 
     async def execute(
@@ -100,20 +106,38 @@ class AsyncCursor(psycopg.AsyncCursor[Row]):
         prepare: bool | None = None,
         binary: bool | None = None,
     ) -> Self:
-        check_bindable_positions(statement_text(query))
+        text = statement_text(query)
+        check_bindable_positions(text)
         # psycopg offers this as two overloads, one of which takes a template and no
         # parameters. Its own body takes either and sorts them out, which is what is wanted
         # here: one check, then whatever was written goes on unchanged.
         await super().execute(
             cast("QueryNoTemplate", query), params, prepare=prepare, binary=binary
         )
+        self._watch_graph_path(text)
         return self
 
     async def executemany(
         self, query: Query, params_seq: Iterable[Params], *, returning: bool = False
     ) -> None:
-        check_bindable_positions(statement_text(query))
+        text = statement_text(query)
+        check_bindable_positions(text)
         await super().executemany(query, params_seq, returning=returning)
+        self._watch_graph_path(text)
+
+    def _watch_graph_path(self, text: str) -> None:
+        """Drop the label table if the statement that just ran moved the session elsewhere.
+
+        After the statement rather than before it, because a statement that failed changed
+        nothing. Setting the graph path is undone by rolling back, so a change made inside a
+        transaction is remembered until that transaction ends.
+        """
+        if not changes_graph_path(text):
+            return
+        conn = cast("AsyncConnection[Row]", self.connection)
+        conn.label_table.invalidate()
+        if not conn.autocommit:
+            conn._agens_graph_path_in_transaction = True
 
 
 class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
@@ -154,30 +178,53 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
     async def graph(self, name: str) -> None:
         """Read from a graph, and fill the label table for it.
 
-        Two statements, and only when the table is not already this graph's -- a connection
-        taken from a pool and pointed at the graph it is already reading costs nothing. The
-        table is what the composite rendering needs to name a label, and filling it here
+        Two statements: one to move the session, one to read the labels of where it now is.
+        The table is what the composite rendering needs to name a label, and filling it here
         means asking for that rendering later does not have to stop and ask.
         """
-        if self.label_table.graph == name:
-            await self._run(self._select_graph_statement(name))
-            return
         await self._run(self._select_graph_statement(name))
         rows = await self._fetch(self._label_statement(), (name,))
         self._accept_labels(name, rows)
 
     async def refresh_labels(self) -> None:
-        """Fill the label table again, after creating or dropping a label.
+        """Fill the label table again, for whichever graph the session is reading.
 
-        Needed only for the composite rendering, and only for a label created since the
-        table was filled. Nothing does this by itself: re-running the statement that hit an
+        Wanted after creating or dropping a label, and after anything that moved the session
+        to another graph. Nothing does this by itself: re-running the statement that hit an
         unknown label would repeat whatever else it did, which for a write that returned rows
         is not something a driver may decide on a caller's behalf.
+
+        A graph the table does not name is asked of the server, which is one statement more
+        and is what makes this the way back from any change the driver only saw go past.
         """
         graph = self.label_table.graph
         if graph is None:
-            return
+            graph = await self._current_graph()
+            if graph is None:
+                return
         self._accept_labels(graph, await self._fetch(self._label_statement(), (graph,)))
+
+    async def _current_graph(self) -> str | None:
+        """The graph the session is reading, or ``None`` if it is reading none."""
+        rows = await self._fetch(CURRENT_GRAPH_QUERY, ())
+        name = rows[0][0] if rows else ""
+        return name or None
+
+    async def commit(self) -> None:
+        await super().commit()
+        self._agens_graph_path_in_transaction = False
+
+    async def rollback(self) -> None:
+        """Roll back, and drop the label table if the graph path is going back with it.
+
+        Setting the graph path is part of a transaction, so rolling one back returns the
+        session to the graph it was reading before, and a table filled inside that transaction
+        describes somewhere the session no longer is.
+        """
+        await super().rollback()
+        if self._agens_graph_path_in_transaction:
+            self.label_table.invalidate()
+            self._agens_graph_path_in_transaction = False
 
     async def execute_query(
         self,

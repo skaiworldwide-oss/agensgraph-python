@@ -58,6 +58,28 @@ def agens(dsn: str) -> Iterator[object]:
 
 
 @pytest.fixture
+def second_graph(dsn: str) -> Iterator[str]:
+    """A second graph to move a session to, holding one label of its own.
+
+    Its first user label gets id three, the same as the first label of any other graph, which
+    is what makes a table belonging to the wrong graph resolve to a name instead of failing.
+    """
+    import agensgraph
+
+    with agensgraph.connect(dsn, autocommit=True) as connection:
+        name = f"b_{os.getpid()}_{id(connection) % 100000}"
+        connection.execute(f'create graph "{name}"')
+        connection.execute(f'set graph_path = "{name}"')
+        connection.execute("create vlabel account")
+        connection.execute("create elabel owns")
+        try:
+            yield name
+        finally:
+            connection.execute("reset graph_path")
+            connection.execute(f'drop graph "{name}" cascade')
+
+
+@pytest.fixture
 def conn(dsn: str) -> Iterator[object]:
     """A connection with the graph types registered, on its own scratch graph.
 

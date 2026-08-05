@@ -12,10 +12,17 @@ stored; the planner uses it as a stand-in for "unlabelled".
 
 from __future__ import annotations
 
-__all__ = ["AG_EDGE_LABID", "AG_VERTEX_LABID", "LabelCache"]
+__all__ = ["AG_EDGE_LABID", "AG_VERTEX_LABID", "CURRENT_GRAPH_QUERY", "LabelCache"]
 
 AG_VERTEX_LABID = 1
 AG_EDGE_LABID = 2
+
+CURRENT_GRAPH_QUERY = "select current_setting('graph_path', true)"
+"""Which graph the session is reading, reported as an empty string when it is reading none.
+
+The setting is not one the server reports of its own accord, so a session moved by anything
+other than :meth:`~agensgraph.Connection.graph` is only found by asking.
+"""
 
 _QUERY = """
 select l.labid, l.labname
