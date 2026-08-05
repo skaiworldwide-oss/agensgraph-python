@@ -21,10 +21,13 @@ from __future__ import annotations
 import re
 
 __all__ = [
+    "WRAP",
     "check_bindable_positions",
+    "check_can_wrap",
     "quote_identifier",
     "quote_string",
     "without_literals",
+    "wrap_for_cursor",
 ]
 
 # A parameter standing where a walk length belongs: directly after the star, after the
@@ -233,4 +236,47 @@ def check_bindable_positions(statement: str) -> None:
         f"{found.group(0)!r}. The server accepts this and reads the parameter as a "
         f"property map, matching a walk of any length. Write the length into the "
         f"statement instead."
+    )
+
+
+# A clause that changes something. A statement holding one cannot be read in chunks, because
+# the wrap a server-side cursor needs takes only the read-only subset.
+_WRITE_CLAUSE = re.compile(
+    r"(?<![A-Za-z0-9_])(create|merge|set|delete|remove|detach)(?![A-Za-z0-9_])", re.IGNORECASE
+)
+
+WRAP = "select * from ({statement}) as {alias}"
+"""How a Cypher statement is made readable by a server-side cursor.
+
+``DECLARE ... CURSOR FOR MATCH`` is a syntax error -- the grammar has no arm for it -- so the
+only way to read a Cypher result in chunks is to put it where a subquery goes. The alias is not
+optional: without one the server reports that Cypher in a FROM needs an alias.
+"""
+
+
+def wrap_for_cursor(statement: str, *, alias: str = "t") -> str:
+    """The statement as a server-side cursor can read it.
+
+    Verified against a live server: the wrap accepts a plain read, a trailing ``LIMIT``, a
+    trailing ``ORDER BY``, ``WHERE`` and ``WITH ... RETURN``, and refuses a mid-query ``LIMIT``,
+    an ``ORDER BY`` that is not final, and any write.
+    """
+    check_can_wrap(statement)
+    return WRAP.format(statement=statement.rstrip().rstrip(";"), alias=quote_identifier(alias))
+
+
+def check_can_wrap(statement: str) -> None:
+    """Refuse a statement that cannot be read in chunks, saying which part is the reason.
+
+    Only a write is caught here. The subtler refusals -- a ``LIMIT`` that is not last, an
+    ``ORDER BY`` that is not final -- the server reports clearly by itself, and repeating that
+    judgement client-side would mean keeping a copy of the grammar in step with it.
+    """
+    found = _WRITE_CLAUSE.search(without_literals(statement))
+    if found is None:
+        return
+    raise ValueError(
+        f"a statement that writes cannot be read in chunks: it holds "
+        f"{found.group(0).upper()}, and reading in chunks needs the statement placed where a "
+        f"subquery goes, which takes only the read-only subset. Read it whole instead."
     )

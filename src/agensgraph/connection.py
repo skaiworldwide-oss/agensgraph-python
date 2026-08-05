@@ -26,6 +26,7 @@ import psycopg
 from psycopg.rows import Row, tuple_row
 
 from ._core import GraphMixin, Result
+from .cypher import wrap_for_cursor
 from .introspect import (
     CONSTRAINTS_QUERY,
     DECLARED_PROPERTIES_QUERY,
@@ -50,7 +51,7 @@ from .summary import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Iterator, Sequence
 
     from psycopg.abc import Params
     from psycopg.rows import RowFactory
@@ -191,6 +192,52 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
             cursor.execute(TRANSACTION_STATUS_QUERY, (str(transaction_id),))
             row = cursor.fetchone()
         return read_outcome(None if row is None else row[0])
+
+    def stream(
+        self,
+        query: str,
+        params: Params | None = None,
+        *,
+        size: int = 100,
+        binary_: bool = False,
+        name: str | None = None,
+    ) -> Iterator[Any]:
+        """Read a result a chunk at a time, without holding all of it.
+
+        A server-side cursor is what keeps the rows on the server, and the grammar has no arm
+        for declaring one over Cypher -- so the statement is placed where a subquery goes, which
+        is the one thing that works. That wrap takes only the read-only subset, so a statement
+        that writes is refused here, by name, rather than producing a syntax error nobody asked
+        for. A trailing ``LIMIT`` or ``ORDER BY`` is fine; one in the middle is not, and the
+        server says so clearly enough to be left to.
+
+        An enclosing transaction is required, and not as a formality: a server-side cursor lives
+        inside one. That requirement is also what makes abandoning the iterator safe, since
+        leaving the transaction closes the cursor with it -- rather than leaving a connection
+        with a statement still running and a lock still held, which is how the ordinary
+        generator form goes wrong.
+
+        ``size`` is how many rows are fetched at a time. A hundred, because the standard's own
+        default of one is a round trip per row.
+        """
+        if size < 1:
+            raise ValueError(f"a chunk holds at least one row, got {size}")
+        self._check(query)
+        statement = wrap_for_cursor(query)
+        with self.cursor(name=name or "agens_stream") as cursor:
+            cursor.itersize = size
+            if binary_:
+                cursor.format = psycopg.pq.Format.BINARY
+            try:
+                cursor.execute(statement, params)
+            except psycopg.Error as exc:
+                raise self._translated(exc) from None
+            while True:
+                rows = cursor.fetchmany(size)
+                if not rows:
+                    return
+                for row in rows:
+                    yield row
 
     def graphs(self) -> list[Graph]:
         """Every graph, since there is no ``\\d`` that knows about them."""
