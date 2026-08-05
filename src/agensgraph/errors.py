@@ -28,6 +28,7 @@ from __future__ import annotations
 import enum
 from typing import TYPE_CHECKING
 
+import psycopg_pool as _pool
 from psycopg import conninfo
 from psycopg import errors as _pg
 from psycopg.errors import (
@@ -81,6 +82,7 @@ __all__ = [
     "ProgrammingError",
     "ReadOnlyGraphWrite",
     "Retryability",
+    "StaleGeneration",
     "StaleLabelCache",
     "UnresolvedCommit",
     "Warning",
@@ -327,6 +329,29 @@ class StaleLabelCache(_pg.OperationalError):
         return exc
 
 
+class StaleGeneration(_pg.OperationalError):
+    """A pooled connection belonging to a generation the pool has retired.
+
+    Raised by the pool's own reset hook, which is how psycopg is told to close a connection
+    rather than reuse it. It is not a failure a caller sees: by the time it is raised the
+    caller has finished and let the connection go.
+    """
+
+    generation: int | None = None
+    current: int | None = None
+
+    @classmethod
+    def for_connection(cls, generation: int | None, *, current: int) -> StaleGeneration:
+        """Build the report, naming the generation the connection came from."""
+        exc = cls(
+            f"this connection belongs to generation {generation}, and the pool has moved on "
+            f"to {current}, so it is closed rather than reused"
+        )
+        exc.generation = generation
+        exc.current = current
+        return exc
+
+
 class NetworkError(_pg.OperationalError):
     """A socket failure, carrying the number the operating system gave it."""
 
@@ -352,13 +377,24 @@ def from_os_error(exc: OSError, *, what: str) -> NetworkError:
 
 
 # Most specific first, since a class is matched by the first entry it belongs to.
+#
+# The pool's three failures are here because they are all an OperationalError carrying no
+# SQLSTATE, so classifying by code calls every one of them a lost connection -- and then a
+# blanket "reconnect on an OperationalError" treats a pool with no free connections as a dead
+# socket. None of them is that. There is no connection to replace, so replacing one is
+# meaningless; waiting for the pool is worth doing later rather than sooner; and a pool that
+# has been closed will never hand anything over however long anyone waits.
 _OURS: tuple[tuple[type[BaseException], Retryability], ...] = (
     (NetworkTimeout, Retryability.UNKNOWN),
     (NetworkError, Retryability.RECONNECT),
     (StaleLabelCache, Retryability.RESET_STATE),
+    (StaleGeneration, Retryability.RECONNECT),
     (UnresolvedCommit, Retryability.UNKNOWN),
     (ConfigurationError, Retryability.FATAL),
     (CapabilityError, Retryability.FATAL),
+    (_pool.PoolClosed, Retryability.FATAL),
+    (_pool.PoolTimeout, Retryability.BACKPRESSURE),
+    (_pool.TooManyRequests, Retryability.BACKPRESSURE),
 )
 
 

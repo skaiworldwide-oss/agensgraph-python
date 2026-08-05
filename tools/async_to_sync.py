@@ -34,6 +34,7 @@ PACKAGE = ROOT / "src" / "agensgraph"
 # else, so a module that escapes conversion is a line missing from one visible list.
 MODULES: dict[str, str] = {
     "connection_async.py": "connection.py",
+    "pool_async.py": "pool.py",
 }
 
 # Names that differ between the two interfaces. The convention keeps this short: a class
@@ -57,6 +58,7 @@ RENAMES: dict[str, str] = {
     "aclose": "close",
     "anext": "next",
     "IS_ASYNC": "IS_ASYNC",
+    "Awaitable": "Awaitable",
 }
 
 HEADER = """\
@@ -132,6 +134,17 @@ class Blocking(ast.NodeTransformer):
 
     def visit_Attribute(self, node: ast.Attribute) -> ast.AST:
         node.attr = _rename(node.attr)
+        return self.generic_visit(node)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> ast.AST:
+        """Rename the module as well as the names taken from it.
+
+        A module whose name ends in ``_async`` has a counterpart without it, and importing the
+        awaiting module from the blocking one would reach the wrong class -- or, since a rename
+        has already changed the name being imported, no class at all.
+        """
+        if node.module and node.module.endswith("_async"):
+            node.module = node.module[: -len("_async")]
         return self.generic_visit(node)
 
     def visit_alias(self, node: ast.alias) -> ast.AST:

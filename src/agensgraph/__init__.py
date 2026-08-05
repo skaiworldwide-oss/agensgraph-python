@@ -18,6 +18,8 @@ from .deadline import Expired as Expired
 from .errors import Retryability as Retryability
 from .errors import is_retryable as is_retryable
 from .errors import retryability as retryability
+from .pool import ConnectionPool as ConnectionPool
+from .pool_async import AsyncConnectionPool as AsyncConnectionPool
 from .retry import RetryPolicy as RetryPolicy
 from .retry import TokenBucket as TokenBucket
 from .summary import GraphWriteCounts as GraphWriteCounts
@@ -32,8 +34,10 @@ __all__ = [
     "LOCID_MAX",
     "MINIMUM_VERSION",
     "AsyncConnection",
+    "AsyncConnectionPool",
     "Capabilities",
     "Connection",
+    "ConnectionPool",
     "Deadline",
     "Edge",
     "Expired",

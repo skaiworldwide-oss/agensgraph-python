@@ -24,12 +24,19 @@ from .errors import explain_string_type, translate
 from .summary import GraphWriteCounts
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Awaitable, Callable, Sequence
 
     from psycopg.pq.abc import PGconn
     from psycopg.sql import SQL, Composed
 
-__all__ = ["GRAPH_ADAPTERS", "GraphMixin", "Result", "Statement"]
+__all__ = [
+    "GRAPH_ADAPTERS",
+    "AsyncConninfoSource",
+    "ConninfoSource",
+    "GraphMixin",
+    "Result",
+    "Statement",
+]
 
 GRAPH_ADAPTERS: AdaptersMap = graph_adapters()
 """The graph types, registered once for the process.
@@ -62,6 +69,12 @@ class GraphMixin:
     _agens_capabilities: Capabilities | None = None
     _agens_labels: LabelCache
     _agens_binary_ready: bool = False
+    _agens_generation: int = 0
+    """Which generation of a pool this connection belongs to, if it came from one.
+
+    Set when the pool creates it and read when it comes back, so that a pool which has moved
+    on closes it instead of handing it to somebody else.
+    """
 
     @property
     def adapters(self) -> AdaptersMap:
@@ -166,6 +179,17 @@ class GraphMixin:
         if hint is not None:
             replacement.add_note(hint)
         return replacement
+
+
+ConninfoSource = Union[str, "Callable[[], str]"]
+"""How a blocking pool may be told where to connect.
+
+A callable is re-read for every connection attempt, which is how a rotating credential is
+supplied without restarting anything.
+"""
+
+AsyncConninfoSource = Union[ConninfoSource, "Callable[[], Awaitable[str]]"]
+"""The same, for an awaiting pool, which may also be told by something to wait for."""
 
 
 Statement = Union[str, bytes, "SQL", "Composed"]
