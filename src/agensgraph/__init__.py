@@ -22,6 +22,7 @@ from .pool import ConnectionPool as ConnectionPool
 from .pool_async import AsyncConnectionPool as AsyncConnectionPool
 from .retry import RetryPolicy as RetryPolicy
 from .retry import TokenBucket as TokenBucket
+from .summary import CommitOutcome as CommitOutcome
 from .summary import GraphWriteCounts as GraphWriteCounts
 from .types import Edge as Edge
 from .types import GraphId as GraphId
@@ -36,6 +37,7 @@ __all__ = [
     "AsyncConnection",
     "AsyncConnectionPool",
     "Capabilities",
+    "CommitOutcome",
     "Connection",
     "ConnectionPool",
     "Deadline",

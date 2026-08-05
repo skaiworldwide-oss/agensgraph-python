@@ -26,7 +26,14 @@ import psycopg
 from psycopg.rows import Row, tuple_row
 
 from ._core import GraphMixin, Result
-from .summary import COUNTER_QUERY
+from .summary import (
+    ASSIGNED_TRANSACTION_QUERY,
+    COUNTER_QUERY,
+    TRANSACTION_ID_QUERY,
+    TRANSACTION_STATUS_QUERY,
+    CommitOutcome,
+    read_outcome,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -132,6 +139,38 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
             tag = cursor.statusmessage
         after = self._counters() if counts_ else None
         return Result(records, keys, self._counts_for(tag, before, after))
+
+    def transaction_id(self, *, assign: bool = False) -> int | None:
+        """The id of the transaction now open, so its fate can be asked about if it is lost.
+
+        With ``assign`` left alone this reports the id the transaction already has, and nothing
+        if it has not needed one -- a transaction that has only read is given none. With
+        ``assign`` set an id is taken whether or not one was needed, which is what a caller
+        does before a write whose outcome it intends to be able to establish.
+
+        Keep the number. If the connection is lost while committing, whether the commit landed
+        is exactly what has been lost, and :meth:`resolve_commit` on *another* connection is
+        the only thing that can answer it.
+        """
+        statement = TRANSACTION_ID_QUERY if assign else ASSIGNED_TRANSACTION_QUERY
+        with super().cursor(row_factory=tuple_row) as cursor:
+            cursor.execute(statement)
+            row = cursor.fetchone()
+        if row is None or row[0] is None:
+            return None
+        return int(row[0])
+
+    def resolve_commit(self, transaction_id: int) -> CommitOutcome:
+        """What became of a transaction, asked from this connection.
+
+        Meant to be asked on a connection other than the one that was lost -- the whole point
+        is that the original cannot answer. A transaction still running is not an answer yet;
+        wait and ask again rather than deciding.
+        """
+        with super().cursor(row_factory=tuple_row) as cursor:
+            cursor.execute(TRANSACTION_STATUS_QUERY, (str(transaction_id),))
+            row = cursor.fetchone()
+        return read_outcome(None if row is None else row[0])
 
     def _counters(self) -> Sequence[int]:
         with super().cursor(row_factory=tuple_row) as cursor:

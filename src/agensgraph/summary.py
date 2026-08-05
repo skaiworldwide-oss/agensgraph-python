@@ -22,12 +22,22 @@ Nothing here reports a number it cannot account for. A counter it cannot vouch f
 
 from __future__ import annotations
 
+import enum
 from typing import TYPE_CHECKING, NamedTuple
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-__all__ = ["COUNTER_COLUMNS", "COUNTER_QUERY", "GraphWriteCounts"]
+__all__ = [
+    "ASSIGNED_TRANSACTION_QUERY",
+    "COUNTER_COLUMNS",
+    "COUNTER_QUERY",
+    "TRANSACTION_ID_QUERY",
+    "TRANSACTION_STATUS_QUERY",
+    "CommitOutcome",
+    "GraphWriteCounts",
+    "read_outcome",
+]
 
 COUNTER_QUERY = "select * from get_last_graph_write_stats()"
 """The statement that reads the counters. One row of five ``bigint`` columns."""
@@ -101,3 +111,67 @@ class GraphWriteCounts(NamedTuple):
         if not self.complete:
             return None
         return sum(value for value in self if value is not None)
+
+
+TRANSACTION_ID_QUERY = "select pg_current_xact_id()::text"
+"""Assign this transaction an id, and read it, so its fate can be asked about later.
+
+Asked as text because the id is what has to be sent back, and sending an integer back is
+refused: there is no cast from any integer type to the one the server wants.
+"""
+
+ASSIGNED_TRANSACTION_QUERY = "select pg_current_xact_id_if_assigned()::text"
+"""The id this transaction already has, or nothing if it has not needed one.
+
+A read is given no id at all -- verified -- so this distinguishes a transaction that wrote
+from one that only looked, without assigning an id to the one that only looked.
+"""
+
+TRANSACTION_STATUS_QUERY = "select pg_xact_status(%s::xid8)"
+"""What became of a transaction, asked from a connection that outlived it."""
+
+
+class CommitOutcome(enum.Enum):
+    """What became of a transaction whose commit was interrupted.
+
+    The one failure that cannot be retried is a commit whose outcome nobody knows: retrying
+    might apply a write twice, and not retrying might lose it. The server can be asked, from
+    another connection, which turns the unanswerable question into an ordinary one.
+    """
+
+    COMMITTED = "committed"
+    """It landed. There is nothing to retry and nothing was lost."""
+
+    ABORTED = "aborted"
+    """It did not land, and nothing of it remains. Safe to run again."""
+
+    IN_PROGRESS = "in progress"
+    """Still running somewhere, so it is too early to say. Wait and ask again."""
+
+    UNKNOWN = "unknown"
+    """The server cannot say, because the record has been truncated away."""
+
+    @property
+    def is_settled(self) -> bool:
+        """Whether the question has an answer yet."""
+        return self in (CommitOutcome.COMMITTED, CommitOutcome.ABORTED)
+
+    @property
+    def safe_to_retry(self) -> bool:
+        """Whether running the transaction again would apply anything twice."""
+        return self is CommitOutcome.ABORTED
+
+
+def read_outcome(reported: str | None) -> CommitOutcome:
+    """Read what the server said about a transaction.
+
+    A transaction old enough that its record has been truncated reports nothing at all, and
+    that is not the same as aborted: it is the server saying it can no longer tell, which has
+    to be reported as such rather than guessed either way.
+    """
+    if reported is None:
+        return CommitOutcome.UNKNOWN
+    try:
+        return CommitOutcome(reported)
+    except ValueError:
+        return CommitOutcome.UNKNOWN
