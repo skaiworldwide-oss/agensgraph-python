@@ -91,6 +91,23 @@ class TestLazyProperties:
             with pytest.raises(ValueError):
                 _ = Vertex(GraphId(5, 1), "person", bad).properties
 
+    def test_a_property_map_of_the_wrong_type_is_rejected_on_access(self):
+        """An element carries its map without looking at it, so every complaint about one is
+        raised in the same place."""
+        vertex = Vertex(GraphId(5, 1), "person", "{}")  # type: ignore[arg-type]
+        assert vertex.label == "person"
+        with pytest.raises(TypeError, match="must be a dict, undecoded bytes or None"):
+            _ = vertex.properties
+
+    def test_a_dict_map_is_the_object_that_was_given(self):
+        given = {"n": 1}
+        assert Vertex(GraphId(5, 1), "person", given).properties is given
+
+    def test_no_properties_reads_as_an_empty_map(self):
+        vertex = Vertex(GraphId(5, 1), "person")
+        assert vertex.properties == {}
+        assert vertex.properties is vertex.properties
+
     def test_metadata_and_properties_are_separate_namespaces(self):
         """A property named like a metadata field must not shadow it."""
         vertex = Vertex(GraphId(5, 1), "person", b'{"label": "spoofed", "id": "spoofed"}')
