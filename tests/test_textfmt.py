@@ -177,3 +177,32 @@ def test_the_map_is_not_decoded_until_it_is_read():
         assert calls == 1
     finally:
         numbers._decode = real
+
+
+class TestTheLabelNameTable:
+    """Label names are decoded once per distinct name rather than once per element."""
+
+    def test_the_same_bytes_give_the_same_string_object(self):
+        a = decode.vertex_from_text(b'person[3.1]{"k": 1}')
+        b = decode.vertex_from_text(b'person[3.2]{"k": 2}')
+        assert a.label == b.label == "person"
+        assert a.label is b.label
+
+    def test_a_label_the_table_has_never_seen_still_reads(self):
+        assert decode.vertex_from_text('사람[3.1]{}'.encode()).label == "사람"
+        assert decode.vertex_from_text(b'a,b[3.1]{}').label == "a,b"
+
+    def test_an_edge_reads_its_label_through_the_same_table(self):
+        edge = decode.edge_from_text(b'knows[4.1][3.1,3.2]{}')
+        assert edge.label == "knows"
+        assert edge.label is decode.vertex_from_text(b'knows[3.9]{}').label
+
+    def test_the_table_does_not_grow_without_bound(self):
+        """It holds label names, which are schema rather than data -- but a process that
+        somehow meets more of them must not accumulate them for ever."""
+        names = decode._label_names
+        names.clear()
+        for i in range(decode.LABEL_NAMES_MAX + 50):
+            assert names[b"label-%d" % i] == f"label-{i}"
+        assert len(names) <= decode.LABEL_NAMES_MAX
+        names.clear()

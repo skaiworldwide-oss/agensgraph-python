@@ -44,13 +44,36 @@ GRAPHPATH_ARRAY_OID = 7031
 
 LabelResolver = Callable[[int], str]
 
+LABEL_NAMES_MAX = 4096
+"""How many distinct label names are remembered before the table starts again."""
+
+
+class _LabelNames(dict[bytes, str]):
+    """Label names by the bytes they arrive as.
+
+    A result holds many rows and few distinct labels, so decoding the same name once per
+    element is work with one answer. This says nothing about which label an id belongs to
+    -- it is the bytes themselves that are the key -- so it holds for every connection and
+    every graph, and cannot go stale the way resolving an id can.
+    """
+
+    def __missing__(self, key: bytes) -> str:
+        if len(self) >= LABEL_NAMES_MAX:
+            self.clear()
+        name = key.decode()
+        self[key] = name
+        return name
+
+
+_label_names = _LabelNames()
+
 
 def vertex_from_text(buf: bytes) -> Vertex:
     """Build a vertex from ``label[labid.locid]{properties}``."""
     parts = textfmt.parse_vertex(buf)
     return Vertex(
         GraphId(parts.labid, parts.locid),
-        parts.label.decode(),
+        _label_names[parts.label],
         parts.properties,
     )
 
@@ -60,7 +83,7 @@ def edge_from_text(buf: bytes) -> Edge:
     p = textfmt.parse_edge(buf)
     return Edge(
         GraphId(p.labid, p.locid),
-        p.label.decode(),
+        _label_names[p.label],
         GraphId(p.start_labid, p.start_locid),
         GraphId(p.end_labid, p.end_locid),
         p.properties,
