@@ -6,6 +6,7 @@ from psycopg.types.json import Jsonb as Jsonb
 
 from . import dbapi as dbapi
 from . import errors as errors
+from . import vector as vector
 from ._core import Result as Result
 from ._protocol.graphid import LABID_MAX as LABID_MAX
 from ._protocol.graphid import LOCID_MAX as LOCID_MAX
@@ -82,6 +83,7 @@ __all__ = [
     "is_retryable",
     "remove_query_logger",
     "retryability",
+    "vector",
 ]
 
 

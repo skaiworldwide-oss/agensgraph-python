@@ -259,6 +259,41 @@ conn.element_counts()             # per label, reading no property at all
 filters exclusion constraints out and a uniqueness assertion is kept as one — so it would
 otherwise report a graph as having none while it has them.
 
+## Embedding vectors
+
+Vectors need pgvector, and unlike every other type here their oid comes from the extension rather
+than the server — so it differs between databases and has to be looked up:
+
+```python
+if conn.has_vectors():
+    conn.register_vectors()      # returns ('vector', 'halfvec')
+```
+
+**Registering matters more than it sounds.** A vector left in the property map is JSON, so it
+arrives as a list of numbers. Give the property a column of its own and it arrives as that
+column's type — and with no loader for it, as the *string* `'[1,2,3,4]'`. So a driver that reads
+vectors correctly without promotion reads them wrongly with it. Both are asserted in the suite.
+
+Two ways to index one, and only one of them is a trap:
+
+```python
+from agensgraph.vector import generated_column, expression_index, nearest
+
+# the dimension lives on the column, so a wrong-length value is refused when written
+conn.execute(f"CREATE VLABEL Emb ({generated_column('v', 1024)})")
+conn.execute('CREATE INDEX ON social."Emb" USING hnsw (v vector_l2_ops)')
+
+# or index the property where it is -- but the cast must carry the dimension
+conn.execute(expression_index("social", "Doc", "v", 1024))
+#   (properties->>'v')::vector      -> "column does not have dimensions"
+#   (properties->>'v')::vector(1024) -> indexes
+
+rows = conn.execute(nearest("social", "Emb", "v", limit=10), (query_vector_text,)).fetchall()
+```
+
+`sparsevec` is deliberately not read: its text form is `{1:1,3:2}/4` rather than a list, so reading
+it like the others would give a plausible wrong answer.
+
 ## Watching it work
 
 ```python

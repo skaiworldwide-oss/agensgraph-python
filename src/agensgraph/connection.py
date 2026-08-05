@@ -35,6 +35,7 @@ from .bulk import (
     vertex_copy_statement,
     vertex_rows,
 )
+from .capabilities import VECTOR_AVAILABLE_QUERY
 from .cypher import wrap_for_cursor
 from .introspect import (
     CONSTRAINTS_QUERY,
@@ -248,6 +249,36 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
                     return
                 for row in rows:
                     yield row
+
+    def register_vectors(self) -> tuple[str, ...]:
+        """Read vectors on this connection, reporting which vector types were found.
+
+        Separate from everything else the connection sets up, because a vector type's oid belongs
+        to an extension rather than to the server: it is assigned when the extension is created and
+        differs between databases, so it has to be asked for here rather than written down. An
+        empty result means the extension is not created in this database.
+
+        Worth doing when a property has been given a column of its own. Such a property arrives as
+        that column's type, and with no loader for it a vector arrives as the *string* it prints
+        as -- where the same property left in the property map arrives as a list of numbers.
+        """
+        from psycopg.types import TypeInfo
+
+        from .vector import TYPES, accept
+
+        found: list[str] = []
+        for name in TYPES:
+            info = TypeInfo.fetch(self, name)
+            if info is None:
+                continue
+            accept(self, info)
+            found.append(name)
+        return tuple(found)
+
+    def has_vectors(self) -> bool:
+        """Whether vectors can be read here at all, without registering anything."""
+        rows = self._fetch(VECTOR_AVAILABLE_QUERY, ())
+        return bool(rows and rows[0][0])
 
     def load_vertices(
         self, label: str, properties: Iterable[Mapping[str, Any]], *, graph: str | None = None

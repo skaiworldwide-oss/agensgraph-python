@@ -148,3 +148,16 @@ class Capabilities:
 
     def __repr__(self) -> str:
         return f"Capabilities({self._reported!r})"
+
+
+VECTOR_AVAILABLE_QUERY = """
+select count(*) > 0 from pg_catalog.pg_type t
+join pg_catalog.pg_namespace n on n.oid = t.typnamespace
+where t.typname = 'vector'
+"""
+"""Whether vectors can be read on this connection.
+
+Not a version question, which is why it is not one of the gates above: the extension is created
+per database, so the same server answers differently for two of them. And its type has no fixed
+oid, so the only way to ask is by name.
+"""
