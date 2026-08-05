@@ -81,6 +81,27 @@ def test_out_of_range_is_rejected(labid, locid):
         GraphId(labid, locid)
 
 
+@pytest.mark.parametrize("packed", [-1, 1 << 64, 1 << 70])
+def test_a_packed_value_wider_than_the_wire_is_rejected(packed):
+    """A value outside eight bytes has a part outside its own range, which is where it is
+    caught. The wire itself cannot produce one: eight bytes are always a valid pair."""
+    with pytest.raises(ValueError):
+        GraphId.from_packed(packed)
+
+
+def test_every_pair_the_wire_can_carry_is_accepted():
+    """Which is why the decode path needs no range check of its own."""
+    for packed in (0, 0xFFFF_FFFF_FFFF_FFFF, 1 << 48, (1 << 48) - 1):
+        assert GraphId.from_packed(packed).packed == packed
+
+
+def test_it_is_not_tracked_by_the_collector():
+    """A result holds one per element, so the collector must have nothing of ours to walk."""
+    import gc
+
+    assert not gc.is_tracked(GraphId(3, 1))
+
+
 @pytest.mark.parametrize("text", REJECTED_GRAPHIDS)
 def test_bad_text_is_rejected(text):
     """Trailing characters are an error, not something to discard.

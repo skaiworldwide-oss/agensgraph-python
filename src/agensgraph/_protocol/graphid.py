@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import struct
 
+import msgspec
+
 __all__ = [
     "LABID_MAX",
     "LOCID_MAX",
@@ -35,87 +37,41 @@ _unpack_u64 = struct.Struct(">Q").unpack
 _pack_u64 = struct.Struct(">Q").pack
 
 
-class GraphId:
+class GraphId(msgspec.Struct, frozen=True, gc=False, order=True):
     """The identity of a vertex or an edge.
 
-    Equality and hashing use the packed value, so a graphid can be a dict key or a
-    set member. The parts are read-only.
+    It holds the two parts, which is what both renderings hand over: the text form writes
+    them separately, and the binary form is split to resolve the label. Ordering follows the
+    parts in the order they are declared, which is the order the packed value sorts in.
+
+    Frozen, so it can be a dict key or a set member, and untracked by the collector,
+    which is what a result holding one per element rests on.
     """
 
-    __slots__ = ("_packed",)
+    labid: int
+    """The label this identity belongs to."""
 
-    _packed: int
+    locid: int
+    """The serial id within the label."""
 
-    def __init__(self, labid: int, locid: int) -> None:
-        if not 0 <= labid <= LABID_MAX:
-            raise ValueError(f"labid out of range: {labid}")
-        if not 0 <= locid <= LOCID_MAX:
-            raise ValueError(f"locid out of range: {locid}")
-        object.__setattr__(self, "_packed", (labid << _LABID_SHIFT) | locid)
+    def __post_init__(self) -> None:
+        if not 0 <= self.labid <= LABID_MAX:
+            raise ValueError(f"labid out of range: {self.labid}")
+        if not 0 <= self.locid <= LOCID_MAX:
+            raise ValueError(f"locid out of range: {self.locid}")
 
     @classmethod
     def from_packed(cls, packed: int) -> GraphId:
         """Build from the packed 64-bit value, as it appears on the wire."""
-        if not 0 <= packed <= 0xFFFF_FFFF_FFFF_FFFF:
-            raise ValueError(f"graphid out of range: {packed}")
-        self = cls.__new__(cls)
-        object.__setattr__(self, "_packed", packed)
-        return self
-
-    @property
-    def labid(self) -> int:
-        """The label this identity belongs to."""
-        return self._packed >> _LABID_SHIFT
-
-    @property
-    def locid(self) -> int:
-        """The serial id within the label."""
-        return self._packed & _LOCID_MASK
+        return cls(packed >> _LABID_SHIFT, packed & _LOCID_MASK)
 
     @property
     def packed(self) -> int:
         """The single 64-bit value, unsigned."""
-        return self._packed
-
-    def __setattr__(self, name: str, value: object) -> None:
-        raise AttributeError("GraphId is immutable")
-
-    def __delattr__(self, name: str) -> None:
-        raise AttributeError("GraphId is immutable")
-
-    def __eq__(self, other: object) -> bool:
-        if isinstance(other, GraphId):
-            return self._packed == other._packed
-        return NotImplemented
-
-    def __hash__(self) -> int:
-        return hash(self._packed)
-
-    def __lt__(self, other: object) -> bool:
-        if not isinstance(other, GraphId):
-            return NotImplemented
-        return self._packed < other._packed
-
-    def __le__(self, other: object) -> bool:
-        if not isinstance(other, GraphId):
-            return NotImplemented
-        return self._packed <= other._packed
-
-    def __gt__(self, other: object) -> bool:
-        if not isinstance(other, GraphId):
-            return NotImplemented
-        return self._packed > other._packed
-
-    def __ge__(self, other: object) -> bool:
-        if not isinstance(other, GraphId):
-            return NotImplemented
-        return self._packed >= other._packed
+        return (self.labid << _LABID_SHIFT) | self.locid
 
     def __str__(self) -> str:
         return f"{self.labid}.{self.locid}"
-
-    def __repr__(self) -> str:
-        return f"GraphId({self.labid}, {self.locid})"
 
 
 def unpack(data: bytes) -> GraphId:
