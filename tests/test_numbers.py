@@ -109,12 +109,14 @@ class TestReadingThemExactly:
         )
 
     def test_a_decimal_can_be_written_back(self, graph) -> None:  # type: ignore[no-untyped-def]
-        """A decimal renders as a JSON string, so a round trip is not identity -- worth knowing
-        rather than discovering."""
-        graph.execute("create (:doc %s)", ({"v": Decimal("1.5")},))
-        assert (
-            graph.execute_query("match (n:doc) return n").records[0][0].properties["v"] == "1.5"
-        )
+        """It renders as a JSON number, and jsonb keeps every digit of one, so the round trip
+        returns what was written."""
+        agensgraph.read_numbers_exactly()
+        value = Decimal("3.141592653589793238462643383279")
+        graph.execute("create (:doc %s)", ({"v": value},))
+        stored = graph.execute_query("match (n:doc) return n").records[0][0].properties["v"]
+        assert stored == value
+        assert type(stored) is Decimal
 
 
 def test_a_map_is_decoded_when_it_is_first_read_not_when_its_row_arrived() -> None:

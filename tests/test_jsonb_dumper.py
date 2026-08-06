@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import json
 import math
+from decimal import Decimal
 
 import pytest
 
 import agensgraph
 from agensgraph.adapters import dump_jsonb
+from agensgraph.numbers import read_numbers_exactly
 
 
 class TestWhatItRenders:
@@ -138,3 +140,49 @@ class TestRoundTripping:
         graph.execute("create (:doc %s)", (wrapped,))
         (vertex,) = graph.execute_query("match (n:doc) return n").records[0]
         assert vertex.properties == {"a": 99}
+
+
+class TestADecimalKeepsItsDigits:
+    """The read side exists so a decimal reads exactly; the write side has to agree with it."""
+
+    def test_it_is_written_as_a_number_and_not_as_text(self) -> None:
+        assert dump_jsonb({"k": Decimal("1.5")}) == b'{"k":1.5}'
+        assert dump_jsonb({"k": Decimal("3.14159265358979323846264338327950288")}) == (
+            b'{"k":3.14159265358979323846264338327950288}'
+        )
+
+    @pytest.mark.server
+    def test_the_server_keeps_every_digit_of_it(self, agens) -> None:  # type: ignore[no-untyped-def]
+        """Which is why it is a number: jsonb does not narrow one, so nothing is lost by it."""
+        value = Decimal("3.14159265358979323846264338327950288")
+        agens.execute("create vlabel exact")
+        agens.execute("create (:exact %s)", ({"p": value},))
+        (stored,) = agens.execute_query("match (n:exact) return n.p::text").records[0]
+        assert stored == "3.14159265358979323846264338327950288"
+
+    @pytest.mark.server
+    def test_it_round_trips_through_a_map_and_through_a_column_alike(self, agens) -> None:  # type: ignore[no-untyped-def]
+        value = Decimal("3.14159265358979323846264338327950288")
+        agens.execute("create vlabel exact")
+        agens.execute("create (:exact %s)", ({"p": value},))
+        read_numbers_exactly(True)
+        try:
+            (column,) = agens.execute_query("match (n:exact) return n.p").records[0]
+            (vertex,) = agens.execute_query("match (n:exact) return n").records[0]
+            # Read inside the mode that read the row: a map on the text path is decoded when
+            # it is first touched and not when its row arrived.
+            from_map = vertex.properties["p"]
+        finally:
+            read_numbers_exactly(False)
+        assert column == value
+        assert from_map == value
+        assert type(column) is Decimal
+        assert type(from_map) is Decimal
+
+    @pytest.mark.server
+    def test_a_column_reads_as_a_float_when_nothing_asked_otherwise(self, agens) -> None:  # type: ignore[no-untyped-def]
+        agens.execute("create vlabel exact")
+        agens.execute("create (:exact %s)", ({"p": Decimal("1.5")},))
+        (column,) = agens.execute_query("match (n:exact) return n.p").records[0]
+        assert type(column) is float
+        assert column == 1.5

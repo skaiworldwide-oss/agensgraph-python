@@ -207,16 +207,13 @@ rendered to rather than as what was sent:
 |---|---|---|
 | `datetime`, `date`, `time` | its ISO text | `str` |
 | `UUID` | its text | `str` |
-| `Decimal` | its text | `str` |
 | `bytes` | base64 text | `str` |
 | `set` | a JSON array | `list` |
 
-`Decimal` is the one worth explaining, since `read_numbers_exactly()` exists so that decimals read
-back exactly. Storing it as a JSON *number* instead would give the right type back, and does for
-anything under about seventeen significant digits — but jsonb narrows a longer one, so
-`Decimal("3.14159265358979323846264338327950288")` would come back
-`3.141592653589793` with nothing said. The text keeps every digit, and `Decimal(value)` reconstructs
-it. Losing the type loudly beats losing the digits quietly.
+A `Decimal` is **not** in that table: it is stored as a JSON number and keeps every digit. jsonb
+does not narrow one — asked for it as text the server returns
+`3.14159265358979323846264338327950288`, all thirty-six digits — so with
+`read_numbers_exactly()` on, a decimal written and read back is the decimal that was written.
 
 A non-finite `float` is refused wherever it appears — in a property map, and as a parameter of its
 own. Sent alone it reaches the server as a `float8`, and converting one to jsonb stores the *text*
@@ -436,9 +433,10 @@ agensgraph.read_numbers_exactly()      # once, at startup
 ```
 
 Every non-integer then reads as a `Decimal` keeping whatever the server holds — `1e-400` included.
-It costs about **3.7×** to decode a map of numbers, and integers are exact either way. Writing a
-`Decimal` back stores its text, so that round trip returns a `str`; see above for why the
-alternative is worse.
+It costs about **3.7×** to decode a map of numbers, and integers are exact either way. It applies
+to a property map and to a bare jsonb column alike: `RETURN n` and `RETURN n.p` agree about the
+same stored value, which they did not while the second was read by the standard library. Writing a
+`Decimal` back stores a JSON number, so the round trip returns the `Decimal` that was written.
 
 ## Sending a burst of statements
 
