@@ -166,8 +166,27 @@ Rendered with msgspec, which is where most of the cost of a write is:
 `null` instead — which is the wrong value rather than an error. The check runs only when the output
 holds a `null` at all, so a map of numbers never pays for it.
 
-A `datetime`, `date`, `UUID`, `Decimal`, `bytes` or `set` is rendered rather than refused —
-respectively an ISO string, a string, a string, a base64 string and a list.
+A value JSON has no type for is rendered rather than refused, and reads back as what it was
+rendered to rather than as what was sent:
+
+| written | stored as | reads back as |
+|---|---|---|
+| `datetime`, `date`, `time` | its ISO text | `str` |
+| `UUID` | its text | `str` |
+| `Decimal` | its text | `str` |
+| `bytes` | base64 text | `str` |
+| `set` | a JSON array | `list` |
+
+`Decimal` is the one worth explaining, since `read_numbers_exactly()` exists so that decimals read
+back exactly. Storing it as a JSON *number* instead would give the right type back, and does for
+anything under about seventeen significant digits — but jsonb narrows a longer one, so
+`Decimal("3.14159265358979323846264338327950288")` would come back
+`3.141592653589793` with nothing said. The text keeps every digit, and `Decimal(value)` reconstructs
+it. Losing the type loudly beats losing the digits quietly.
+
+A non-finite `float` is refused wherever it appears — in a property map, and as a parameter of its
+own. Sent alone it reaches the server as a `float8`, and converting one to jsonb stores the *text*
+`"NaN"`, so what came back was a string where a number was sent.
 
 ## What a write changed
 
@@ -355,7 +374,8 @@ agensgraph.read_numbers_exactly()      # once, at startup
 
 Every non-integer then reads as a `Decimal` keeping whatever the server holds — `1e-400` included.
 It costs about **3.7×** to decode a map of numbers, and integers are exact either way. Writing a
-`Decimal` back stores it as a JSON string, so that round trip is not identity.
+`Decimal` back stores its text, so that round trip returns a `str`; see above for why the
+alternative is worse.
 
 ## Sending a burst of statements
 

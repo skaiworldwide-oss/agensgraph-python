@@ -7,3 +7,4 @@ dist
 .idea
 # Agent worktrees and local session state.
 .claude/
+.scratch/
