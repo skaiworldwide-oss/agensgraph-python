@@ -261,14 +261,19 @@ class ConnectionPool:
         """
         budget = deadline if deadline is not None else Deadline(timeout)
         budget.check("waiting for a connection")
-        wait = budget.bounded(timeout)
         lent: Connection[Any] | None = None
         try:
-            with self._pool.connection(timeout=wait) as conn:
-                lent = conn
-                conn._agens_lent = True
-                self._prepare(conn, budget)
-                yield conn
+            for _ in range(self._pool.max_size + 1):
+                budget.check("waiting for a connection")
+                with self._pool.connection(timeout=budget.bounded(timeout)) as conn:
+                    lent = conn
+                    conn._agens_lent = True
+                    if conn._agens_generation != self._generation:
+                        continue
+                    self._prepare(conn, budget)
+                    yield conn
+                    return
+            raise StaleGeneration.for_pool(self._generation)
         finally:
             if lent is not None:
                 lent._agens_lent = False

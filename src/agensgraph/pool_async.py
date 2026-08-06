@@ -279,16 +279,26 @@ class AsyncConnectionPool:
         """
         budget = deadline if deadline is not None else Deadline(timeout)
         budget.check("waiting for a connection")
-        wait = budget.bounded(timeout)
         lent: AsyncConnection[Any] | None = None
         try:
-            async with self._pool.connection(timeout=wait) as conn:
-                # Given back after psycopg's own block has ended, because that block commits
-                # and resets, and the pool doing so is not a caller reaching past its turn.
-                lent = conn
-                conn._agens_lent = True
-                await self._prepare(conn, budget)
-                yield conn
+            # A connection from a retired generation is handed back rather than lent, and
+            # another taken. Retiring one only as it returns would let each of them serve one
+            # more caller first, which is the failure per caller the epoch bump replaces.
+            for _ in range(self._pool.max_size + 1):
+                budget.check("waiting for a connection")
+                async with self._pool.connection(timeout=budget.bounded(timeout)) as conn:
+                    # Marked before the test and left so through the end of psycopg's own
+                    # block, which commits and resets: the pool doing that is not a caller
+                    # reaching past its turn. One rejected here is closed on the way out, so
+                    # what the flag says about it afterwards reaches nobody.
+                    lent = conn
+                    conn._agens_lent = True
+                    if conn._agens_generation != self._generation:
+                        continue
+                    await self._prepare(conn, budget)
+                    yield conn
+                    return
+            raise StaleGeneration.for_pool(self._generation)
         finally:
             if lent is not None:
                 lent._agens_lent = False

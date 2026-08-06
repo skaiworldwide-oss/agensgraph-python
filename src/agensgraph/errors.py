@@ -413,6 +413,16 @@ class StaleGeneration(_pg.OperationalError):
     current: int | None = None
 
     @classmethod
+    def for_pool(cls, current: int) -> StaleGeneration:
+        """Build the report for a pool that could not find a connection of this generation."""
+        exc = cls(
+            f"every connection the pool offered belongs to a generation before {current}, so "
+            f"none was lent. Something is retiring them as fast as they are made"
+        )
+        exc.current = current
+        return exc
+
+    @classmethod
     def for_connection(cls, generation: int | None, *, current: int) -> StaleGeneration:
         """Build the report, naming the generation the connection came from."""
         exc = cls(

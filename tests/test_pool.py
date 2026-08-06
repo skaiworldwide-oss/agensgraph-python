@@ -514,3 +514,39 @@ class TestAStatementTimeoutBelongsToOneBorrow:
             with pool.connection(deadline=Deadline(20.0)) as conn:
                 second = conn.execute("show statement_timeout").fetchone()[0]
             assert first != second
+
+
+@pytest.mark.server
+class TestARetiredConnectionIsNeverLent:
+    """Retiring one only as it comes back lets each of them serve one more caller first, which
+    is the failure-per-caller the epoch bump replaces."""
+
+    def test_no_borrow_after_invalidate_gets_an_older_generation(self, dsn: str) -> None:
+        with agensgraph.ConnectionPool(dsn, min_size=3, max_size=3, timeout=5.0) as pool:
+            pool.wait()
+            for _ in range(5):
+                with pool.connection() as conn:
+                    conn.execute("select 1")
+            current = pool.invalidate()
+            served = []
+            for _ in range(4):
+                with pool.connection() as conn:
+                    served.append(conn._agens_generation)
+            assert served == [current] * 4
+
+    def test_they_are_all_retired_rather_than_one_per_caller(self, dsn: str) -> None:
+        with agensgraph.ConnectionPool(dsn, min_size=3, max_size=3, timeout=5.0) as pool:
+            pool.wait()
+            for _ in range(4):
+                with pool.connection() as conn:
+                    conn.execute("select 1")
+            pool.invalidate()
+            with pool.connection() as conn:
+                conn.execute("select 1")
+            assert pool.retired >= 3
+
+    def test_the_pool_still_serves_afterwards(self, dsn: str) -> None:
+        with agensgraph.ConnectionPool(dsn, min_size=2, max_size=2, timeout=5.0) as pool:
+            pool.wait()
+            pool.invalidate()
+            assert pool.execute_query("return 1 as n").records == [(1,)]
