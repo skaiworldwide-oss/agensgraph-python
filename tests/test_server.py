@@ -10,12 +10,15 @@ tests fails and says which workaround to drop.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
 import psycopg
 import pytest
 
+import agensgraph
 from agensgraph import Edge, GraphId, Path, Vertex
+from agensgraph import connection as connection_module
 from agensgraph._protocol.labels import LabelCache
 from agensgraph.adapters import OIDS, assert_oids, register_binary
 from agensgraph.capabilities import Capabilities
@@ -496,3 +499,90 @@ class TestThePromotedSentinelColumn:
         result = promoted.execute_query("match (d:doc) where d.title = 'a' return d.title")
         assert result.records == [("a",)]
         assert result.oids == (TEXT_OID,)
+
+
+@contextmanager
+def counting_statements() -> Iterator[list[str]]:
+    """Every statement any connection sends, counted at the cursor it is sent through.
+
+    Not through the query logger: that reports what a caller asked for, and the driver's own
+    catalog reads do not go through it -- which is exactly what a test about hidden round trips
+    must be able to see.
+    """
+    sent: list[str] = []
+    real = connection_module.Cursor.execute
+
+    def counting(self, query, params=None, **kwargs):  # type: ignore[no-untyped-def]
+        sent.append(str(query))
+        return real(self, query, params, **kwargs)
+
+    connection_module.Cursor.execute = counting  # type: ignore[method-assign, assignment]
+    try:
+        yield sent
+    finally:
+        connection_module.Cursor.execute = real  # type: ignore[method-assign]
+
+
+class TestTheMechanismsAReadRelieson:
+    """That a read does what it is documented to do, not only that it answers correctly.
+
+    A per-row catalog lookup and a per-row cached one both return the right label, and a map
+    decoded twice holds the same thing as one decoded once. Neither difference is visible in an
+    answer, so each is asserted here as a count.
+    """
+
+    @pytest.fixture
+    def many(self, graph: Connection[object], labels: LabelCache) -> Connection[object]:
+        register_binary(graph, labels)
+        graph.execute("create vlabel many")
+        for _ in range(40):
+            graph.execute("create (:many {n: 1})")
+        name = graph.execute("select current_setting('graph_path')").fetchone()[0]
+        labels.load(name, graph.execute(labels.query, (name,)).fetchall())
+        return graph
+
+    def test_naming_a_label_asks_the_table_and_not_the_server(
+        self, many: Connection[object], dsn: str
+    ) -> None:
+        """Forty rows, one statement. A lookup per row would be forty more."""
+        graph_name = many.execute("select current_setting('graph_path')").fetchone()[0]
+        with agensgraph.connect(dsn) as conn:
+            conn.graph(graph_name)
+            with counting_statements() as sent:
+                rows = conn.execute_query("match (n:many) return n", binary_=True).records
+        assert len(rows) == 40
+        assert {v.label for (v,) in rows} == {"many"}
+        assert len(sent) == 1, sent
+
+    def test_a_binary_map_is_decoded_once_per_row(self, many: Connection[object]) -> None:
+        from agensgraph import numbers
+
+        calls = 0
+        real = numbers._decode
+
+        def counting(data: bytes) -> object:
+            nonlocal calls
+            calls += 1
+            return real(data)
+
+        numbers._decode = counting
+        try:
+            rows = many.execute("match (n:many) return n", binary=True).fetchall()
+            assert [row[0].properties["n"] for row in rows] == [1] * 40
+            assert calls == 40
+        finally:
+            numbers._decode = real
+
+    def test_the_capability_gate_costs_no_statement(self, dsn: str) -> None:
+        """It is read from what the server reported at startup, so it asks nothing."""
+        with agensgraph.connect(dsn) as conn, counting_statements() as sent:
+            assert conn.capabilities.version >= (2, 16)
+            assert conn.capabilities.has_property_promotion() in (True, False)
+            assert sent == []
+
+    def test_the_counting_notices_a_statement(self, dsn: str) -> None:
+        """Or the two above are asserting nothing."""
+        with agensgraph.connect(dsn) as conn, counting_statements() as sent:
+            conn.execute_query("return 1")
+            conn.refresh_labels()
+        assert len(sent) >= 2

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from agensgraph._protocol import decode, textfmt
@@ -206,3 +208,60 @@ class TestTheLabelNameTable:
             assert names[b"label-%d" % i] == f"label-{i}"
         assert len(names) <= decode.LABEL_NAMES_MAX
         names.clear()
+
+
+class TestTheMechanismsBehindTheNumbers:
+    """Assertions on how the work is done, not only on what comes out.
+
+    Every defect this suite missed once passed the type gates and every behavioural test: what
+    they could not see was a mechanism -- a map decoded that should not have been, a scan whose
+    cost grew with what it was scanning past. Each of those is cheap to assert directly, and
+    what follows asserts it.
+    """
+
+    @staticmethod
+    def element(index: int, size: int) -> bytes:
+        return b'p[3.%d]{"pad": "%s"}' % (index, b"x" * size)
+
+    def test_splitting_costs_the_same_per_element_however_many_there_are(self) -> None:
+        """A splitter that measures each element in turn is linear; one that rescans is not.
+
+        The property map is a kilobyte and a half, which is where a quadratic scan shows: it is
+        the bytes between one separator and the next that a wrong implementation walks again.
+        """
+
+        def cost(count: int) -> float:
+            buf = b"[" + b",".join(self.element(i, 1500) for i in range(count)) + b"]"
+            best = float("inf")
+            for _ in range(5):
+                started = time.perf_counter()
+                textfmt.split_elements(buf)
+                best = min(best, time.perf_counter() - started)
+            return best
+
+        small, large = cost(50), cost(400)
+        assert large < small * 20, "eight times the elements cost more than eight times as much"
+
+    def test_a_map_is_decoded_once_per_element_and_not_twice(self) -> None:
+        """The two renderings each decode; neither may decode what the other already did."""
+        from agensgraph import numbers
+
+        buf = b"[" + b",".join(self.element(i, 8) for i in range(20)) + b"]"
+        calls = 0
+        real = numbers._decode
+
+        def counting(data: bytes) -> object:
+            nonlocal calls
+            calls += 1
+            return real(data)
+
+        numbers._decode = counting
+        try:
+            vertices = decode.vertices_from_text(buf)
+            assert calls == 0, "nothing is decoded until a map is read"
+            assert [v.properties["pad"] for v in vertices] == ["x" * 8] * 20
+            assert calls == 20
+            assert [v.properties["pad"] for v in vertices] == ["x" * 8] * 20
+            assert calls == 20, "a map read twice is decoded once"
+        finally:
+            numbers._decode = real
