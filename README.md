@@ -249,10 +249,23 @@ its text rendering, and the driver reads that — which is the default and needs
 from the server beyond the answer itself.
 
 The same query can be asked for in the composite rendering instead, per statement. That
-form leaves out the label name, so it needs a label table for the connection, and it is
-worth asking for where a result carries paths or element arrays: on those, measured over
-2,000 paths, it reads `nodes(p)` in 32 ms against 78 ms and `RETURN p` in 61 ms against
-97 ms. On whole vertices the two are within 2% of each other, so it buys nothing there.
+form leaves out the label name, so it needs a label table for the connection.
+
+It reads faster on every shape, and by how much depends on the shape, because it trades
+bandwidth for parsing — every element repeats its column oids, its lengths and a tuple id the
+text form never writes:
+
+| | text | composite | | on the wire |
+|---|---|---|---|---|
+| whole vertices, 4,096 rows | 14.6 ms | 12.8 ms | **1.14×** | 205 B → 242 B |
+| edges | 2.1 ms | 1.4 ms | **1.45×** | 23 B → 83 B |
+| paths | 11.7 ms | 9.0 ms | **1.30×** | 437 B → 639 B |
+| `nodes(p)` | 7.1 ms | 6.2 ms | **1.15×** | |
+
+So it is worth asking for on a result whose parsing dominates, and worth *not* asking for
+across a slow link where the extra bytes cost more than the parse saves. Embeddings are the
+clearest case for it — see below, where it is 7× — because a vector's text is decimal and its
+binary is the numbers themselves.
 
 Both renderings produce the same objects, and the test suite asserts that against values
 the server itself produced.

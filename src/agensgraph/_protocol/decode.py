@@ -8,6 +8,7 @@ agree, and a disagreement is a defect in one of them.
 
 from __future__ import annotations
 
+import struct
 from collections.abc import Callable
 
 from ..types import Edge, Path, Vertex
@@ -133,12 +134,56 @@ def edges_from_text(buf: bytes) -> list[Edge | None]:
     ]
 
 
+# A vertex is always (graphid, jsonb, tid) and an edge always (graphid, graphid, graphid,
+# jsonb, tid): the arity belongs to the type and not to the label. Read from the engine --
+# `Natts_ag_vertex` is 3 and `Natts_ag_edge` is 5, and `makeGraphVertexDatum` asserts the
+# descriptor has that many -- and confirmed against a label carrying three promoted columns,
+# whose vertex still arrives as three columns with oids 7002, 3802 and 27.
+#
+# So everything up to the property map is one fixed layout, read in a single unpack instead
+# of a loop that builds a tuple and a slice per column and then does it once more for the
+# tuple id it throws away.
+_VERTEX_HEAD = struct.Struct(">iiiQii")
+_EDGE_HEAD = struct.Struct(">iiiQiiQiiQii")
+_TID_COLUMN = 8 + 6
+"""What follows the property map: the tuple id's own header and its six bytes."""
+
+
+def _jsonb_at(buf: bytes, start: int, size: int) -> bytes:
+    """The JSON text of a jsonb payload known to begin at *start*."""
+    if size < 1 or start + size > len(buf):
+        raise ValueError("property map runs past the end of the value")
+    if buf[start] != 1:
+        raise ValueError(f"unsupported jsonb format version: {buf[start]}")
+    return buf[start + 1 : start + size]
+
+
 def vertex_from_binary(buf: bytes, resolve: LabelResolver) -> Vertex:
     """Build a vertex from its composite encoding.
 
     The columns are the graphid, the property map and the tuple id. The tuple id is
     present in this rendering and absent from the text one; nothing here needs it.
+
+    A value that is not the expected shape falls back to reading it a column at a time, so
+    a malformed one still raises rather than being read past.
     """
+    try:
+        ncols, id_oid, id_size, packed, prop_oid, prop_size = _VERTEX_HEAD.unpack_from(buf, 0)
+    except struct.error:
+        return _vertex_column_by_column(buf, resolve)
+    if (
+        ncols != 3
+        or id_oid != GRAPHID_OID
+        or id_size != 8
+        or prop_oid != composite.JSONB_OID
+        or len(buf) != _VERTEX_HEAD.size + prop_size + _TID_COLUMN
+    ):
+        return _vertex_column_by_column(buf, resolve)
+    gid = GraphId.from_packed(packed)
+    return Vertex(gid, resolve(gid.labid), _jsonb_at(buf, _VERTEX_HEAD.size, prop_size))
+
+
+def _vertex_column_by_column(buf: bytes, resolve: LabelResolver) -> Vertex:
     fields = composite.decode_record(buf)
     if len(fields) < 2:
         raise ValueError(f"a vertex needs at least 2 columns, got {len(fields)}")
@@ -153,6 +198,46 @@ def edge_from_binary(buf: bytes, resolve: LabelResolver) -> Edge:
     The columns are the graphid, the start and end graphids, the property map and the
     tuple id.
     """
+    try:
+        (
+            ncols,
+            id_oid,
+            id_size,
+            packed,
+            start_oid,
+            start_size,
+            start_packed,
+            end_oid,
+            end_size,
+            end_packed,
+            prop_oid,
+            prop_size,
+        ) = _EDGE_HEAD.unpack_from(buf, 0)
+    except struct.error:
+        return _edge_column_by_column(buf, resolve)
+    if (
+        ncols != 5
+        or id_oid != GRAPHID_OID
+        or start_oid != GRAPHID_OID
+        or end_oid != GRAPHID_OID
+        or id_size != 8
+        or start_size != 8
+        or end_size != 8
+        or prop_oid != composite.JSONB_OID
+        or len(buf) != _EDGE_HEAD.size + prop_size + _TID_COLUMN
+    ):
+        return _edge_column_by_column(buf, resolve)
+    gid = GraphId.from_packed(packed)
+    return Edge(
+        gid,
+        resolve(gid.labid),
+        GraphId.from_packed(start_packed),
+        GraphId.from_packed(end_packed),
+        _jsonb_at(buf, _EDGE_HEAD.size, prop_size),
+    )
+
+
+def _edge_column_by_column(buf: bytes, resolve: LabelResolver) -> Edge:
     fields = composite.decode_record(buf)
     if len(fields) < 4:
         raise ValueError(f"an edge needs at least 4 columns, got {len(fields)}")

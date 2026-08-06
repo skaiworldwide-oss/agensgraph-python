@@ -127,3 +127,53 @@ class TestValues:
         buf = wire.record([(7002, wire.graphid(5, 1)), (25, b"text not jsonb")])
         with pytest.raises(ValueError):
             decode.vertex_from_binary(buf, resolve)
+
+
+class TestTheFixedPrefix:
+    """A vertex is always three columns and an edge always five, so the part before the
+    property map is one layout read in one unpack rather than a loop.
+
+    The arity belongs to the type, not to the label: ``Natts_ag_vertex`` is 3 and
+    ``Natts_ag_edge`` is 5 in the engine's own headers, and a label carrying three promoted
+    generated columns still arrives as three columns with oids 7002, 3802 and 27.
+    """
+
+    def test_a_record_of_another_shape_is_still_read(self):
+        """A value that is not the expected layout is read a column at a time instead."""
+        buf = wire.record([(7002, wire.graphid(5, 1)), (3802, wire.jsonb(b'{"n": 1}'))])
+        v = decode.vertex_from_binary(buf, resolve)
+        assert v.id.locid == 1
+        assert v.properties == {"n": 1}
+
+    def test_a_wrong_oid_in_the_identity_column_is_refused(self):
+        buf = wire.record(
+            [(23, b"\x00" * 8), (3802, wire.jsonb(b"{}")), (27, b"\x00" * 6)]
+        )
+        with pytest.raises(ValueError):
+            decode.vertex_from_binary(buf, resolve)
+
+    def test_a_truncated_property_map_is_refused(self):
+        good = wire.record(
+            [(7002, wire.graphid(5, 1)), (3802, wire.jsonb(b'{"n": 1}')), (27, b"\x00" * 6)]
+        )
+        with pytest.raises(ValueError):
+            decode.vertex_from_binary(good[:-4], resolve)
+
+    def test_a_bad_jsonb_version_is_refused(self):
+        buf = wire.record(
+            [(7002, wire.graphid(5, 1)), (3802, b"\x09{}"), (27, b"\x00" * 6)]
+        )
+        with pytest.raises(ValueError, match="version"):
+            decode.vertex_from_binary(buf, resolve)
+
+    def test_an_edge_of_another_shape_is_still_read(self):
+        buf = wire.record(
+            [
+                (7002, wire.graphid(6, 1)),
+                (7002, wire.graphid(5, 1)),
+                (7002, wire.graphid(5, 2)),
+                (3802, wire.jsonb(b"{}")),
+            ]
+        )
+        e = decode.edge_from_binary(buf, resolve)
+        assert (e.start.locid, e.end.locid) == (1, 2)

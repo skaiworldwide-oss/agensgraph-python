@@ -21,6 +21,7 @@ from .graphid import GraphId
 from .graphid import unpack as _unpack_graphid
 
 __all__ = [
+    "GRAPHID_OID",
     "JSONB_OID",
     "TID_OID",
     "Field",
@@ -29,6 +30,7 @@ __all__ = [
     "decode_record",
 ]
 
+GRAPHID_OID = 7002
 JSONB_OID = 3802
 TID_OID = 27
 
@@ -130,7 +132,13 @@ def decode_array(buf: bytes) -> tuple[int, list[bytes | None]]:
 
 
 def graphid_of(field: Field) -> GraphId:
-    """Read a graphid column, rejecting a null."""
+    """Read a graphid column, rejecting a null and a column that is not one.
+
+    The oid is checked because eight bytes of anything unpack into a plausible identity: a
+    ``bigint`` where an identity belongs would otherwise be read as one rather than refused.
+    """
+    if field.oid != GRAPHID_OID:
+        raise ValueError(f"expected a graphid column, got oid {field.oid}")
     if field.data is None:
         raise ValueError("graphid column is null")
     return _unpack_graphid(field.data)
