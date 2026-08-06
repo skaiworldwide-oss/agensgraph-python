@@ -181,7 +181,12 @@ class TestPath:
 
     def test_reaching_one_element_does_not_walk_the_path(self):
         """Indexing was rebuilding the interleaved tuple each time, so a walk by index was
-        quadratic. The cost of one lookup must not grow with the length of the path."""
+        quadratic. The cost of one lookup must not grow with the length of the path.
+
+        The short path is long enough that its per-lookup cost is a measurement rather than
+        loop overhead, and the ceiling is half what a quadratic walk would give, so the
+        assertion has room to be noisy without being wrong.
+        """
         import time
 
         def walk(hops):
@@ -190,14 +195,15 @@ class TestPath:
                 tuple(e(locid=i) for i in range(hops)),
             )
             best = float("inf")
-            for _ in range(3):
+            for _ in range(7):
                 started = time.perf_counter()
                 for i in range(len(path)):
                     path[i]
                 best = min(best, time.perf_counter() - started)
             return best / len(path)
 
-        assert walk(1600) < walk(100) * 4, "the cost of one lookup grows with the path"
+        short, long = walk(400), walk(3200)
+        assert long < short * 4, f"one lookup costs {long / short:.1f} times as much on a path"
 
     def test_mismatched_counts_are_rejected(self):
         with pytest.raises(ValueError):
