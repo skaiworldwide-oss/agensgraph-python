@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
 __all__ = [
+    "SHARED_ALLOWANCE",
     "Attempt",
     "RetryPolicy",
     "TokenBucket",
@@ -124,6 +125,16 @@ class TokenBucket:
         return f"TokenBucket({self.tokens():.0f}/{self._capacity})"
 
 
+SHARED_ALLOWANCE = TokenBucket()
+"""The allowance every policy draws on unless it is given one of its own.
+
+One per process, because the multiplication it exists to bound happens *between* layers: four
+of them each willing to try three times is sixty-four attempts from one action, and four
+separate allowances would each say yes to their own three.
+"""
+
+
+
 class Attempt:
     """What was decided about one failure, and why.
 
@@ -173,10 +184,17 @@ class RetryPolicy:
     ) -> None:
         if attempts < 1:
             raise ValueError(f"there is always a first attempt, got {attempts}")
+        if base <= 0:
+            raise ValueError(f"a delay has to grow from something, got {base}")
+        if cap < base:
+            raise ValueError(f"a cap below the base is not a cap, got {cap} under {base}")
         self._attempts = attempts
         self._base = base
         self._cap = cap
-        self._bucket = bucket if bucket is not None else TokenBucket()
+        # The allowance is shared by every policy that does not ask for its own, which is what
+        # makes it a budget: four layers each holding their own would multiply the retries the
+        # budget exists to bound.
+        self._bucket = bucket if bucket is not None else SHARED_ALLOWANCE
         self._rng = rng
 
     @property
@@ -204,6 +222,8 @@ class RetryPolicy:
         ``remaining`` is what is left of the caller's budget; a wait that would not leave time
         for another attempt is not worth taking.
         """
+        if number < 1:
+            raise ValueError(f"an attempt is numbered from one, got {number}")
         recovery = retryability(exc, wrote=wrote)
         delay = 0.0
 
@@ -268,9 +288,12 @@ class RetryPolicy:
 
         The number of attempts goes into the message as well as onto the exception, because a
         report saying a statement failed and one saying it failed every time it was tried lead
-        to different places.
+        to different places. This is the one place that can say so, being the one that knows
+        no further attempt will be made.
         """
-        attach_retry_history(exc, attempts=attempts, previous_errors=previous)
+        attach_retry_history(
+            exc, attempts=attempts, previous_errors=previous, exhausted=True
+        )
         return exc
 
     def __repr__(self) -> str:

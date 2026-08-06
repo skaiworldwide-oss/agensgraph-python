@@ -243,10 +243,23 @@ class TestAttachments:
         assert exc.attempts == 3
         assert exc.previous_errors == tuple(earlier)
 
-    def test_the_message_says_how_many_attempts_there_were(self) -> None:
+    def test_the_message_says_so_only_when_the_limit_was_reached(self) -> None:
+        """A failure that stopped for another reason used some of its attempts, not all of
+        them, and saying it reached the maximum answers the wrong question about why."""
+        exhausted = error_for("40001")
+        E.attach_retry_history(exhausted, attempts=4, exhausted=True)
+        assert "reached max retries: 4" in str(exhausted)
+
+        stopped = error_for("40001")
+        E.attach_retry_history(stopped, attempts=2)
+        assert "reached max retries" not in str(stopped)
+        assert stopped.attempts == 2
+
+    def test_recording_it_twice_does_not_say_it_twice(self) -> None:
         exc = error_for("40001")
-        E.attach_retry_history(exc, attempts=4)
-        assert "reached max retries: 4" in str(exc)
+        E.attach_retry_history(exc, attempts=4, exhausted=True)
+        E.attach_retry_history(exc, attempts=4, exhausted=True)
+        assert str(exc).count("reached max retries") == 1
 
     def test_a_single_attempt_leaves_the_message_alone(self) -> None:
         exc = error_for("40001")

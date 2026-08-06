@@ -121,7 +121,9 @@ class TestTokenBucket:
 class TestDeciding:
     @pytest.fixture
     def policy(self) -> RetryPolicy:
-        return RetryPolicy(attempts=3, rng=random.Random(5))
+        """Its own allowance: the shipped default is shared by the whole process, so one
+        test's failures would otherwise stop another's retries."""
+        return RetryPolicy(attempts=3, bucket=TokenBucket(), rng=random.Random(5))
 
     def test_a_conflict_is_retried(self, policy: RetryPolicy) -> None:
         decision = policy.decide(failure(CONFLICT), number=1)
@@ -225,7 +227,7 @@ class TestDeciding:
 
 class TestGivingUp:
     def test_the_failure_carries_what_happened(self) -> None:
-        policy = RetryPolicy()
+        policy = RetryPolicy(bucket=TokenBucket())
         earlier = [failure(CONFLICT), failure(CONFLICT)]
         last = failure(CONFLICT)
         raised = policy.exhausted(last, attempts=3, previous=earlier)
@@ -243,7 +245,7 @@ class TestGivingUp:
 
 def test_a_decision_reads_clearly() -> None:
     """It goes into logs, so it has to say what was decided and why in one line."""
-    policy = RetryPolicy(rng=random.Random(11))
+    policy = RetryPolicy(bucket=TokenBucket(), rng=random.Random(11))
     assert "retry in" in repr(policy.decide(failure(CONFLICT), number=1))
     assert "give up" in repr(policy.decide(failure(SYNTAX), number=1))
     assert "RetryPolicy(attempts=3" in repr(policy)

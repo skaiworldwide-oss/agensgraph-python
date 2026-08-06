@@ -62,6 +62,8 @@ from psycopg.errors import (
     Warning as Warning,
 )
 
+from .deadline import Expired as _Expired
+
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
@@ -455,6 +457,11 @@ def from_os_error(exc: OSError, *, what: str) -> NetworkError:
 # meaningless; waiting for the pool is worth doing later rather than sooner; and a pool that
 # has been closed will never hand anything over however long anyone waits.
 _OURS: tuple[tuple[type[BaseException], Retryability], ...] = (
+    # Named before the fall-through that reads any TimeoutError as an unknown outcome. This one
+    # is the driver declining to send rather than a reply that never came, so nothing is
+    # unknown: nothing was done. Whether there is budget left for another attempt is the
+    # caller's loop to answer and not this.
+    (_Expired, Retryability.SAFE),
     (NetworkTimeout, Retryability.UNKNOWN),
     (NetworkError, Retryability.RECONNECT),
     (StaleLabelCache, Retryability.RESET_STATE),
@@ -567,20 +574,29 @@ def attach_query(exc: BaseException, *, statement: str | None, params: object = 
 
 
 def attach_retry_history(
-    exc: BaseException, *, attempts: int, previous_errors: Sequence[BaseException] = ()
+    exc: BaseException,
+    *,
+    attempts: int,
+    previous_errors: Sequence[BaseException] = (),
+    exhausted: bool = False,
 ) -> None:
     """Record how many attempts a failure survived, and what the earlier ones were.
 
     Typed attributes rather than notes, because this is data a caller reads and matches
-    on rather than advice for a person. The count also goes into the message, which is
-    the difference between a report saying a statement failed and one saying it failed
-    every time it was tried.
+    on rather than advice for a person.
+
+    *exhausted* says the limit was reached, and only then does the message say so -- a failure
+    that stopped for any other reason used some of its attempts rather than all of them, and
+    saying it reached the maximum is a wrong answer about why it gave up. Nor does a limit of
+    one say it: a statement tried once and not retried simply failed.
+
+    Applying this twice records the second reading and does not say the same thing twice.
     """
     exc.attempts = attempts  # type: ignore[attr-defined]
     exc.previous_errors = tuple(previous_errors)  # type: ignore[attr-defined]
-    if attempts > 1 and exc.args:
-        first = f"{exc.args[0]} (reached max retries: {attempts})"
-        exc.args = (first, *exc.args[1:])
+    if exhausted and attempts > 1 and exc.args and not getattr(exc, "_agens_retry_noted", False):
+        exc._agens_retry_noted = True  # type: ignore[attr-defined]
+        exc.args = (f"{exc.args[0]} (reached max retries: {attempts})", *exc.args[1:])
 
 
 def mask_dsn(dsn: str | None) -> str:

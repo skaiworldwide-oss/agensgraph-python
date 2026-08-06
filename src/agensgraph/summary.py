@@ -189,7 +189,12 @@ class CommitOutcome(enum.Enum):
 
     @property
     def safe_to_retry(self) -> bool:
-        """Whether running the transaction again would apply anything twice."""
+        """Whether the transaction can be run again without applying anything twice.
+
+        True for one outcome only. A transaction known to have aborted left nothing behind, so
+        running it again applies it once. Every other answer -- committed, still running, or no
+        longer on record -- either applied it already or has not said.
+        """
         return self is CommitOutcome.ABORTED
 
 
