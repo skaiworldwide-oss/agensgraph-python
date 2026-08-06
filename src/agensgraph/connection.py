@@ -128,6 +128,11 @@ class Cursor(psycopg.Cursor[Row]):
         except psycopg.Error as exc:
             conn._report_query(text, timer, rows=0, error=redact_details(exc))
             raise
+        except BaseException as exc:
+            if not isinstance(exc, Exception):
+                conn._agens_cancelled = True
+                conn._report_query(text, timer, rows=0, error=exc)
+            raise
         conn._report_query(text, timer, rows=self.rowcount, error=None)
         self._watch_graph_path(text)
         return self
@@ -143,6 +148,11 @@ class Cursor(psycopg.Cursor[Row]):
             super().executemany(query, params_seq, returning=returning)
         except psycopg.Error as exc:
             conn._report_query(text, timer, rows=0, error=redact_details(exc))
+            raise
+        except BaseException as exc:
+            if not isinstance(exc, Exception):
+                conn._agens_cancelled = True
+                conn._report_query(text, timer, rows=0, error=exc)
             raise
         conn._report_query(text, timer, rows=self.rowcount, error=None)
         self._watch_graph_path(text)

@@ -49,7 +49,7 @@ from psycopg_pool import errors as _pool_errors
 
 from .connection_async import AsyncConnection
 from .deadline import Deadline
-from .errors import StaleGeneration
+from .errors import InterruptedConnection, StaleGeneration
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Awaitable, Callable
@@ -127,6 +127,7 @@ class AsyncConnectionPool:
         self._counters = threading.Lock()
         self._statement_timeout_gap = statement_timeout_gap
         self._retired = 0
+        self._interrupted = 0
         self._pool: psycopg_pool.AsyncConnectionPool[AsyncConnection[Any]] = (
             self._pool_class(
                 conninfo,
@@ -260,6 +261,10 @@ class AsyncConnectionPool:
         That is the whole of the generation mechanism -- nothing has to reach into the pool's
         own bookkeeping to retire a set of connections.
         """
+        if conn._agens_cancelled:
+            with self._counters:
+                self._interrupted += 1
+            raise InterruptedConnection.for_reuse()
         if conn._agens_generation != self._generation:
             with self._counters:
                 self._retired += 1
@@ -386,6 +391,11 @@ class AsyncConnectionPool:
         """How many connections have been closed for belonging to an older generation."""
         return self._retired
 
+    @property
+    def interrupted(self) -> int:
+        """How many connections have been closed for having had a statement interrupted."""
+        return self._interrupted
+
     # -- what psycopg already offers, passed through ------------------------------------
 
     async def check(self) -> None:
@@ -415,6 +425,7 @@ class AsyncConnectionPool:
         stats = dict(self._pool.get_stats())
         stats["generation"] = self._generation
         stats["connections_retired"] = self._retired
+        stats["connections_interrupted"] = self._interrupted
         return stats
 
     def pop_stats(self) -> dict[str, int]:
@@ -422,6 +433,7 @@ class AsyncConnectionPool:
         stats = dict(self._pool.pop_stats())
         stats["generation"] = self._generation
         stats["connections_retired"] = self._retired
+        stats["connections_interrupted"] = self._interrupted
         return stats
 
     @property

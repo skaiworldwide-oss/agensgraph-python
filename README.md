@@ -298,7 +298,18 @@ one event rather than one failure per connection. `configure` runs once per new 
 to the second. And a `Deadline` threaded through covers both the wait for a connection and the
 statement that runs on it, reaching the server as `statement_timeout`.
 
-`get_stats()` returns psycopg's sixteen counters plus `generation` and `connections_retired`.
+`get_stats()` returns psycopg's sixteen counters plus `generation`, `connections_retired` and
+`connections_interrupted`.
+
+A connection whose statement was **interrupted** — cancelled, or a keyboard interrupt — is closed
+rather than lent to somebody else. psycopg does try to leave it clean: it asks the server to cancel
+and then reads back whatever is still coming, and when that finishes the connection really is idle
+and really is reusable. What it cannot promise is that it finished — the read it re-enters is
+bounded by nothing, and because an `asyncio.timeout` works *by* cancelling, no timeout on that
+connection can fire either. So such a connection is replaced, which costs one connection on an
+event that is rare by definition. A statement that merely *failed* keeps its connection: a value
+this driver refused to send never reached the socket, and a server's own refusal leaves the
+connection idle and answering.
 
 `drain()` is the other half of `invalidate()` and does a different job. It closes every connection
 and opens the same number again, for a change a connection carries from the moment it is made — a

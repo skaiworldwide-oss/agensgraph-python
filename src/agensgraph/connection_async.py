@@ -134,6 +134,17 @@ class AsyncCursor(psycopg.AsyncCursor[Row]):
         except psycopg.Error as exc:
             conn._report_query(text, timer, rows=0, error=redact_details(exc))
             raise
+        except BaseException as exc:
+            # An interruption, and only an interruption: cancellation, a keyboard interrupt,
+            # an interpreter shutting down. The statement did not finish and what the
+            # connection holds is whatever psycopg managed to read back, so it is marked here
+            # rather than guessed at afterwards, when it looks like any other idle connection.
+            # An ordinary exception is left alone -- a value this driver refuses to send never
+            # reached the socket, and the connection is untouched by it.
+            if not isinstance(exc, Exception):
+                conn._agens_cancelled = True
+                conn._report_query(text, timer, rows=0, error=exc)
+            raise
         conn._report_query(text, timer, rows=self.rowcount, error=None)
         self._watch_graph_path(text)
         return self
@@ -149,6 +160,11 @@ class AsyncCursor(psycopg.AsyncCursor[Row]):
             await super().executemany(query, params_seq, returning=returning)
         except psycopg.Error as exc:
             conn._report_query(text, timer, rows=0, error=redact_details(exc))
+            raise
+        except BaseException as exc:
+            if not isinstance(exc, Exception):
+                conn._agens_cancelled = True
+                conn._report_query(text, timer, rows=0, error=exc)
             raise
         conn._report_query(text, timer, rows=self.rowcount, error=None)
         self._watch_graph_path(text)

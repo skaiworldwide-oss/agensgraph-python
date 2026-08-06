@@ -170,6 +170,19 @@ class GraphMixin:
     _agens_statement_timeout: bool = False
     """Whether a statement timeout was set on this connection for the caller now holding it."""
 
+    _agens_cancelled: bool = False
+    """Whether a statement on this connection was interrupted rather than finished.
+
+    A pool closes such a connection instead of lending it again. psycopg does try to leave one
+    clean -- it asks the server to cancel and then reads what is still coming -- and when that
+    finishes the connection really is idle and really is reusable. What it cannot promise is
+    that it finished: the read it re-enters is bounded by nothing
+    (``psycopg/connection_async.py:526``), so on a connection whose packets stopped arriving it
+    is still there. A connection that has been through that is cheaper to replace than to
+    reason about, and a cancellation is rare enough that replacing it costs nothing anybody
+    will see.
+    """
+
     def _check_lent(self) -> None:
         """Refuse a connection its holder has already given back.
 

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 
+import psycopg
 import pytest
 import pytest_asyncio
 
@@ -194,3 +195,89 @@ class TestWhatIsLeftBehind:
                 await asyncio.sleep(0.01)
             else:
                 pytest.fail("the server was left running the statement")
+
+
+class TestAConnectionThatSawACancel:
+    """It is closed rather than lent to somebody else.
+
+    psycopg does try to leave it clean: it asks the server to cancel and then reads what is
+    still coming, and when that finishes the connection really is idle and really is reusable
+    -- measured, the next caller got the right answer. What it cannot promise is that it
+    finished. The read it re-enters is bounded by nothing, so on a connection whose packets
+    stopped arriving it is still in there, and because an asyncio timeout works *by*
+    cancelling, no timeout on that connection can fire either. That is psycopg's to bound and
+    not this driver's to fix; what this driver can do is not hand such a connection to the next
+    caller, which costs one connection on an event that is rare by definition.
+    """
+
+    async def backend_pid(self, pool) -> int:  # type: ignore[no-untyped-def]
+        async with pool.connection() as conn:
+            result = await conn.execute_query("select pg_backend_pid()")
+            return int(result.records[0][0])
+
+    @pytest.mark.asyncio
+    async def test_the_next_caller_gets_a_different_backend(self, dsn: str) -> None:
+        pool = agensgraph.AsyncConnectionPool(dsn, min_size=1, max_size=1)
+        await pool.open(wait=True)
+        try:
+            before = await self.backend_pid(pool)
+
+            async def slow() -> None:
+                async with pool.connection() as conn:
+                    await conn.execute_query("select pg_sleep(5)")
+
+            task = asyncio.create_task(slow())
+            await asyncio.sleep(0.3)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            await asyncio.sleep(0.5)
+            after = await self.backend_pid(pool)
+            assert before != after
+            assert pool.interrupted == 1
+            assert pool.get_stats()["connections_interrupted"] == 1
+        finally:
+            await pool.close()
+
+    @pytest.mark.asyncio
+    async def test_the_pool_still_serves(self, dsn: str) -> None:
+        pool = agensgraph.AsyncConnectionPool(dsn, min_size=1, max_size=1)
+        await pool.open(wait=True)
+        try:
+
+            async def slow() -> None:
+                async with pool.connection() as conn:
+                    await conn.execute_query("select pg_sleep(5)")
+
+            task = asyncio.create_task(slow())
+            await asyncio.sleep(0.3)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            await asyncio.sleep(0.5)
+            result = await pool.execute_query("return 42")
+            assert result.records == [(42,)]
+        finally:
+            await pool.close()
+
+    @pytest.mark.asyncio
+    async def test_a_statement_that_merely_failed_keeps_its_connection(self, dsn: str) -> None:
+        """The mark is for an interruption and not for any failure: a refused value never
+        reached the socket, and a server's own refusal left the connection idle and answered."""
+        pool = agensgraph.AsyncConnectionPool(dsn, min_size=1, max_size=1)
+        await pool.open(wait=True)
+        try:
+            before = await self.backend_pid(pool)
+            with pytest.raises(ValueError):
+                async with pool.connection() as conn:
+                    await conn.execute_query("select %s", ({"x": float("nan")},))
+            await asyncio.sleep(0.2)
+            assert await self.backend_pid(pool) == before
+            with pytest.raises(psycopg.errors.UndefinedFunction):
+                async with pool.connection() as conn:
+                    await conn.execute_query("select nosuchfunction()")
+            await asyncio.sleep(0.2)
+            assert await self.backend_pid(pool) == before
+            assert pool.interrupted == 0
+        finally:
+            await pool.close()

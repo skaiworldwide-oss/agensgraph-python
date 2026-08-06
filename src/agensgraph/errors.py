@@ -629,6 +629,23 @@ def redact_details(exc: BaseException) -> BaseException:
     return exc
 
 
+class InterruptedConnection(_pg.OperationalError):
+    """A connection whose statement was interrupted, being closed rather than lent again.
+
+    Raised in a pool's own reset hook, which is how a pool discards a connection: psycopg
+    closes one whose reset fails. A caller never sees it -- by the time it is raised the
+    caller has finished with the connection -- so it names what happened for a log rather
+    than for an ``except``.
+    """
+
+    @classmethod
+    def for_reuse(cls) -> InterruptedConnection:
+        return cls(
+            "a statement on this connection was interrupted rather than finished, so it is "
+            "closed instead of being lent to somebody else"
+        )
+
+
 def mask_dsn(dsn: str | None) -> str:
     """A connection string safe to write down.
 
