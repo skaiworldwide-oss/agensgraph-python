@@ -108,14 +108,20 @@ no Cypher expression produces one.
 
 
 def _decode_bytes(data: Buffer) -> bytes:
-    """Take a payload as ``bytes``, copying only when psycopg hands over a view.
+    """Take a payload as ``bytes``, which means copying it.
 
-    Slicing a ``memoryview`` is cheap and searching one is not -- the generic
-    implementation allocates an object per byte compared -- and everything downstream
-    searches. psycopg gives ``bytes`` in the ordinary case, so this usually costs a type
-    check.
+    Slicing a ``memoryview`` is cheap and searching one is not -- the generic implementation
+    allocates an object per byte compared -- and everything downstream searches. The payload
+    also has to outlive the result, since a property map is held as the bytes it arrived as
+    and read later.
+
+    It is not an exceptional case. This driver depends on psycopg's C extension, and that hands
+    over a ``memoryview`` for every value in both renderings -- counted, a hundred out of a
+    hundred each way. So the exact type is asked for first and ``tobytes`` is called on it, which
+    knows it is copying a view: 108 nanoseconds against 188 for reaching ``bytes()`` through an
+    ``isinstance``.
     """
-    return data if isinstance(data, bytes) else bytes(data)
+    return data.tobytes() if type(data) is memoryview else bytes(data)
 
 
 class GraphIdLoader(Loader):

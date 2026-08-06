@@ -6,7 +6,7 @@ import pytest
 
 from agensgraph._protocol import decode, textfmt
 
-from .corpus import EDGES, ELEMENT_ARRAYS, PATHS, REJECTED_VERTICES, VERTICES
+from .corpus import EDGES, PATHS, REJECTED_VERTICES, VERTICES
 
 
 @pytest.mark.parametrize("buf,label,labid,locid,props", VERTICES)
@@ -52,18 +52,19 @@ def test_single_vertex_path_is_truthy():
     assert p.length == 0
 
 
-@pytest.mark.parametrize("buf,count", ELEMENT_ARRAYS)
-def test_element_array(buf, count):
-    got = decode.elements_from_text(buf)
-    assert len(got) == count
-
-
 def test_null_elements_map_to_none():
     """An element array may hold nulls, and the server writes them as a bare word."""
-    assert decode.elements_from_text(b"[NULL,NULL,NULL]") == [None, None, None]
-    got = decode.elements_from_text(b"[v[5.1]{},NULL]")
+    assert decode.vertices_from_text(b"[NULL,NULL,NULL]") == [None, None, None]
+    got = decode.vertices_from_text(b"[v[5.1]{},NULL]")
     assert got[0] is not None
     assert got[1] is None
+
+
+def test_a_list_cannot_mix_a_vertex_and_an_edge():
+    """Which is why nothing here classifies an array element by its shape: the server has an
+    array type for vertices and one for edges and no type for both, and refuses to build one --
+    ``graph object cannot be list element``."""
+    assert not hasattr(decode, "elements_from_text")
 
 
 def test_null_inside_a_path_is_rejected():

@@ -23,7 +23,6 @@ __all__ = [
     "edge_from_text",
     "edges_from_binary",
     "edges_from_text",
-    "elements_from_text",
     "path_from_binary",
     "path_from_text",
     "vertex_from_binary",
@@ -132,31 +131,6 @@ def edges_from_text(buf: bytes) -> list[Edge | None]:
         None if part == textfmt.NULL_ELEMENT else edge_from_text(part)
         for part in textfmt.split_elements(buf)
     ]
-
-
-def elements_from_text(buf: bytes) -> list[Vertex | Edge | None]:
-    """Build an array of either kind, classifying each element by its own shape.
-
-    For an array whose type is known, prefer :func:`vertices_from_text` or
-    :func:`edges_from_text`, which do not have to try one shape and then the other.
-    """
-    out: list[Vertex | Edge | None] = []
-    for part in textfmt.split_elements(buf):
-        if part == textfmt.NULL_ELEMENT:
-            out.append(None)
-        elif _looks_like_edge(part):
-            out.append(edge_from_text(part))
-        else:
-            out.append(vertex_from_text(part))
-    return out
-
-
-def _looks_like_edge(part: bytes) -> bool:
-    try:
-        textfmt.parse_edge(part)
-    except ValueError:
-        return False
-    return True
 
 
 def vertex_from_binary(buf: bytes, resolve: LabelResolver) -> Vertex:
