@@ -262,3 +262,43 @@ class TestTheAwaitingInterface:
         await aconn.refresh_labels()
         result = await aconn.execute_query("match (n:later) return n", binary_=True)
         assert result.records[0][0].label == "later"
+
+
+class TestKeepaliveDefaults:
+    """The connection string is as likely a place to set one as the arguments are, and psycopg
+    lays the arguments over it -- so a default filled in blindly reverses what the string said."""
+
+    def test_nothing_said_gets_the_defaults(self) -> None:
+        from agensgraph._core import KEEPALIVE_DEFAULTS, with_keepalives
+
+        assert with_keepalives({}, "host=h") == KEEPALIVE_DEFAULTS
+
+    def test_turning_them_off_in_the_connection_string_is_respected(self) -> None:
+        import psycopg
+
+        from agensgraph._core import with_keepalives
+
+        dsn = "host=h keepalives=0"
+        merged = psycopg.conninfo.conninfo_to_dict(dsn, **with_keepalives({}, dsn))
+        assert merged["keepalives"] == "0"
+        assert "keepalives_idle" not in merged
+
+    def test_turning_them_off_in_the_arguments_is_respected(self) -> None:
+        from agensgraph._core import with_keepalives
+
+        assert with_keepalives({"keepalives": 0}, "host=h") == {"keepalives": 0}
+
+    def test_one_setting_in_the_string_is_not_displaced(self) -> None:
+        import psycopg
+
+        from agensgraph._core import with_keepalives
+
+        dsn = "host=h keepalives_idle=99"
+        merged = psycopg.conninfo.conninfo_to_dict(dsn, **with_keepalives({}, dsn))
+        assert merged["keepalives_idle"] == "99"
+        assert merged["keepalives"] == 1
+
+    def test_a_url_connection_string_is_read_too(self) -> None:
+        from agensgraph._core import with_keepalives
+
+        assert with_keepalives({}, "postgresql://h/db?keepalives=0") == {}

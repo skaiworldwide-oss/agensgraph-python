@@ -164,7 +164,7 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
         Keepalive is asked for unless the caller decided otherwise; see
         :data:`~agensgraph._core.KEEPALIVE_DEFAULTS` for what that is worth.
         """
-        conn = await super().connect(conninfo, **with_keepalives(kwargs))
+        conn = await super().connect(conninfo, **with_keepalives(kwargs, conninfo))
         try:
             _ = conn.capabilities
         except BaseException:

@@ -15,6 +15,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, NamedTuple, Union
 
 from psycopg.adapt import AdaptersMap
+from psycopg.conninfo import conninfo_to_dict as _conninfo_to_dict
 
 from ._protocol.labels import LabelCache
 from .adapters import graph_adapters, register_binary
@@ -90,7 +91,7 @@ connection that is busy sending, where too small a value would end a healthy one
 """
 
 
-def with_keepalives(kwargs: dict[str, Any]) -> dict[str, Any]:
+def with_keepalives(kwargs: dict[str, Any], conninfo: str = "") -> dict[str, Any]:
     """The connection arguments, with any keepalive setting the caller left out filled in.
 
     Filled in one key at a time rather than all or nothing, because the settings do nothing useful
@@ -100,14 +101,21 @@ def with_keepalives(kwargs: dict[str, Any]) -> dict[str, Any]:
 
     ``keepalives=0`` is the one thing that turns the rest off, since it says so.
 
+    The connection string is read as well as the arguments, because a setting is as likely to be
+    written there and psycopg lays the arguments over it. A default filled in as an argument would
+    otherwise displace what the string asked for, which is the opposite of leaving a caller's
+    decision alone.
+
     ``tcp_user_timeout`` does **not** count as having decided. It bounds how long transmitted data may
     go unacknowledged, and a connection waiting for a reply has transmitted nothing -- so a caller who
     sets only that has asked for something that does not bound a hung read, and keepalive is still
     filled in for them.
     """
-    if str(kwargs.get("keepalives", 1)) == "0":
+    named = dict(_conninfo_to_dict(conninfo)) if conninfo else {}
+    named.update(kwargs)
+    if str(named.get("keepalives", 1)) == "0":
         return kwargs
-    return {**KEEPALIVE_DEFAULTS, **kwargs}
+    return {**{k: v for k, v in KEEPALIVE_DEFAULTS.items() if k not in named}, **kwargs}
 
 
 class GraphMixin:
