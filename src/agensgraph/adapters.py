@@ -52,8 +52,9 @@ says so.
 
 from __future__ import annotations
 
+import struct
 from collections.abc import Mapping
-from math import inf as _INFINITY
+from math import isfinite as _isfinite
 from typing import TYPE_CHECKING, Any
 
 import msgspec
@@ -211,7 +212,7 @@ _encode_json = msgspec.json.Encoder().encode
 def _has_non_finite(obj: Any) -> bool:
     """Whether a value holds a float that jsonb has no way to store."""
     if isinstance(obj, float):
-        return obj != obj or obj in (_INFINITY, -_INFINITY)
+        return not _isfinite(obj)
     if isinstance(obj, Mapping):
         return any(_has_non_finite(value) for value in obj.values())
     if isinstance(obj, list | tuple | set | frozenset):
@@ -255,6 +256,53 @@ class UnspecifiedDumper(Dumper):
 
     def dump(self, obj: str) -> bytes:
         return obj.encode()
+
+
+_pack_float8 = struct.Struct("!d").pack
+
+_NON_FINITE = (
+    "a value here cannot be NaN or an infinity: it reaches the server as a float8, and "
+    "converting one to jsonb stores the text {0!r} rather than a number. Store the string "
+    "yourself if that is what you meant, or leave the property out"
+)
+
+
+def _refuse_non_finite(obj: float) -> None:
+    """Refuse a float jsonb has no way to hold.
+
+    Every Cypher expression is jsonb, and jsonb has no NaN and no infinity, so one sent as a
+    float8 arrives as a *string* of its name. Refused for the same reason a property map
+    holding one is refused: what comes back is not what was sent.
+    """
+    if not _isfinite(obj):
+        raise ValueError(_NON_FINITE.format(str(obj)))
+
+
+class FloatDumper(Dumper):
+    """Write a float, refusing what jsonb cannot hold.
+
+    Written out rather than derived from psycopg's, which exists to render the three values
+    refused here. What is left is what ``repr`` produces, which is what psycopg writes for
+    every finite float.
+    """
+
+    format = pq.Format.TEXT
+    oid = postgres.types["float8"].oid
+
+    def dump(self, obj: float) -> bytes:
+        _refuse_non_finite(obj)
+        return repr(obj).encode()
+
+
+class FloatBinaryDumper(Dumper):
+    """The same, as the eight bytes ``float8send`` writes."""
+
+    format = pq.Format.BINARY
+    oid = postgres.types["float8"].oid
+
+    def dump(self, obj: float) -> bytes:
+        _refuse_non_finite(obj)
+        return _pack_float8(obj)
 
 
 class GraphIdDumper(Dumper):
@@ -310,6 +358,8 @@ def register_text(context: AdaptContext | AdaptersMap) -> None:
     # StrDumper is that it is for "where the unknown oid is ambiguous and the text oid is
     # required". The last dumper registered is the one an ordinary placeholder uses, so this
     # displaces the unspecified-oid default without touching psycopg's global map.
+    adapters.register_dumper(float, FloatDumper)
+    adapters.register_dumper(float, FloatBinaryDumper)
     adapters.register_dumper(str, StrDumper)
     adapters.register_dumper(str, StrBinaryDumper)
     adapters.register_dumper(Unspecified, UnspecifiedDumper)

@@ -309,3 +309,40 @@ class TestRegistration:
         adapters = graph_adapters()
         register_text(adapters)
         assert load(adapters, OIDS["graphid"], b"3.1", TEXT) == GraphId(3, 1)
+
+
+class TestAFloatJsonbCannotHold:
+    """A map holding one was already refused; a bare parameter was not, and stored a string."""
+
+    @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+    def test_it_is_refused_as_a_bare_parameter(self, value: float) -> None:
+        from agensgraph.adapters import FloatDumper
+
+        with pytest.raises(ValueError, match="cannot be NaN or an infinity"):
+            FloatDumper(float).dump(value)
+
+    @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+    def test_and_in_the_binary_rendering_too(self, value: float) -> None:
+        from agensgraph.adapters import FloatBinaryDumper
+
+        with pytest.raises(ValueError, match="cannot be NaN or an infinity"):
+            FloatBinaryDumper(float).dump(value)
+
+    @pytest.mark.parametrize("value", [1.5, 0.0, -0.0, 1e308, -1e308, 1e-308])
+    def test_an_ordinary_float_is_untouched(self, value: float) -> None:
+        from agensgraph.adapters import FloatDumper
+
+        assert FloatDumper(float).dump(value) is not None
+
+
+@pytest.mark.server
+class TestANonFiniteFloatAgainstAServer:
+    def test_it_never_reaches_the_server_as_the_text_of_its_name(self, agens) -> None:  # type: ignore[no-untyped-def]
+        """It used to arrive as a float8, and converting one to jsonb stores 'NaN'."""
+        agens.execute("create vlabel t")
+        agens.refresh_labels()
+        for value in (float("nan"), float("inf")):
+            with pytest.raises(ValueError, match="cannot be NaN or an infinity"):
+                agens.execute("create (:t {p: %s})", (value,))
+        agens.execute("create (:t {p: %s})", (1.5,))
+        assert agens.execute_query("match (n:t) return n.p").records[0][0] == 1.5
