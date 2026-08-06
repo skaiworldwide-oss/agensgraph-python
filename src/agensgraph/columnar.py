@@ -136,9 +136,19 @@ def columns(records: Sequence[Sequence[Any]], keys: Sequence[str]) -> dict[str, 
     is converted -- an identity to its text, a vector to a list of numbers, an element to a mapping
     of its identity, label and properties -- and everything else is left as it arrived. The
     conversion is decided once per column.
+
+    Two columns of one name are refused. A statement may return them -- ``return n.a, n.a`` names
+    both columns ``a``, and so does aliasing two of them the same -- and a mapping cannot hold both,
+    so one would be lost with nothing said. :func:`to_arrow` carries them, being a shape that can.
     """
     if not keys:
         return {}
+    if len(set(keys)) != len(keys):
+        repeated = sorted({name for name in keys if list(keys).count(name) > 1})
+        raise ValueError(
+            f"two columns share a name, and a mapping can hold only one of each: {repeated}. "
+            f"Name them apart with AS, or use to_arrow, which carries both."
+        )
     out: dict[str, list[Any]] = {}
     for name, values in zip(keys, _transpose(records, len(keys)), strict=True):
         convert = _plainly(_first(values))

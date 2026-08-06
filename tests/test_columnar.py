@@ -802,3 +802,22 @@ class TestVectorsAgainstAServer:
         result = graph.execute_query("match (n:emb) return n.v as v", binary_=True)
         table = to_arrow(result)
         assert table.column("v").to_pylist() == [held.tolist() for (held,) in result.records]
+
+
+class TestTwoColumnsOfOneName:
+    """A statement may return them: `return n.a, n.a` names both columns `a`."""
+
+    def test_a_mapping_refuses_them_rather_than_losing_one(self) -> None:
+        with pytest.raises(ValueError, match="two columns share a name"):
+            columns([(1, 2), (3, 4)], ["name", "name"])
+
+    def test_the_message_names_which_ones(self) -> None:
+        with pytest.raises(ValueError, match=r"\['a', 'b'\]"):
+            columns([(1, 2, 3, 4)], ["a", "a", "b", "b"])
+
+    def test_arrow_carries_both(self) -> None:
+        """Which is why the mapping refuses rather than the reader as a whole."""
+        table = to_arrow([(1, 2), (3, 4)], ["name", "name"])
+        assert table.num_columns == 2
+        assert table.column(0).to_pylist() == [1, 3]
+        assert table.column(1).to_pylist() == [2, 4]
