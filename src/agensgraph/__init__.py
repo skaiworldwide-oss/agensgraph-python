@@ -43,7 +43,9 @@ from .observability import disable_tracing as disable_tracing
 from .observability import enable_tracing as enable_tracing
 from .observability import remove_query_logger as remove_query_logger
 from .pool import ConnectionPool as ConnectionPool
+from .pool import NullConnectionPool as NullConnectionPool
 from .pool_async import AsyncConnectionPool as AsyncConnectionPool
+from .pool_async import AsyncNullConnectionPool as AsyncNullConnectionPool
 from .retry import RetryPolicy as RetryPolicy
 from .retry import TokenBucket as TokenBucket
 from .summary import CommitOutcome as CommitOutcome
@@ -63,6 +65,7 @@ __all__ = [
     "MINIMUM_VERSION",
     "AsyncConnection",
     "AsyncConnectionPool",
+    "AsyncNullConnectionPool",
     "BatchFailed",
     "Capabilities",
     "Check",
@@ -86,6 +89,7 @@ __all__ = [
     "LabelInfo",
     "Notice",
     "Notify",
+    "NullConnectionPool",
     "Path",
     "QueryRecord",
     "Result",

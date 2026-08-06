@@ -606,3 +606,116 @@ class TestAPoolWideStatementTimeout:
                 assert conn.execute("show statement_timeout").fetchone()[0] != "5s"
             with pool.connection() as conn:
                 assert conn.execute("show statement_timeout").fetchone()[0] == "5s"
+
+
+def backend_pid(pool) -> int:  # type: ignore[no-untyped-def]
+    with pool.connection() as conn:
+        return int(conn.execute_query("select pg_backend_pid()").records[0][0])
+
+
+class TestDraining:
+    """Which replaces every connection, for a change one carries from the moment it is made."""
+
+    def test_the_backends_are_new_ones(self, dsn: str, graph_name: str) -> None:
+        p = agensgraph.ConnectionPool(dsn, graph=graph_name, min_size=2, max_size=2)
+        p.open(wait=True)
+        try:
+            before = {backend_pid(p) for _ in range(4)}
+            p.drain()
+            p.wait()
+            after = {backend_pid(p) for _ in range(4)}
+        finally:
+            p.close()
+        assert len(before) == 2
+        assert len(after) == 2
+        assert not (before & after)
+
+    def test_the_generation_is_left_alone(self, dsn: str, graph_name: str) -> None:
+        """Because a drained connection is not one that must never be used again."""
+        p = agensgraph.ConnectionPool(dsn, graph=graph_name, min_size=1, max_size=1)
+        p.open(wait=True)
+        try:
+            before = p.generation
+            p.drain()
+            p.wait()
+            assert p.generation == before
+            assert p.get_stats()["connections_retired"] == 0
+            with p.connection() as conn:
+                assert conn.execute_query("return 1").records == [(1,)]
+        finally:
+            p.close()
+
+
+class TestKeepingNothing:
+    """The null pool, for a process that handles one request and exits."""
+
+    def test_every_caller_gets_a_backend_of_their_own(self, dsn: str) -> None:
+        p = agensgraph.NullConnectionPool(dsn)
+        p.open(wait=True)
+        try:
+            pids = [backend_pid(p) for _ in range(3)]
+            assert len(set(pids)) == 3
+            assert p.get_stats()["pool_available"] == 0
+            assert p.get_stats()["pool_size"] == 0
+        finally:
+            p.close()
+
+    def test_the_graph_is_still_selected_and_the_version_still_checked(
+        self, dsn: str, graph_name: str
+    ) -> None:
+        p = agensgraph.NullConnectionPool(dsn, graph=graph_name)
+        p.open(wait=True)
+        try:
+            with p.connection() as conn:
+                assert conn.label_table.graph == graph_name
+                assert conn.capabilities.version >= (2, 16)
+                assert conn.execute_query("match (t:thing) return t.n").records == [(1,)]
+        finally:
+            p.close()
+
+    def test_asking_it_to_keep_one_is_refused(self, dsn: str) -> None:
+        with pytest.raises(ValueError, match="min_size"):
+            agensgraph.NullConnectionPool(dsn, min_size=1)
+
+    def test_it_is_the_same_pool_otherwise(self, dsn: str) -> None:
+        """So that moving between the two is a change of class and nothing else."""
+        assert issubclass(agensgraph.NullConnectionPool, agensgraph.ConnectionPool)
+        assert issubclass(agensgraph.AsyncNullConnectionPool, agensgraph.AsyncConnectionPool)
+
+
+class TestKeepingNothingAwaiting:
+    """The awaiting pool is the one that is written; the other is generated from it."""
+
+    @pytest.mark.asyncio
+    async def test_it_serves_and_keeps_nothing(self, dsn: str, graph_name: str) -> None:
+        p = agensgraph.AsyncNullConnectionPool(dsn, graph=graph_name)
+        await p.open(wait=True)
+        try:
+            pids = []
+            for _ in range(3):
+                async with p.connection() as conn:
+                    result = await conn.execute_query("select pg_backend_pid()")
+                    pids.append(result.records[0][0])
+            assert len(set(pids)) == 3
+            assert p.get_stats()["pool_size"] == 0
+        finally:
+            await p.close()
+
+    @pytest.mark.asyncio
+    async def test_draining_replaces_the_backends(self, dsn: str, graph_name: str) -> None:
+        p = agensgraph.AsyncConnectionPool(dsn, graph=graph_name, min_size=2, max_size=2)
+        await p.open(wait=True)
+
+        async def pid() -> int:
+            async with p.connection() as conn:
+                result = await conn.execute_query("select pg_backend_pid()")
+                return int(result.records[0][0])
+
+        try:
+            before = {await pid() for _ in range(4)}
+            await p.drain()
+            await p.wait()
+            after = {await pid() for _ in range(4)}
+        finally:
+            await p.close()
+        assert not (before & after)
