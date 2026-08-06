@@ -255,10 +255,11 @@ class RetryPolicy:
                 reason="the retry allowance is spent, so the server is being left alone",
             )
 
-        delay = full_jitter(number, base=self._base, cap=self._cap, rng=self._rng)
-        if recovery.wants_longer_delay:
-            # The server is short of something, so arriving sooner is worse than later.
-            delay *= 2
+        # A server short of something is arrived at later, and doubling the base doubles the
+        # ceiling the wait is drawn below -- before the cap is applied, so the cap stays one.
+        # Doubling the drawn value instead put the wait at twice the cap.
+        base = self._base * 2 if recovery.wants_longer_delay else self._base
+        delay = full_jitter(number, base=base, cap=self._cap, rng=self._rng)
         if remaining is not None and delay >= remaining:
             return Attempt(
                 number=number,

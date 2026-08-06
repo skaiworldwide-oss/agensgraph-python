@@ -27,6 +27,7 @@ def failure(state: str) -> pg.Error:
     return pg.lookup(state)("failed")
 
 
+TOO_MANY_CONNECTIONS = "53300"
 CONFLICT = "40001"
 LOST = "08006"
 SYNTAX = "42601"
@@ -250,3 +251,39 @@ def test_a_decision_reads_clearly() -> None:
     assert "give up" in repr(policy.decide(failure(SYNTAX), number=1))
     assert "RetryPolicy(attempts=3" in repr(policy)
     assert "/100" in repr(TokenBucket(100))
+
+
+class TestTheCapHoldsForEveryRecovery:
+    """Doubling the drawn value put a backpressure wait at twice the stated cap."""
+
+    def _worst(self, exc: BaseException, *, cap: float) -> float:
+        rng = random.Random(3)
+        worst = 0.0
+        for number in range(1, 20):
+            for _ in range(200):
+                policy = RetryPolicy(
+                    attempts=30, cap=cap, bucket=TokenBucket(100), rng=rng
+                )
+                worst = max(worst, policy.decide(exc, number=number).delay)
+        return worst
+
+    def test_a_backpressure_wait_never_exceeds_the_cap(self) -> None:
+        assert self._worst(failure(TOO_MANY_CONNECTIONS), cap=2.0) <= 2.0
+
+    def test_nor_does_an_ordinary_one(self) -> None:
+        assert self._worst(failure(CONFLICT), cap=2.0) <= 2.0
+
+    def test_backpressure_still_waits_longer_while_the_ceiling_is_below_the_cap(self) -> None:
+        """Doubling the ceiling before capping is what honours both rules at once."""
+        rng = random.Random(4)
+        busy, ordinary = [], []
+        for _ in range(400):
+            for store, exc in (
+                (busy, failure(TOO_MANY_CONNECTIONS)),
+                (ordinary, failure(CONFLICT)),
+            ):
+                policy = RetryPolicy(
+                    attempts=30, base=0.05, cap=2.0, bucket=TokenBucket(100), rng=rng
+                )
+                store.append(policy.decide(exc, number=2).delay)
+        assert sum(busy) / len(busy) > sum(ordinary) / len(ordinary) * 1.5
