@@ -26,6 +26,9 @@ if TYPE_CHECKING:
 
 pytestmark = pytest.mark.server
 
+TEXT_OID = 25
+"""What a promoted read of a ``text`` property comes back as, where jsonb is 3802."""
+
 
 @pytest.fixture
 def graph(conn: Connection[object]) -> Connection[object]:
@@ -340,3 +343,63 @@ def test_an_edge_and_a_vertex_are_usable_as_keys(graph: Connection[object]) -> N
             seen[element] = seen.get(element, 0) + 1
     assert len(seen) == 3
     assert all(isinstance(k, Vertex | Edge) for k in seen)
+
+
+class TestThePromotedSentinelColumn:
+    """A hidden column the server projects to carry a promoted read across a scope boundary.
+
+    It is named ``_agens_default_prop:<var>:<key>`` and it is real: with promotion on, a
+    ``WITH`` or ``LET`` that carries a graph element forward appends one target entry per
+    promoted property of that element's label, so a later ``WHERE`` or ``ORDER BY`` still
+    reaches the typed column and its index rather than the property map.
+
+    It cannot reach a client, and the driver therefore does not filter it. Two things in the
+    server say so, and both are asserted below rather than taken on trust. Sentinels are
+    appended for ``WITH`` and ``LET`` only -- ``RETURN`` is terminal and excluded, so that its
+    projection stays exactly what was written -- and a Cypher statement's columns are its
+    terminal ``RETURN``'s. And star expansion drops every target entry whose name is a
+    sentinel, so ``RETURN *`` after such a ``WITH`` does not carry them either.
+
+    Filtering them here would be worse than not: a record is a tuple, so dropping a name
+    without dropping the value beside it would leave the names and the values misaligned.
+    """
+
+    SHAPES = (
+        "match (d:doc) return d.title",
+        "match (d:doc) with d as e where e.title = 'a' return *",
+        "match (d:doc) with d where d.n > 0 return d",
+        "match (d:doc) with d, d.title as t return *",
+        "match (d:doc) with d order by d.title return d.title",
+        "match (d:doc) with d limit 2 with d return *",
+        "match (d:doc) call { with d match (d)-[:link]->(x:doc) return x } return *",
+        "match (d:doc) let t = d.title return *",
+        "match (d:doc) with d match (d)-[r:link]->(y) return *",
+        "match (d:doc) return *",
+    )
+
+    @pytest.fixture
+    def promoted(self, agens):  # type: ignore[no-untyped-def]
+        if not agens.capabilities.has_property_promotion():
+            pytest.skip("this server has no property promotion")
+        on = agens.execute_query("show enable_property_promotion").records[0][0]
+        assert on == "on", "promotion is off on this server, so the sentinel is never projected"
+        agens.execute("create vlabel doc (title text generated, n int generated)")
+        agens.execute("create elabel link")
+        agens.execute("create (:doc {title: 'a', n: 1})-[:link]->(:doc {title: 'b', n: 2})")
+        agens.refresh_labels()
+        return agens
+
+    @pytest.mark.parametrize("statement", SHAPES)
+    def test_no_shape_surfaces_it_as_a_column(self, promoted, statement) -> None:  # type: ignore[no-untyped-def]
+        keys = promoted.execute_query(statement).keys
+        assert not [key for key in keys if key.startswith("_agens_default_")]
+
+    def test_the_promoted_read_is_the_column_s_own_type(self, promoted) -> None:  # type: ignore[no-untyped-def]
+        """Which is what the sentinel is projected for, and what a filter here would risk.
+
+        Without promotion the same read is jsonb; the column's own type is what reaches the
+        typed column's index, and it is how this fixture is known to be promoted at all.
+        """
+        result = promoted.execute_query("match (d:doc) where d.title = 'a' return d.title")
+        assert result.records == [("a",)]
+        assert result.oids == (TEXT_OID,)
