@@ -44,6 +44,7 @@ from array import array
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, overload
 
+import msgspec
 from psycopg.adapt import Dumper, Loader
 from psycopg.pq import Format
 
@@ -64,6 +65,7 @@ __all__ = [
     "generated_column",
     "nearest",
     "parse_vector_text",
+    "parse_vector_values",
     "search_option_statements",
     "vector_index",
 ]
@@ -93,19 +95,6 @@ _F32 = struct.Struct(">f")
 _F16 = struct.Struct(">e")
 
 
-def _narrow_all(values: list[float], *, half: bool = False) -> list[float]:
-    """The same numbers at the width the server keeps them.
-
-    Single precision goes through an array, which converts the whole list in C. Half precision
-    cannot: the array module has no half typecode, so those go one at a time -- which is slower
-    and matters less, since half precision is chosen to make a vector smaller and the vectors
-    are correspondingly cheaper to walk.
-    """
-    if half:
-        return [float(_F16.unpack(_F16.pack(value))[0]) for value in values]
-    return array("f", values).tolist()
-
-
 def _narrow(value: float, width: struct.Struct) -> float:
     """One value, for the places that have only one."""
     return float(width.unpack(width.pack(value))[0])
@@ -126,8 +115,11 @@ def _elements(data: Buffer, code: str) -> list[float]:
     return list(struct.unpack_from(f">{dimensions}{code}", raw, _HEADER.size))
 
 
-def parse_vector_text(text: str | bytes, *, half: bool = False) -> list[float]:
-    """Read ``[1,2,3]`` into numbers of the width the server keeps them at.
+_decode_numbers = msgspec.json.Decoder(list[float]).decode
+
+
+def parse_vector_values(text: str | bytes, *, half: bool = False) -> array[float]:
+    """Read ``[1,2,3]`` into an array of the width the server keeps the numbers at.
 
     The whole string has to be a bracketed list, so a value that has been through something which
     quoted or truncated it is refused rather than half-read.
@@ -136,16 +128,32 @@ def parse_vector_text(text: str | bytes, *, half: bool = False) -> list[float]:
     that is what the server stores, and because not doing it makes this disagree with the binary
     reading of the same value. The decimal the server prints is the shortest one that reproduces
     its single-precision value; read as a double it is a different number.
+
+    The list of numbers a vector prints as is also JSON, so it is read by the same C decoder the
+    property map is read by rather than one Python call per number: 100 microseconds against 300
+    for 1536 dimensions, three times. A text the decoder will not take -- a leading ``+``, which
+    JSON forbids and ``float`` accepts -- falls back to reading it a number at a time, so nothing
+    this used to accept is refused now.
     """
-    if isinstance(text, bytes):
-        text = text.decode()
-    text = text.strip()
-    if not text.startswith("[") or not text.endswith("]"):
+    raw = text if isinstance(text, bytes) else text.encode()
+    raw = raw.strip()
+    if not raw.startswith(b"[") or not raw.endswith(b"]"):
         raise ValueError(f"not a vector: {text!r}")
-    body = text[1:-1].strip()
-    if not body:
-        return []
-    return _narrow_all([float(part) for part in body.split(",")], half=half)
+    try:
+        numbers = _decode_numbers(raw)
+    except msgspec.DecodeError:
+        body = raw[1:-1].strip()
+        if not body:
+            return array("f")
+        numbers = [float(part) for part in body.decode().split(",")]
+    if half:
+        return array("f", (float(_F16.unpack(_F16.pack(value))[0]) for value in numbers))
+    return array("f", numbers)
+
+
+def parse_vector_text(text: str | bytes, *, half: bool = False) -> list[float]:
+    """The same numbers as an ordinary list, for a caller that wants one."""
+    return parse_vector_values(text, half=half).tolist()
 
 
 class VectorLoader(Loader):
@@ -266,7 +274,7 @@ class Vector:
     property map -- and it pays here for the same reason: a vector search asks the *server* for the
     distance, so the components of the vectors it ranked are frequently never read at all.
 
-    Measured, one embedding of 1536 dimensions:
+    Measured, one embedding of 1536 dimensions arriving in the composite rendering:
 
     ==========================================  ========
     a list of Python floats, as this once did      33.8 µs
@@ -277,6 +285,13 @@ class Vector:
 
     So sixty-nine times cheaper to read and ignore, and thirteen times cheaper to read and use.
     It also holds four bytes a number rather than eight plus a pointer plus an object header.
+
+    **Ask for the composite rendering when reading vectors.** Those figures are that rendering's,
+    and the text one is the default. A vector of 1536 dimensions prints as about fifteen kilobytes
+    of decimal against six of wire bytes, and its numbers have to be read out of that text rather
+    than copied. End to end over three hundred such rows: 29.9 microseconds a row in the composite
+    rendering with the numbers read, against 92.8 in the text one with them left alone and 208.5
+    with them read. ``binary_=True`` is what asks for it.
 
     It behaves like the sequence it is: indexing, slicing, iteration, ``len``, ``in``, ``index``,
     ``count``, ``sum``, and equality against any sequence -- so ``vector == [1.0, 2.0]`` is true
@@ -338,7 +353,7 @@ class Vector:
         else:
             text = self._text
             assert text is not None
-            held = array("f", parse_vector_text(text, half=self._half))
+            held = parse_vector_values(text, half=self._half)
         object.__setattr__(self, "_values", held)
         object.__setattr__(self, "_raw", None)
         object.__setattr__(self, "_text", None)

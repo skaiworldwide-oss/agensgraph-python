@@ -24,6 +24,7 @@ from agensgraph.vector import (
     generated_column,
     nearest,
     parse_vector_text,
+    parse_vector_values,
     search_option_statements,
     vector_index,
 )
@@ -1037,3 +1038,41 @@ class TestNothingCallerSuppliedReachesTheStatementUnchecked:
             "match (n:movie) return n order by n.embedding::vector(4) <=> "
             "%s::vector(4) limit 10"
         )
+
+
+class TestReadingTheTextThroughTheJsonDecoder:
+    """The list a vector prints as is also JSON, which is what makes reading it three times faster.
+
+    JSON has no leading ``+`` and ``float`` does, so a text the decoder will not take is read a
+    number at a time instead, and both spellings give the same numbers.
+    """
+
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            ("[1,2,3]", [1.0, 2.0, 3.0]),
+            ("[]", []),
+            ("[-0.5,1e-05,2E3]", [-0.5, 9.999999747378752e-06, 2000.0]),  # narrowed to a single
+            (" [1, 2] ", [1.0, 2.0]),
+            ("[+1,+2.5]", [1.0, 2.5]),
+            (b"[1,2,3]", [1.0, 2.0, 3.0]),
+        ],
+    )
+    def test_what_it_reads(self, text, expected) -> None:  # type: ignore[no-untyped-def]
+        assert parse_vector_text(text) == expected
+        assert list(parse_vector_values(text)) == expected
+
+    @pytest.mark.parametrize("text", ['"[1,2]"', "[1,2", "1,2", "{}", "[1,2}"])
+    def test_what_it_refuses(self, text: str) -> None:
+        with pytest.raises(ValueError):
+            parse_vector_text(text)
+
+    def test_the_array_is_handed_through_rather_than_rebuilt(self) -> None:
+        """The array a text is read into is the array the value holds."""
+        values = parse_vector_values("[1,2,3]")
+        assert values.typecode == "f"
+        assert Vector.from_wire_text(b"[1,2,3]").values.typecode == "f"
+
+    def test_half_precision_still_narrows(self) -> None:
+        assert parse_vector_text("[0.1]", half=True) != [0.1]
+        assert parse_vector_text("[0.1]", half=True)[0] == pytest.approx(0.1, abs=1e-3)

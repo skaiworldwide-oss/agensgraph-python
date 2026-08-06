@@ -696,13 +696,19 @@ v.tolist()          # an ordinary list, if you want one
 It is not a `list` — `isinstance(v, list)` is `False` and `json.dumps(v)` raises — but it compares
 equal to one, which is the part that would otherwise go wrong quietly.
 
-| reading 200 embeddings of 1536 dimensions | |
+| reading 300 embeddings of 1536 dimensions, per row | |
 |---|---|
-| binary, values untouched | **5.8 ms** |
-| binary, one value read from each | 10.5 ms |
-| text, values untouched | 16.9 ms |
+| **binary, values read** | **29.9 µs** |
+| text, values untouched | 92.8 µs |
+| text, values read | 208.5 µs |
 
-Ask for `binary=True` where you can: even with the parse deferred, text costs 3× more.
+**Ask for `binary_=True` when you read vectors.** The text rendering is the default, and a
+1536-dimension vector prints as about fifteen kilobytes of decimal against six of wire bytes — so
+it costs three times as much before anything is parsed, and seven times once the numbers are read.
+The numbers themselves are read by the same C decoder the property map is read by, since the list a
+vector prints as is also JSON: 100 microseconds against 300 for a hand-rolled loop, three times.
+A text that decoder will not take, such as a leading `+`, falls back to reading it a number at a
+time, so nothing that used to be accepted is refused.
 
 Sending is where the largest saving is, because every other route formats each number as decimal
 text:
