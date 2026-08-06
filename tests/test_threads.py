@@ -1,9 +1,10 @@
 """The state that is shared between threads, and whether sharing it is safe.
 
-Three things in this driver are reachable from more than one thread at once: the retry allowance,
-the adapters template every connection derives from, and the list of query loggers. A module-level
-cache is the documented first hazard of a free-threaded build, and the canonical broken shape is
-check-then-fill, so each is exercised here.
+Five things in this driver are reachable from more than one thread at once: the retry allowance,
+the adapters template every connection derives from, the list of query loggers, the map each
+connection derives from that template, and the label table. A cache is the documented first hazard
+of a free-threaded build, and the canonical broken shape is check-then-fill, so each is exercised
+here. The prepared-statement cache is psycopg's own and is exercised through it.
 
 The switch interval is dropped to a microsecond, which forces interleaving without needing a
 free-threaded interpreter -- one of the two techniques that find these races on an ordinary build.
@@ -19,6 +20,7 @@ import threading
 import pytest
 
 from agensgraph._core import GRAPH_ADAPTERS
+from agensgraph._protocol.labels import LabelCache
 from agensgraph.errors import Retryability
 from agensgraph.observability import (
     QueryRecord,
@@ -151,3 +153,148 @@ def test_the_build_can_be_told_apart_from_the_state_of_the_lock() -> None:
     assert isinstance(right_now, bool)
     if not build:
         assert right_now, "a build with the lock cannot be running without it"
+
+
+class TestTheLabelTable:
+    """Which names a label by an id whose meaning depends on which graph the table came from.
+
+    Label ids restart per graph, so names read beside the wrong graph name do not fail -- they
+    name a different label, and the caller is told a vertex is something it is not. The names and
+    the graph they came from are therefore one field, replaced in a single assignment.
+
+    Racing for that is not how it is checked. The window between two assignments is one bytecode
+    wide, and eight readers against two thousand writes at a microsecond switch interval never
+    land in it -- the same test passes against the shape that holds the two apart. So the count of
+    assignments is asserted directly, and the interleaving test below is kept for what it does
+    show, which is that hammering the table from eight threads answers correctly or not at all.
+    """
+
+    def test_replacing_the_table_is_one_assignment(self) -> None:
+        class Recording(LabelCache):
+            """Whose published field records how many times it is written."""
+
+            def __init__(self) -> None:
+                self.writes = 0
+                super().__init__()
+
+            @property
+            def _table(self) -> tuple[str | None, dict[int, str]]:
+                return self._written
+
+            @_table.setter
+            def _table(self, value: tuple[str | None, dict[int, str]]) -> None:
+                self.writes += 1
+                self._written = value
+
+        cache = Recording()
+        cache.writes = 0
+        cache.load("first", [(3, "alpha")])
+        assert cache.writes == 1
+        cache.writes = 0
+        cache.invalidate()
+        assert cache.writes == 1
+
+    def test_a_lookup_is_answered_correctly_or_not_at_all(self) -> None:
+        cache = LabelCache()
+        cache.load("first", [(3, "alpha")])
+        states = [
+            lambda c: c.load("first", [(3, "alpha")]),
+            lambda c: c.load("second", [(4, "beta")]),
+            lambda c: c.invalidate(),
+        ]
+        seen: list[tuple[str, str | None]] = []
+        stop = threading.Event()
+
+        def write() -> None:
+            for i in range(EACH):
+                states[i % len(states)](cache)
+            stop.set()
+
+        def read() -> None:
+            """At least one read before looking at the flag, or a reader that starts late
+            collects nothing and the assertion below has nothing to assert."""
+            while True:
+                try:
+                    seen.append(("named", cache.name(3)))
+                except KeyError as exc:
+                    seen.append(("refused", str(exc.args[0]).rpartition("graph ")[2]))
+                if stop.is_set():
+                    return
+
+        writer = threading.Thread(target=write)
+        readers = [threading.Thread(target=read) for _ in range(THREADS)]
+        writer.start()
+        for reader in readers:
+            reader.start()
+        writer.join()
+        for reader in readers:
+            reader.join()
+
+        assert seen
+        assert set(seen) <= {("named", "alpha"), ("refused", "'second'"), ("refused", "None")}
+
+
+@pytest.mark.server
+class TestWhatAConnectionFillsForItself:
+    """The two per-connection copies, and the gate that decides whether to keep the connection.
+
+    A field that fills itself on first use is filled twice when two callers arrive together, and
+    one of the two copies is dropped -- taking with it whatever the losing caller registered on it
+    or loaded into it. So none of them fills itself on first use: the two copies are built with the
+    connection, and the gate is answered inside connect before the connection is handed over. That
+    is asserted directly for the same reason as the label table -- the window is too narrow to race
+    for, and a test that raced for it would pass either way.
+    """
+
+    def test_both_are_there_before_the_connection_has_been_used(self, dsn) -> None:  # type: ignore[no-untyped-def]
+        """Read behind the properties, since reading through them is what would fill them."""
+        import agensgraph
+
+        fresh = agensgraph.Connection.connect(dsn)
+        try:
+            assert isinstance(fresh._agens_adapters, type(GRAPH_ADAPTERS))
+            assert isinstance(fresh._agens_labels, LabelCache)
+        finally:
+            fresh.close()
+
+    def test_both_copies_are_the_same_object_from_every_thread(self, agens) -> None:  # type: ignore[no-untyped-def]
+        maps: list[int] = []
+        tables: list[int] = []
+
+        def look() -> None:
+            for _ in range(EACH):
+                maps.append(id(agens.adapters))
+                tables.append(id(agens.label_table))
+
+        run_on_threads(look)
+        assert len(set(maps)) == 1
+        assert len(set(tables)) == 1
+
+    def test_the_map_is_this_connection_s_own(self, agens, dsn) -> None:  # type: ignore[no-untyped-def]
+        import agensgraph
+
+        other = agensgraph.Connection.connect(dsn)
+        try:
+            assert agens.adapters is not other.adapters
+            assert agens.adapters is not GRAPH_ADAPTERS
+            assert agens.label_table is not other.label_table
+        finally:
+            other.close()
+
+    def test_the_version_gate_is_answered_before_anybody_holds_the_connection(self, agens) -> None:  # type: ignore[no-untyped-def]
+        """So the one field that is still filled on first use cannot be reached by two callers."""
+        assert agens._agens_capabilities is not None
+
+    def test_the_prepared_statement_cache_takes_eight_threads(self, agens) -> None:  # type: ignore[no-untyped-def]
+        """psycopg's own, not this driver's, and pinned here because it is shared all the same."""
+        agens.execute("create (:cached {n: 1})")
+        answers: list[int] = []
+
+        def ask() -> None:
+            for _ in range(20):
+                answers.append(
+                    agens.execute_query("match (n:cached) return n.n", prepare_=True).records[0][0]
+                )
+
+        run_on_threads(ask)
+        assert answers == [1] * (THREADS * 20)

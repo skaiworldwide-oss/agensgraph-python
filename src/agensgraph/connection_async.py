@@ -20,10 +20,18 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, cast
 
 import psycopg
+from psycopg.adapt import AdaptersMap
 from psycopg.rows import Row, tuple_row
 
-from ._core import GraphMixin, Result, statement_text, stream_name, with_keepalives
-from ._protocol.labels import CURRENT_GRAPH_QUERY
+from ._core import (
+    GRAPH_ADAPTERS,
+    GraphMixin,
+    Result,
+    statement_text,
+    stream_name,
+    with_keepalives,
+)
+from ._protocol.labels import CURRENT_GRAPH_QUERY, LabelCache
 from .bulk import (
     EDGE_COLUMN_TYPES,
     VERTEX_COLUMN_TYPES,
@@ -159,8 +167,18 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
     """
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
+        """Take a connection's own copy of what the rest of it reads.
+
+        Filled here rather than on first use. Two callers reaching a field that fills itself
+        both find it empty and both fill it, and one of the two copies is then dropped --
+        with whatever was registered on it, or loaded into it, going with it. Building both
+        outright costs a few microseconds against a connection that is about to cost a round
+        trip, and leaves nothing to race for.
+        """
         super().__init__(*args, **kwargs)
         self.cursor_factory = AsyncCursor
+        self._agens_adapters = AdaptersMap(GRAPH_ADAPTERS)
+        self._agens_labels = LabelCache()
 
     # -- refusing a handle its holder gave back ------------------------------------------
     #

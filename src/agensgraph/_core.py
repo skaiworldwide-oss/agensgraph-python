@@ -15,7 +15,6 @@ from __future__ import annotations
 from itertools import count
 from typing import TYPE_CHECKING, Any, NamedTuple, Union
 
-from psycopg.adapt import AdaptersMap
 from psycopg.conninfo import conninfo_to_dict as _conninfo_to_dict
 
 from ._protocol.labels import LabelCache
@@ -29,6 +28,7 @@ from .summary import GraphWriteCounts
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Sequence
 
+    from psycopg.adapt import AdaptersMap
     from psycopg.pq.abc import PGconn
     from psycopg.sql import SQL, Composed
 
@@ -135,7 +135,7 @@ def with_keepalives(kwargs: dict[str, Any], conninfo: str = "") -> dict[str, Any
 class GraphMixin:
     """Everything a graph connection knows that does not require waiting for the server."""
 
-    _adapters: AdaptersMap | None
+    _agens_adapters: AdaptersMap
     pgconn: PGconn
 
     _agens_capabilities: Capabilities | None = None
@@ -181,10 +181,12 @@ class GraphMixin:
 
         Derived per connection, so registering something on one connection does not reach the
         others and nothing here reaches a plain PostgreSQL connection in the same process.
+
+        Named apart from psycopg's own field rather than filling it, because psycopg reads
+        that one in the property this one replaces and nowhere else, and a field of our own
+        needs no agreement with a base class about when it may be empty.
         """
-        if not self._adapters:
-            self._adapters = AdaptersMap(GRAPH_ADAPTERS)
-        return self._adapters
+        return self._agens_adapters
 
     # -- the capability gate ------------------------------------------------------------
 
@@ -211,11 +213,7 @@ class GraphMixin:
         of the value. It is filled when a graph is selected and can be filled again after
         a label is created.
         """
-        try:
-            return self._agens_labels
-        except AttributeError:
-            self._agens_labels = LabelCache()
-            return self._agens_labels
+        return self._agens_labels
 
     def _accept_labels(self, graph: str, rows: Sequence[tuple[int, str]]) -> None:
         """Take the label table for a graph, and make the composite loaders available."""

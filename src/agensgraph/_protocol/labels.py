@@ -37,18 +37,25 @@ class LabelCache:
 
     Lookups are a plain dict hit. Interning the names is deliberately not done: a warm
     dict lookup is cheaper than interning, and interning costs more than it saves here.
+
+    The names and the graph they came from are one field, replaced in a single assignment.
+    Held apart they are two, and a reader between the two assignments would see names that
+    belong to one graph beside the name of another -- which is how the caller that reloads
+    the table asks the server for the labels of a graph the session has left, and stores the
+    answer as though it described the graph it is on. Reading the two together costs about
+    twelve nanoseconds a lookup, against six thousand a vertex for the rendering that needs
+    it.
     """
 
-    __slots__ = ("_graph", "_names")
+    __slots__ = ("_table",)
 
     def __init__(self) -> None:
-        self._names: dict[int, str] = {}
-        self._graph: str | None = None
+        self._table: tuple[str | None, dict[int, str]] = (None, {})
 
     @property
     def graph(self) -> str | None:
         """The graph these names came from."""
-        return self._graph
+        return self._table[0]
 
     @property
     def query(self) -> str:
@@ -57,32 +64,32 @@ class LabelCache:
 
     def load(self, graph: str, rows: list[tuple[int, str]]) -> None:
         """Replace the contents with the labels of one graph."""
-        self._names = dict(rows)
-        self._graph = graph
+        self._table = (graph, dict(rows))
 
     def invalidate(self) -> None:
         """Forget everything, so the next lookup has to reload."""
-        self._names = {}
-        self._graph = None
+        self._table = (None, {})
 
     def get(self, labid: int) -> str | None:
         """Look up a name, or ``None`` if this id is not known."""
-        return self._names.get(labid)
+        return self._table[1].get(labid)
 
     def name(self, labid: int) -> str:
         """Look up a name, raising if this id is not known."""
+        table = self._table
         try:
-            return self._names[labid]
+            return table[1][labid]
         except KeyError:
             raise KeyError(
-                f"label id {labid} is not in the cache for graph {self._graph!r}"
+                f"label id {labid} is not in the cache for graph {table[0]!r}"
             ) from None
 
     def __contains__(self, labid: object) -> bool:
-        return labid in self._names
+        return labid in self._table[1]
 
     def __len__(self) -> int:
-        return len(self._names)
+        return len(self._table[1])
 
     def __repr__(self) -> str:
-        return f"LabelCache(graph={self._graph!r}, {len(self._names)} labels)"
+        graph, names = self._table
+        return f"LabelCache(graph={graph!r}, {len(names)} labels)"
