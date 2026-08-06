@@ -119,8 +119,6 @@ def test_classification_of_failures_that_are_not_the_servers(
     [
         (E.StaleLabelCache.for_label(9, graph="g"), R.RESET_STATE),
         (E.UnresolvedCommit.for_transaction(7, reason="lost"), R.UNKNOWN),
-        (E.NetworkTimeout("timed out"), R.UNKNOWN),
-        (E.NetworkError("reset"), R.RECONNECT),
         (E.ConfigurationError("a setting refused it"), R.FATAL),
         (E.CapabilityError.for_feature("x", required="2.18", found="2.16"), R.FATAL),
     ],
@@ -287,29 +285,6 @@ class TestPickling:
         assert str(restored) == str(exc)
         assert restored.__dict__ == exc.__dict__
 
-    def test_a_wrapped_socket_failure_survives(self) -> None:
-        exc = E.from_os_error(ConnectionResetError(104, "reset"), what="reading a result")
-        restored = pickle.loads(pickle.dumps(exc))
-        assert restored.errno == 104
-
-
-class TestFromOsError:
-    def test_the_error_number_is_kept(self) -> None:
-        wrapped = E.from_os_error(ConnectionResetError(104, "reset"), what="reading")
-        assert wrapped.errno == 104
-        assert "reading" in str(wrapped)
-
-    def test_a_timeout_gets_a_class_of_its_own(self) -> None:
-        assert isinstance(E.from_os_error(TimeoutError(), what="reading"), E.NetworkTimeout)
-        assert not isinstance(
-            E.from_os_error(ConnectionResetError(104, "x"), what="reading"), E.NetworkTimeout
-        )
-
-    def test_a_wrapped_failure_is_still_an_operational_one(self) -> None:
-        """So that an except clause written against psycopg keeps matching."""
-        wrapped = E.from_os_error(OSError(101, "unreachable"), what="connecting")
-        assert isinstance(wrapped, pg.OperationalError)
-
 
 def test_the_pep_249_names_are_here() -> None:
     """A caller importing them from the driver should not have to reach for psycopg."""
@@ -326,3 +301,13 @@ def test_the_pep_249_names_are_here() -> None:
         "NotSupportedError",
     ):
         assert getattr(E, name) is getattr(pg, name)
+
+
+def test_the_driver_never_sees_a_raw_socket_failure() -> None:
+    """Which is why nothing wraps one: psycopg is the transport, and by the time a failure
+    reaches this driver it is already one of psycopg's own classes."""
+    import agensgraph
+
+    with pytest.raises(pg.OperationalError) as caught:
+        agensgraph.Connection.connect("host=127.0.0.1 port=59999 connect_timeout=2")
+    assert not isinstance(caught.value, OSError)

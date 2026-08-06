@@ -78,8 +78,6 @@ __all__ = [
     "IntegrityError",
     "InterfaceError",
     "InternalError",
-    "NetworkError",
-    "NetworkTimeout",
     "NoEnclosingTransaction",
     "NotSupportedError",
     "OperationalError",
@@ -94,7 +92,6 @@ __all__ = [
     "attach_query",
     "attach_retry_history",
     "explain_string_type",
-    "from_os_error",
     "is_retryable",
     "mask_dsn",
     "retryability",
@@ -434,29 +431,6 @@ class StaleGeneration(_pg.OperationalError):
         return exc
 
 
-class NetworkError(_pg.OperationalError):
-    """A socket failure, carrying the number the operating system gave it."""
-
-    errno: int | None = None
-
-
-class NetworkTimeout(NetworkError):
-    """A socket operation that ran out of time."""
-
-
-def from_os_error(exc: OSError, *, what: str) -> NetworkError:
-    """Wrap a socket failure, keeping its error number.
-
-    The number is the first thing anyone asks for and it is lost by every wrapper that
-    only carries the message across, so it is kept on the wrapper as well. A timeout gets
-    a class of its own, because it leaves the statement's fate open where a refused or
-    reset connection does not.
-    """
-    cls = NetworkTimeout if isinstance(exc, TimeoutError) else NetworkError
-    wrapped = cls(f"{what}: {exc}")
-    wrapped.errno = exc.errno
-    return wrapped
-
 
 # Most specific first, since a class is matched by the first entry it belongs to.
 #
@@ -472,8 +446,6 @@ _OURS: tuple[tuple[type[BaseException], Retryability], ...] = (
     # unknown: nothing was done. Whether there is budget left for another attempt is the
     # caller's loop to answer and not this.
     (_Expired, Retryability.SAFE),
-    (NetworkTimeout, Retryability.UNKNOWN),
-    (NetworkError, Retryability.RECONNECT),
     (StaleLabelCache, Retryability.RESET_STATE),
     (StaleGeneration, Retryability.RECONNECT),
     (UnresolvedCommit, Retryability.UNKNOWN),
@@ -611,6 +583,11 @@ def attach_retry_history(
 
 def mask_dsn(dsn: str | None) -> str:
     """A connection string safe to write down.
+
+    Nothing here calls it, and that is checked rather than assumed: no message, log record or
+    ``__repr__`` this driver produces carries a connection string, and psycopg masks the
+    password in its own connection ``__repr__``. It is exported for the caller who holds the
+    string and wants to write it somewhere.
 
     Every value whose key names a password is replaced. A string that will not parse
     yields a placeholder rather than itself, because the reason it will not parse may be
