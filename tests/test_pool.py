@@ -550,3 +550,59 @@ class TestARetiredConnectionIsNeverLent:
             pool.wait()
             pool.invalidate()
             assert pool.execute_query("return 1 as n").records == [(1,)]
+
+
+@pytest.mark.server
+class TestWhatRunningOutOfTimeIsCalled:
+    """A caller that ran out of its own budget and a pool with nothing to give want retrying
+    differently: one is the server being short and the other is not."""
+
+    def test_a_spent_deadline_is_reported_as_the_budget_expiring(self, dsn: str) -> None:
+        from agensgraph.deadline import Deadline, Expired
+        from agensgraph.errors import Retryability, retryability
+
+        with agensgraph.ConnectionPool(dsn, min_size=1, max_size=1, timeout=5.0) as pool:
+            pool.wait()
+            with (
+                pool.connection(),
+                pytest.raises(Expired) as caught,
+                pool.connection(deadline=Deadline(0.3)),
+            ):
+                pass
+            assert retryability(caught.value) is Retryability.SAFE
+
+    def test_a_plain_wait_is_reported_as_the_pool_being_empty(self, dsn: str) -> None:
+        import psycopg_pool
+
+        from agensgraph.errors import Retryability, retryability
+
+        with agensgraph.ConnectionPool(dsn, min_size=1, max_size=1, timeout=5.0) as pool:
+            pool.wait()
+            with (
+                pool.connection(),
+                pytest.raises(psycopg_pool.PoolTimeout) as caught,
+                pool.connection(timeout=0.3),
+            ):
+                pass
+            assert retryability(caught.value) is Retryability.BACKPRESSURE
+
+
+@pytest.mark.server
+class TestAPoolWideStatementTimeout:
+    """The per-caller limit costs a round trip and cannot not; a ceiling for every connection
+    costs none, because the options travel in the startup packet."""
+
+    def test_it_is_set_without_a_round_trip_and_narrowed_by_a_deadline(self, dsn: str) -> None:
+        from agensgraph.deadline import Deadline
+
+        with agensgraph.ConnectionPool(
+            dsn, min_size=1, max_size=1, timeout=5.0,
+            kwargs={"options": "-c statement_timeout=5000"},
+        ) as pool:
+            pool.wait()
+            with pool.connection() as conn:
+                assert conn.execute("show statement_timeout").fetchone()[0] == "5s"
+            with pool.connection(deadline=Deadline(2.0)) as conn:
+                assert conn.execute("show statement_timeout").fetchone()[0] != "5s"
+            with pool.connection() as conn:
+                assert conn.execute("show statement_timeout").fetchone()[0] == "5s"

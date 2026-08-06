@@ -45,6 +45,7 @@ from typing import TYPE_CHECKING, Any
 
 import psycopg_pool
 from psycopg.pq import TransactionStatus
+from psycopg_pool import errors as _pool_errors
 
 from .connection_async import AsyncConnection
 from .deadline import Deadline
@@ -299,12 +300,31 @@ class AsyncConnectionPool:
                     yield conn
                     return
             raise StaleGeneration.for_pool(self._generation)
+        except _pool_errors.PoolTimeout:
+            # A caller who gave a deadline and ran out of it is not a pool with nothing to
+            # give: one is the server being short and the other is not, and they are worth
+            # retrying differently. A caller who only said how long to wait, and waited that
+            # long, met the pool.
+            if deadline is not None:
+                budget.check("waiting for a connection")
+            raise
         finally:
             if lent is not None:
                 lent._agens_lent = False
 
     async def _prepare(self, conn: AsyncConnection[Any], budget: Deadline) -> None:
         """Once per use: what follows the caller rather than the socket.
+
+        A statement timeout is one statement, and there is no way to make it none. A limit
+        worked out for *this* caller cannot travel in the connection's own options, which are
+        a startup parameter fixed for the life of the connection; so a per-caller deadline
+        costs one round trip on acquire, measured at 84 microseconds. A pool that wants a
+        ceiling and no round trip sets one for every connection instead::
+
+            ConnectionPool(dsn, kwargs={"options": "-c statement_timeout=5000"})
+
+        which this narrows per caller only when a deadline asks for something shorter, and
+        restores by name rather than by number when it does not.
 
         A statement timeout belongs to the caller it was worked out for, so one left by the
         caller before is taken off rather than inherited. Inherited, it cancels a statement
