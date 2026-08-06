@@ -58,10 +58,17 @@ MAX_IDENTIFIER = 63
 GRAPHS_QUERY = """
 select g.graphname::text,
        n.nspname::text,
-       (select count(*) from pg_catalog.ag_label l where l.graphid = g.oid)::bigint
+       count(l.oid)::bigint
 from pg_catalog.ag_graph g
 join pg_catalog.pg_namespace n on n.oid = g.nspid
+left join pg_catalog.ag_label l on l.graphid = g.oid
+group by g.graphname, n.nspname
 order by g.graphname
+"""
+"""Every graph and how many labels it has.
+
+Counted by a grouped join rather than a subquery per graph, which read the whole of ``ag_label``
+once for each of them: 9 buffers against 141, and 0.294 milliseconds against 1.299.
 """
 
 # The parent is read from the inheritance the server sets up between label tables, which is
@@ -87,7 +94,7 @@ order by l.labid
 # The label is cast in both places it appears. Left uncast, a null in a comparison against
 # nothing else typed gives the server nothing to infer from, and it says so rather than
 # guessing -- which is the same refusal a bare parameter gets as an argument to concat.
-DECLARED_PROPERTIES_QUERY = """
+_DECLARED_PROPERTIES = """
 select l.labname::text,
        p.propname::text,
        format_type(a.atttypid, a.atttypmod),
@@ -96,21 +103,56 @@ from pg_catalog.ag_label_property p
 join pg_catalog.ag_label l on l.oid = p.laboid
 join pg_catalog.ag_graph g on g.oid = l.graphid
 join pg_catalog.pg_attribute a on a.attrelid = l.relid and a.attnum = p.attnum
-where g.graphname = %s and (%s::text is null or l.labname::text = %s::text)
+where g.graphname = %s{label}
 order by l.labname, p.propname
 """
 
-INDEXES_QUERY = """
-select labelname::text, indexname::text, "unique", indexdef
-from pg_catalog.ag_property_indexes
-where graphname = %s and (%s::text is null or labelname::text = %s::text)
-order by labelname, indexname
+DECLARED_PROPERTIES_QUERY = _DECLARED_PROPERTIES.format(label="")
+DECLARED_PROPERTIES_FOR_LABEL = _DECLARED_PROPERTIES.format(
+    label="\n  and l.labname::text = %s"
+)
+
+_INDEXES = """
+select l.labname::text,
+       i.relname::text,
+       x.indisunique,
+       pg_catalog.ag_get_propindexdef(i.oid)
+from pg_catalog.ag_graph g
+join pg_catalog.ag_label l on l.graphid = g.oid
+join pg_catalog.pg_index x on x.indrelid = l.relid
+join pg_catalog.pg_class i on i.oid = x.indexrelid
+where g.graphname = %s{label}
+  and x.indisexclusion = false
+  and i.relkind = 'i'
+  and (x.indexprs is not null
+       or exists (select 1
+                    from pg_catalog.pg_attribute a
+                   where a.attrelid = l.relid
+                     and a.attnum = any(x.indkey::smallint[])
+                     and not a.attisdropped
+                     and a.attgenerated <> ''))
+order by l.labname, i.relname
 """
+"""Every property index of a graph, read from the catalogs rather than through the view.
+
+``ag_property_indexes`` answers the same question, and reading it costs what its other five
+columns cost -- among them ``pg_size_pretty(pg_table_size(...))``, which the planner may not drop
+however few columns are selected, because a volatile expression is not prunable. Reading the
+catalogs starts from the graph instead of filtering every index in the database at the top:
+93 buffers against 1,574, and 0.99 milliseconds against 28.25.
+
+The conditions are the view's own, kept so the two answer alike: not an exclusion constraint's
+index -- that is a uniqueness assertion and belongs to constraints() -- and either an expression
+index or one over a promoted column.
+"""
+
+INDEXES_QUERY = _INDEXES.format(label="")
+INDEXES_FOR_LABEL = _INDEXES.format(label="\n  and l.labname::text = %s")
 
 # Restricted to the two types a graph constraint can be. Asking about a not-null constraint or
 # a primary key -- which every label has -- reports an invalid constraint type instead of
 # nothing, so those are not asked about. 'x' is a uniqueness assertion and 'c' a check.
-CONSTRAINTS_QUERY = """
+_CONSTRAINTS = """
 select l.labname::text,
        c.conname::text,
        c.contype = 'x',
@@ -119,18 +161,35 @@ from pg_catalog.pg_constraint c
 join pg_catalog.ag_label l on l.relid = c.conrelid
 join pg_catalog.ag_graph g on g.oid = l.graphid
 where g.graphname = %s
-  and c.contype in ('x', 'c')
-  and (%s::text is null or l.labname::text = %s::text)
+  and c.contype in ('x', 'c'){label}
 order by l.labname, c.conname
+"""
+
+CONSTRAINTS_QUERY = _CONSTRAINTS.format(label="")
+CONSTRAINTS_FOR_LABEL = _CONSTRAINTS.format(label="\n  and l.labname::text = %s")
+
+ASKING_FOR_ONE_LABEL = """Why each of the three above is two statement texts and not one.
+
+One text holding ``(%s::text is null or labname = %s::text)`` has to plan for both.
+
+Once psycopg prepares it -- which it does on the sixth execution -- the generic plan is the one
+both get, and that plan estimates one row of ``ag_label`` against the eighty-seven to a hundred it
+reads, abandons the index and nested-loops instead, for six and a half to eleven times the buffers.
+Two texts each plan for what they are.
 """
 
 
 def element_count_query(graph: str, *, edges: bool = False) -> str:
-    """Count elements per label without reading a single property.
+    """Count elements per label, grouping on the label id inside every element's identity.
 
-    The label id is part of every element's identity, so grouping on it needs nothing from the
-    row but its id -- no property map decoded, no wider column read. The graph's name is quoted
-    into the statement because a schema cannot be bound as a parameter.
+    Nothing decodes a property map: the group key is a function of the id column alone. Whether
+    the *heap* is read anyway is the planner's to decide and often yes -- against a narrow label
+    it prefers a sequential scan to an index-only one, correctly, because there are fewer heap
+    pages than index pages. And an edge can never avoid it: the engine creates an edge's id index
+    as BRIN (``parse_utilcmd.c``, ``edge_id_idx->accessMethod = "brin"``), and BRIN carries no
+    tuple pointers, so there is no index-only scan for it to choose.
+
+    The graph's name is quoted into the statement because a schema cannot be bound as a parameter.
     """
     table = "ag_edge" if edges else "ag_vertex"
     return (

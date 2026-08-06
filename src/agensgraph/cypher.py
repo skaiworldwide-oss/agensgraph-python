@@ -29,6 +29,7 @@ __all__ = [
     "changes_graph_path",
     "check_bindable_positions",
     "check_can_wrap",
+    "needs_a_reading_first",
     "quote_identifier",
     "quote_string",
     "without_literals",
@@ -325,6 +326,30 @@ _WRITE_WORD = re.compile(
     r'(?<![a-z0-9_.":])(create|insert|merge|set|delete|remove|detach)(?![a-z0-9_]|\s*:)'
 )
 _WRITE_WORDS = tuple(WRITE_GROUPS)
+
+def needs_a_reading_first(statement: str) -> bool:
+    """Whether the write counters have to be read before a statement as well as after.
+
+    They do not for a graph write that returns no rows, and that is the common counted
+    statement: such a write is a graph write at the top, the server zeroes all five counters for
+    one, and so reading them afterwards says exactly what it did. Skipping the reading
+    beforehand takes a round trip out of it.
+
+    They do for everything else. A write that returns rows is a select at the top, and only the
+    groups its clauses can move are zeroed -- the rest still hold whatever came before. And a
+    statement with no write clause of its own may still move a counter, by calling a function
+    that writes; nothing is zeroed for that one, so only the difference between two readings
+    finds it.
+
+    Read from the text, and safe in the direction that matters: the test can only find a
+    ``return`` that is not the terminal one -- inside a ``call`` body, say -- and never miss one
+    that is, so finding none means there is none.
+    """
+    lowered = statement.lower()
+    if "return" in lowered or "finish" in lowered:
+        return True
+    return not writable_counters(statement)
+
 
 WRAP = "select * from (\n{statement}\n) as {alias}"
 """How a Cypher statement is made readable by a server-side cursor.

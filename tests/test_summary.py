@@ -224,3 +224,51 @@ class TestAWriteThatNamesNoClause:
             assert counts.inserted_vertices == 1
         finally:
             agens.execute("drop function writes_one()")
+
+
+@pytest.mark.server
+class TestHowManyStatementsCountingCosts:
+    """The counters live on the session and are read by a statement of their own, so asking for
+    them costs round trips. How many depends on what the server zeroes."""
+
+    def sent(self, conn, run) -> list[str]:  # type: ignore[no-untyped-def]
+        from agensgraph import connection as connection_module
+
+        seen: list[str] = []
+        real = connection_module.Cursor.execute
+
+        def counting(self, query, params=None, **kwargs):  # type: ignore[no-untyped-def]
+            seen.append(str(query))
+            return real(self, query, params, **kwargs)
+
+        connection_module.Cursor.execute = counting  # type: ignore[method-assign, assignment]
+        try:
+            run()
+        finally:
+            connection_module.Cursor.execute = real  # type: ignore[method-assign]
+        return seen
+
+    def test_a_write_that_returns_nothing_is_read_once(self, agens) -> None:  # type: ignore[no-untyped-def]
+        """The server zeroes all five for it, so the reading afterwards is the whole answer."""
+        agens.execute("create vlabel t")
+        sent = self.sent(agens, lambda: agens.execute_query("create (:t {n: 1})", counts_=True))
+        assert len(sent) == 2, sent
+
+    def test_a_write_that_returns_rows_is_read_twice(self, agens) -> None:  # type: ignore[no-untyped-def]
+        """Only the groups its clauses can move are zeroed, so the rest need a reading before."""
+        agens.execute("create vlabel t")
+        sent = self.sent(
+            agens, lambda: agens.execute_query("create (:t {n: 1}) return 1", counts_=True)
+        )
+        assert len(sent) == 3, sent
+
+    def test_a_statement_with_no_write_clause_is_read_twice(self, agens) -> None:  # type: ignore[no-untyped-def]
+        """It may still move a counter by calling something that writes, and nothing is zeroed
+        for that -- so only the difference between two readings finds it."""
+        sent = self.sent(agens, lambda: agens.execute_query("select 1", counts_=True))
+        assert len(sent) == 3, sent
+
+    def test_it_still_counts_what_the_write_did(self, agens) -> None:  # type: ignore[no-untyped-def]
+        agens.execute("create vlabel t")
+        result = agens.execute_query("create (:t {n: 1}), (:t {n: 2})", counts_=True)
+        assert result.counts.inserted_vertices == 2

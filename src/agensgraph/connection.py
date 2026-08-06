@@ -47,12 +47,20 @@ from .bulk import (
 )
 from .capabilities import VECTOR_AVAILABLE_QUERY, VECTOR_VERSION_QUERY
 from .columnar import CHUNK
-from .cypher import changes_graph_path, check_bindable_positions, wrap_for_cursor
+from .cypher import (
+    changes_graph_path,
+    check_bindable_positions,
+    needs_a_reading_first,
+    wrap_for_cursor,
+)
 from .errors import BatchFailed, NoEnclosingTransaction, redact_details
 from .introspect import (
+    CONSTRAINTS_FOR_LABEL,
     CONSTRAINTS_QUERY,
+    DECLARED_PROPERTIES_FOR_LABEL,
     DECLARED_PROPERTIES_QUERY,
     GRAPHS_QUERY,
+    INDEXES_FOR_LABEL,
     INDEXES_QUERY,
     LABELS_QUERY,
     Check,
@@ -319,7 +327,7 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
                     self._check_binary()
                     cursor.format = psycopg.pq.Format.BINARY
                 before: Sequence[int] | None = None
-                if counts_:
+                if counts_ and needs_a_reading_first(text):
                     before = self._counters()
                 try:
                     cursor.execute(query, params, prepare=prepare_)
@@ -599,13 +607,16 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
         before 2.18 nothing can be promoted at all and this is always empty.
         """
         name = self._graph_of(graph)
-        rows = self._fetch(DECLARED_PROPERTIES_QUERY, (name, label, label))
+        query = DECLARED_PROPERTIES_QUERY if label is None else DECLARED_PROPERTIES_FOR_LABEL
+        rows = self._fetch(query, (name,) if label is None else (name, label))
         return [DeclaredProperty(*row) for row in rows]
 
     def indexes(self, label: str | None = None, *, graph: str | None = None) -> list[Index]:
         """Every property index. A uniqueness constraint is not one; see :meth:`constraints`."""
         name = self._graph_of(graph)
-        return [Index(*row) for row in self._fetch(INDEXES_QUERY, (name, label, label))]
+        query = INDEXES_QUERY if label is None else INDEXES_FOR_LABEL
+        params = (name,) if label is None else (name, label)
+        return [Index(*row) for row in self._fetch(query, params)]
 
     def constraints(
         self, label: str | None = None, *, graph: str | None = None
@@ -617,7 +628,8 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
         would otherwise be invisible.
         """
         name = self._graph_of(graph)
-        rows = self._fetch(CONSTRAINTS_QUERY, (name, label, label))
+        query = CONSTRAINTS_QUERY if label is None else CONSTRAINTS_FOR_LABEL
+        rows = self._fetch(query, (name,) if label is None else (name, label))
         return [Constraint(*row) for row in rows]
 
     def pipeline_batch(
@@ -776,8 +788,9 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
     def element_counts(self, *, graph: str | None = None) -> dict[str, int]:
         """How many vertices and edges each label holds.
 
-        Two statements and no property read: the label id is part of every element's identity,
-        so counting per label needs nothing from a row but its id.
+        Three statements -- the labels, then the vertices and the edges -- and no property read:
+        the label id is part of every element's identity, so counting per label needs nothing
+        from a row but its id.
         """
         name = self._graph_of(graph)
         names = {label.id: label.name for label in self.labels(graph=name)}

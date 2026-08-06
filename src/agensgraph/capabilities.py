@@ -171,9 +171,7 @@ sparse vectors in 0.7.0. A caller that has to know cannot read it off a boolean.
 """
 
 VECTOR_AVAILABLE_QUERY = """
-select count(*) > 0 from pg_catalog.pg_type t
-join pg_catalog.pg_namespace n on n.oid = t.typnamespace
-where t.typname = 'vector'
+select count(*) > 0 from pg_catalog.pg_type t where t.typname = 'vector'
 """
 """Whether vectors can be read on this connection.
 
