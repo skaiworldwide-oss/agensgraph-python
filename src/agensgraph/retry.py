@@ -55,7 +55,8 @@ REJECTION_COST = 5
 """What a rejection costs. Less, because being turned away is about this request."""
 
 SUCCESS_CREDIT = 1
-"""What a success returns. Roughly ten successes pay for one transient retry."""
+"""What a success returns. So fourteen successes pay for one transient retry and five for
+one rejection, which is the ratio those two costs are chosen to give."""
 
 
 def full_jitter(

@@ -1,9 +1,9 @@
 """Loading a lot of elements at once.
 
 Copying is the fast way in, and the reason is that it is one stream rather than a statement per
-row. Measured on this driver against ten thousand vertices: **223,000 rows a second** by copying,
-against 140,000 for a single ``UNWIND ... CREATE`` and 47,000 for one statement per row -- so
-1.6 times the best Cypher can do and 4.7 times the obvious approach.
+row. Measured on this driver against twenty thousand vertices: **225,000 rows a second** by
+copying, against 140,000 for a single ``UNWIND ... CREATE`` and 5,400 for one statement per row --
+so 1.6 times the best Cypher can do and **thirty-two** times the obvious approach.
 
 An identity does not have to be supplied. A label table's ``id`` column has a default that builds
 the graph id from the label's own id and the label's sequence, so copying only the property map

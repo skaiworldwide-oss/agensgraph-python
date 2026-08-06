@@ -9,7 +9,8 @@ been paid. Research collected for this driver measured a *no-op* span at 38,734 
 against 13,603 to parse an entire vertex, and 5.37 µs of wall clock against 7.8 ns for a flag.
 That figure is not reproduced here, because ``opentelemetry-api`` is not installed in this
 tree. What is measured here is what a caller with no tracing pays to ask for a span: **316
-nanoseconds**, being a call, a flag read and entering an object that does nothing. The flag
+nanoseconds**, being a call, a flag read and entering an object that does nothing --
+278 on a later run, so read it as a few hundred rather than as a figure. The flag
 itself reads in 40, and closing that gap would mean putting the test at every call site and
 writing the body twice -- 270 nanoseconds against a round trip of about 87 microseconds. A span
 is taken per statement and never per row.

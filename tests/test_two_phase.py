@@ -1,8 +1,9 @@
 """Committing a graph write in two phases.
 
-The plan left this undefined, so it is settled here rather than in prose: a graph write survives
-``PREPARE TRANSACTION`` and the later ``COMMIT PREPARED`` or ``ROLLBACK PREPARED``, including a write
-that returned rows, which the server plans as a select at the top rather than as a graph write.
+A graph write survives ``PREPARE TRANSACTION`` and the later ``COMMIT PREPARED`` or
+``ROLLBACK PREPARED``, including a write that returned rows, which the server plans as a select at
+the top rather than as a graph write. Settled here rather than in prose, because a driver that
+declined to support it would have to say so and this one has nothing to say.
 
 Nothing in the driver implements this. psycopg's own two-phase methods work unchanged, and the one
 case worth reporting well -- a server left at the default ``max_prepared_transactions = 0`` -- it

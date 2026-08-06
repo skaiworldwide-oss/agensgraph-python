@@ -55,8 +55,10 @@ def read_numbers_exactly(enabled: bool = True) -> None:
     holds decimals, and one whose map was already touched holds floats. Two rows of one result can
     disagree that way.
 
-    Costs about 3.7 times as much to decode a map of numbers, and gives back every digit the server
-    holds. An integer is read exactly either way.
+    What it costs depends on what the map holds, because only a non-integer takes the slower path.
+    Measured on maps of forty keys: a map of integers is unchanged, a mixed one costs twice as
+    much, one of non-integers 4.4 times, and a single embedding of 1536 floats 5.8 times. An
+    integer is read exactly either way, however long.
     """
     global _decode
     _decode = _AS_DECIMAL if enabled else _AS_FLOAT

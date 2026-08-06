@@ -62,7 +62,10 @@ def engine(dsn: str):  # type: ignore[no-untyped-def]
 
 class TestTheDialectIsShort:
     def test_it_is_a_handful_of_lines(self) -> None:
-        """The plan's claim, asserted so that it cannot drift: around fifty lines, not two hundred."""
+        """Asserted so it cannot drift: a handful of lines, not two hundred.
+
+        The length is the point. A dialect this short is what a complete PEP 249 surface buys, so
+        a dialect that grew would mean something had gone missing from it."""
         lines = inspect.getsource(AgensGraphDialect).splitlines()
         code = [line for line in lines if line.strip() and not line.strip().startswith("#")]
         assert len(code) < 20, f"the dialect needed {len(code)} lines, so something is missing"

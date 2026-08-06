@@ -20,12 +20,17 @@ track, which is most of what makes a large result cheap:
 
 | building 200,000 vertices | |
 |---|---|
-| as an ordinary object with `__slots__` | 176 ms |
-| **as an untracked struct** | **33 ms** |
+| with `__slots__` and a `__setattr__` that refuses writes | 165 ms |
+| with `__slots__` and ordinary assignment | 89 ms |
+| **as an untracked struct** | **63 ms** |
 
-Reading 200,000 vertices end to end went from **1564 ms to 986 ms** for the same reason. Nothing here
-can take part in a reference cycle — a property map holds only what JSON can — so going untracked
-costs nothing.
+Most of the first row is the guard, not the storage: routing every field through
+`object.__setattr__` to make a value immutable costs more than the value does. The public surface
+is read-only anyway, so it is read-only by having no setters rather than by refusing writes.
+
+Reading 200,000 vertices end to end is **986 ms**, against 1564 for the same read of tracked
+objects. Nothing here can take part in a reference cycle — a property map holds only what JSON can
+— so going untracked costs nothing.
 
 The public surface is read-only: `id`, `label`, `properties`, and `start`/`end` on an edge have no
 setters.
@@ -348,7 +353,7 @@ with agensgraph.paused_collection():
 
 Worth about **1.03×** on a read of 200,000 vertices — and that is the point: a row is a struct the
 collector does not track, so a result is almost entirely invisible to it. The same read against rows
-built as ordinary objects was **1.69×**, which is the cost this avoids by not being tracked at all.
+built as ordinary objects is **1.69×**, which is what being untracked saves.
 Reference counting still frees as usual; only the collection of cycles waits.
 
 `agensgraph.freeze_after_import()` is the other half — call it once at startup and every later
@@ -721,7 +726,7 @@ it costs three times as much before anything is parsed, and seven times once the
 The numbers themselves are read by the same C decoder the property map is read by, since the list a
 vector prints as is also JSON: 100 microseconds against 300 for a hand-rolled loop, three times.
 A text that decoder will not take, such as a leading `+`, falls back to reading it a number at a
-time, so nothing that used to be accepted is refused.
+time, so both spellings are read.
 
 Sending is where the largest saving is, because every other route formats each number as decimal
 text:

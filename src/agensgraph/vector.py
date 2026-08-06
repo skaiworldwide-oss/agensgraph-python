@@ -133,7 +133,7 @@ def parse_vector_values(text: str | bytes, *, half: bool = False) -> array[float
     property map is read by rather than one Python call per number: 100 microseconds against 300
     for 1536 dimensions, three times. A text the decoder will not take -- a leading ``+``, which
     JSON forbids and ``float`` accepts -- falls back to reading it a number at a time, so nothing
-    this used to accept is refused now.
+    ``float`` accepts falls back to reading it a number at a time, so both spellings are read.
     """
     raw = text if isinstance(text, bytes) else text.encode()
     raw = raw.strip()
@@ -277,14 +277,16 @@ class Vector:
     Measured, one embedding of 1536 dimensions arriving in the composite rendering:
 
     ==========================================  ========
-    a list of Python floats, as this once did      33.8 µs
-    an array of singles                             1.74 µs
-    **this, untouched**                             **0.49 µs**
-    this, with its numbers read                     2.67 µs
+    a list of Python floats                        27.4 µs
+    an array of singles                             1.44 µs
+    **this, untouched**                             **0.80 µs**
+    this, with its numbers read                     3.09 µs
     ==========================================  ========
 
-    So sixty-nine times cheaper to read and ignore, and thirteen times cheaper to read and use.
-    It also holds four bytes a number rather than eight plus a pointer plus an object header.
+    So thirty-four times cheaper to read and ignore, and nine times cheaper to read and use --
+    all four built from the same wire bytes, so the rows are comparable with each other and the
+    ratios are of those rows. It also holds four bytes a number rather than eight plus a pointer
+    plus an object header.
 
     **Ask for the composite rendering when reading vectors.** Those figures are that rendering's,
     and the text one is the default. A vector of 1536 dimensions prints as about fifteen kilobytes
