@@ -16,25 +16,14 @@ pip install agensgraph-python
 ## Graph values
 
 A vertex, an edge and a path are read from the wire. They are structs the garbage collector does not
-track, which is most of what makes a large result cheap:
+track, which is most of what makes a large result cheap: nothing here can take part in a reference
+cycle — a property map holds only what JSON can — so going untracked loses nothing and keeps a
+large result out of the collector's way entirely.
 
-| building 200,000 vertices | |
-|---|---|
-| with `__slots__` and a `__setattr__` that refuses writes | 165 ms |
-| with `__slots__` and ordinary assignment | 89 ms |
-| **as an untracked struct** | **63 ms** |
-
-Most of the first row is the guard, not the storage: routing every field through
-`object.__setattr__` to make a value immutable costs more than the value does. The public surface
-is read-only anyway, so it is read-only by having no setters rather than by refusing writes.
-
-Reading 200,000 vertices end to end is **986 ms**, against 1564 for the same read of tracked
-objects. Nothing here can take part in a reference cycle — a property map holds only what JSON can
-— so going untracked costs nothing.
-
-The public surface is read-only: `id`, `label`, `properties`, and `start`/`end` on an edge have no
-setters.
-
+The public surface is read-only — `id`, `label`, `properties`, and `start`/`end` on an edge have no
+setters — and it is read-only by having none rather than by refusing writes. That is not only
+taste: routing every field through a `__setattr__` that raises costs more than storing the value
+does, on every element of every result.
 
 A vertex and an edge are values rather than handles. Each is immutable, compares and
 hashes on its identity alone, and so can be used as a dictionary key or a set member.
@@ -74,8 +63,8 @@ reading that needs no table at all.
 A row is a tuple and the column names are read once per result into `result.keys`, so there is no
 dict per row and no name scanned per lookup. The same vertex appearing in many rows of a join is
 many objects that compare equal rather than one shared object: collapsing them saves one property
-decode per repeat, and on a join of three hundred rows with kilobyte property maps that is 25 µs of
-a 4 ms read — measured, against a pass over every result to find out whether there are any repeats
+decode per repeat, and on a join of three hundred rows with kilobyte property maps that is under a
+hundredth of the read — against a pass over every result to find out whether there are any repeats
 at all.
 
 A label or a property key cannot be bound as a parameter — the grammar has no place for one
@@ -132,9 +121,9 @@ order they are in.
 There is no `graph_` and no `timeout_`, and both are absences with a reason. Selecting a graph is a
 statement, is undone by a rollback, and drops the label table; it belongs on the connection or on
 the pool, once, rather than once per statement. Bounding a statement's time is two more statements,
-one to set the limit and one to put it back — measured, `return 1` costs 161 µs and the same read
-between them costs 373, and against a server a network away those are two more round trips. So a
-deadline belongs where it is paid once for many statements: `pool.connection(deadline=…)`, or
+one to set the limit and one to put it back, which measures **2.3×** a bare `return 1` on a local
+server and is two more round trips against one a network away. So a deadline belongs where it is
+paid once for many statements: `pool.connection(deadline=…)`, or
 `options=-c statement_timeout=…` on the connection.
 
 ```python
@@ -194,12 +183,9 @@ that cannot take a parameter reports a syntax error of its own and is left to th
 
 ### Sending a property map
 
-Rendered with msgspec, which is where most of the cost of a write is:
-
-| | `json.dumps` | this |
-|---|---|---|
-| a 1024-float embedding | 681 µs | **61 µs** |
-| a small map | 2.22 µs | **0.52 µs** |
+Rendered with msgspec, which is where most of the cost of a write is: several times faster than
+the standard library on a small map, and about ten times on an embedding, where the numbers
+dominate.
 
 `NaN` and the infinities are refused. jsonb has no way to store one, and encoding it would write
 `null` instead — which is the wrong value rather than an error. The check runs only when the output
@@ -256,21 +242,17 @@ from the server beyond the answer itself.
 The same query can be asked for in the composite rendering instead, per statement. That
 form leaves out the label name, so it needs a label table for the connection.
 
-It reads faster on every shape, and by how much depends on the shape, because it trades
-bandwidth for parsing — every element repeats its column oids, its lengths and a tuple id the
-text form never writes:
+**Ask for it when the result is large and the link is not the bottleneck.** It trades bandwidth
+for parsing: every element repeats its column oids, its lengths and a tuple id the text form never
+writes, so a vertex is about a fifth more bytes and an edge several times more. In exchange the
+driver reads lengths instead of measuring where each value ends.
 
-| | text | composite | | on the wire |
-|---|---|---|---|---|
-| whole vertices, 4,096 rows | 14.6 ms | 12.8 ms | **1.14×** | 205 B → 242 B |
-| edges | 2.1 ms | 1.4 ms | **1.45×** | 23 B → 83 B |
-| paths | 11.7 ms | 9.0 ms | **1.30×** | 437 B → 639 B |
-| `nodes(p)` | 7.1 ms | 6.2 ms | **1.15×** | |
+That trade pays most on edges and paths and barely at all on whole vertices, and it stops paying
+on a short result, where the round trip costs more than either parse — a few hundred rows of whole
+vertices is slower in the composite rendering than in text. Embeddings are the clearest case for
+it, because a vector's text is decimal and its binary is the numbers themselves.
 
-So it is worth asking for on a result whose parsing dominates, and worth *not* asking for
-across a slow link where the extra bytes cost more than the parse saves. Embeddings are the
-clearest case for it — see below, where it is 7× — because a vector's text is decimal and its
-binary is the numbers themselves.
+When in doubt, leave it off and turn it on for the one query that is slow.
 
 Both renderings produce the same objects, and the test suite asserts that against values
 the server itself produced.
@@ -336,9 +318,9 @@ For a process that handles one request and exits, or a serverless one that may b
 requests, `NullConnectionPool` keeps nothing: one connection per caller, closed when they are done.
 Everything else is the same — the graph is selected, the version is checked, `configure` and `setup`
 run, the counters are counted — so moving between the two is a change of class and nothing else.
-Measured against this pool on the same box, a borrow and one statement costs **4.2 ms against
-0.5 ms**, which is what connecting costs and is the reason not to choose it for a process that
-lives long enough to reuse a connection.
+A borrow and one statement costs about **eight times** what it costs from a pool that keeps its
+connections, which is what connecting costs and is the reason not to choose it for a process that
+lives long enough to reuse one.
 
 ```python
 pool = agensgraph.NullConnectionPool("host=localhost dbname=graph", graph="social")
@@ -374,14 +356,9 @@ frame = to_pandas(result)
 Installed as needed, and imported only where used: `agensgraph-python[arrow]`, `[pandas]`,
 `[polars]`.
 
-Measured on 200,000 vertices of five properties, against building one list per column and letting
-Arrow infer the types:
-
-| | a value at a time | a column at a time |
-|---|---|---|
-| an Arrow table | 1248 ms | **104 ms** |
-| a pandas frame | 1335 ms | **150 ms** |
-| a polars frame | 1272 ms | **114 ms** |
+Each column is built as a column, with its type declared rather than inferred, which is about an
+order of magnitude faster than assembling one Python value at a time — for Arrow, pandas and polars
+alike.
 
 **A whole vertex is a struct** of its identity, its label and its property map — and the map is JSON
 text taken from the bytes it arrived in, so it is never decoded into a dict:
@@ -391,7 +368,7 @@ table = to_arrow(conn.execute_query("MATCH (n:Person) RETURN n"))
 # n: struct<id: uint64, label: dictionary<values=string, indices=int32>, properties: string>
 ```
 
-219 ms for those 200,000 rows, against 864 for building a dict per row. An edge carries `start` and
+Several times faster than building a dict per row, and it holds less. An edge carries `start` and
 `end` as the same `uint64` a vertex's `id` is, so the join is an integer join. A path is a struct of
 a list of vertices and a list of edges. `Layout` says what to do where more than one answer is
 defensible — `elements="columns"` to spread a vertex over `n.id`, `n.label` and `n.properties`,
@@ -399,8 +376,8 @@ defensible — `elements="columns"` to spread a vertex over `n.id`, `n.label` an
 pull named fields out of the map, `properties="skip"` to leave it out.
 
 **An embedding becomes `FixedSizeList<float32>`** straight from the wire bytes, with no Python float
-in between. Ask for the binary rendering and 20,000 vectors of 384 dimensions export in 80 ms rather
-than 4881, in half the memory:
+in between. Ask for the composite rendering and 20,000 vectors of 384 dimensions export **sixty
+times faster**, in half the memory:
 
 ```python
 result = conn.execute_query("MATCH (n:Emb) RETURN n.v AS v", binary_=True)
@@ -426,9 +403,8 @@ conn.load_vertex_frame("Person", table)               # each column is a propert
 conn.load_edge_frame("KNOWS", edges)                  # start and end are packed identities
 ```
 
-1.5× an Arrow table handed to `load_vertices()` as mappings, and no more than that: of 1879 ms for
-200,000 vertices, 1810 is the server's own ingest. The client's share is what falls, from 1024 ms to
-125.
+1.5× an Arrow table handed to `load_vertices()` as mappings, and no more than that, because almost
+all of a load is the server's own ingest. The client's share is what falls, by about eight times.
 
 ## Numbers in a property map
 
@@ -451,10 +427,12 @@ agensgraph.read_numbers_exactly()      # once, at startup
 ```
 
 Every non-integer then reads as a `Decimal` keeping whatever the server holds — `1e-400` included.
-It costs about **3.7×** to decode a map of numbers, and integers are exact either way. It applies
-to a property map and to a bare jsonb column alike: `RETURN n` and `RETURN n.p` agree about the
-same stored value, which they did not while the second was read by the standard library. Writing a
-`Decimal` back stores a JSON number, so the round trip returns the `Decimal` that was written.
+What it costs depends on what the map holds, since only a non-integer takes the slower path: a map
+of integers is unchanged, a mixed one costs twice as much, one of non-integers **4.4×**, and an
+embedding of 1536 floats **5.8×**. An integer is exact either way, however long. It applies to a
+property map and to a bare jsonb column alike, so `RETURN n` and `RETURN n.p` agree about the same
+stored value. Writing a `Decimal` back stores a JSON number, so the round trip returns the
+`Decimal` that was written.
 
 ## Sending a burst of statements
 
@@ -524,8 +502,8 @@ by_key = conn.identity_map("Doc", "key")
 conn.load_edges("Cites", [(by_key["a"], by_key["b"], {"weight": 1})])
 ```
 
-Copying rather than a statement per row: measured at **223,000 vertices a second**, against
-140,000 for a single `UNWIND ... CREATE` and 47,000 one at a time. No identity is supplied — the
+Copying rather than a statement per row: **thirty-two times** one statement at a time, and 1.6×
+the best a single `UNWIND ... CREATE` can do. No identity is supplied — the
 column's default produces exactly the identities a `CREATE` would. Edges need the two they join,
 which is what `identity_map` reads, in one statement for the whole label.
 
@@ -714,36 +692,21 @@ v.tolist()          # an ordinary list, if you want one
 It is not a `list` — `isinstance(v, list)` is `False` and `json.dumps(v)` raises — but it compares
 equal to one, which is the part that would otherwise go wrong quietly.
 
-| reading 300 embeddings of 1536 dimensions, per row | |
-|---|---|
-| **binary, values read** | **29.9 µs** |
-| text, values untouched | 92.8 µs |
-| text, values read | 208.5 µs |
+**Ask for `binary_=True` when you read vectors** — this is the one place the rendering makes a
+large difference rather than a small one. A vector of 1536 dimensions prints as roughly fifteen
+kilobytes of decimal against six of wire bytes, so the text form costs about three times as much
+before anything is parsed and seven times once the numbers are read.
 
-**Ask for `binary_=True` when you read vectors.** The text rendering is the default, and a
-1536-dimension vector prints as about fifteen kilobytes of decimal against six of wire bytes — so
-it costs three times as much before anything is parsed, and seven times once the numbers are read.
-The numbers themselves are read by the same C decoder the property map is read by, since the list a
-vector prints as is also JSON: 100 microseconds against 300 for a hand-rolled loop, three times.
-A text that decoder will not take, such as a leading `+`, falls back to reading it a number at a
-time, so both spellings are read.
+The numbers are read by the same C decoder the property map is read by, since the list a vector
+prints as is also JSON — several times quicker than a call per number. A text that decoder will not
+take, such as a leading `+`, falls back to reading it a number at a time, so both spellings are
+read.
 
-Sending is where the largest saving is, because every other route formats each number as decimal
-text:
-
-| sending one 1536-dimension embedding | |
-|---|---|
-| a `list` with a `::vector(1536)` cast | 2.55 ms |
-| a string built by hand | 0.79 ms |
-| **`Vector(values)`** | **0.32 ms** |
-
-and in bulk, loading 20,000 embeddings of 768 dimensions:
-
-| | rows/s |
-|---|---|
-| one statement at a time | 2,002 |
-| `COPY` in text | 3,282 |
-| **`COPY` binary with `Vector`** | **31,396** |
+**Send a `Vector`, not a list and not a string you built.** Sending is where the largest saving
+is, because every other route formats each number as decimal for the server to parse back: a list
+cast to `vector(1536)` costs about eight times as much, and a hand-built string about two and a
+half. In bulk the gap is wider still — `COPY` in binary with `Vector` loads an order of magnitude
+faster than `COPY` in text, and more than that against a statement at a time.
 
 ```python
 from agensgraph.vector import Vector
@@ -822,9 +785,9 @@ caller asking what the driver sends wants the round trips they did not write. `e
 round trip — sending the statement until the server has answered — and not the reading of the rows
 afterwards.
 
-Off costs a boolean test — measured at 165 µs per statement with a logger attached against 165
-with none, and the reporting adds about 360 ns to a statement whose round trip is 140 µs. A clock
-is not read, and a timer is not even allocated, unless something is going to ask for the number.
+Off costs a boolean test — a statement takes the same time with a logger attached as with none,
+and the reporting adds about a quarter of a per cent to a statement's round trip. A clock is not
+read, and a timer is not even allocated, unless something is going to ask for the number.
 Spans are per statement and never per row, the tracing API is imported only when asked for and the
 SDK never, the record carries an opaque connection number rather than the connection's settings,
 and no parameter value ever reaches a span.
@@ -885,7 +848,6 @@ colon and Cypher receives the label:
 conn.execute(text(r"MATCH (n\:Person) RETURN n"))
 ```
 
-
 ## When the network goes quiet
 
 A connection whose packets stop being delivered waits for the kernel, and on Linux that is **two hours
@@ -909,10 +871,10 @@ waiting for a reply has transmitted nothing. Measured against a server whose tra
 
 | | outcome |
 |---|---|
-| nothing set | still waiting after 22 s |
-| **`tcp_user_timeout=3000` alone** | **still waiting after 22 s** |
-| `keepalives_idle=1` + `tcp_user_timeout=3000` | failed after 3.1 s |
-| `keepalives_idle=1` alone | failed after 4.1 s |
+| nothing set | still waiting when the test gave up |
+| **`tcp_user_timeout=3000` alone** | **still waiting when the test gave up** |
+| `keepalives_idle=1` + `tcp_user_timeout=3000` | failed within seconds |
+| `keepalives_idle=1` alone | failed within seconds |
 
 So `tcp_user_timeout` is useful *alongside* keepalive — it shortens how long the probing may fail — and
 useless instead of it. It is left unset by default because it also applies while sending, where too
