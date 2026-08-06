@@ -60,6 +60,19 @@ p[0], p[1]    # first vertex, first edge
 p.length      # hop count
 ```
 
+`label` is the label a vertex was created with, and it is in the value the server sent. Its
+ancestry is not, and is not carried: `labels(n)` is a Cypher function and the server answers it
+with the row — `MATCH (n:derived) RETURN n, labels(n)` gives `["derived", "base"]`, own first.
+Carrying it on the vertex would put a label-table lookup on the text rendering, which is the one
+reading that needs no table at all.
+
+A row is a tuple and the column names are read once per result into `result.keys`, so there is no
+dict per row and no name scanned per lookup. The same vertex appearing in many rows of a join is
+many objects that compare equal rather than one shared object: collapsing them saves one property
+decode per repeat, and on a join of three hundred rows with kilobyte property maps that is 25 µs of
+a 4 ms read — measured, against a pass over every result to find out whether there are any repeats
+at all.
+
 A label or a property key cannot be bound as a parameter — the grammar has no place for one
 there — so a statement naming one dynamically has to carry it in its text. `agensgraph.cypher`
 is where that quoting lives:

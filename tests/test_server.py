@@ -609,3 +609,72 @@ class TestRowDataInAFailure:
         assert "alice@example.com" not in str(caught.value)
         assert "alice@example.com" in caught.value.diag.message_detail
         assert caught.value.sqlstate is not None
+
+
+class TestThreeThingsTheObjectModelDoesNotDo:
+    """Three shapes a graph driver is often expected to have, and the measurement behind each.
+
+    Rows are tuples with the names read once, so there is no dict per row and no name scanned per
+    lookup, and nothing else has to hold them. Identity is not deduplicated across a result,
+    because on the shape that would benefit it saves twenty five microseconds of a four
+    millisecond read. And a vertex carries its own label but not its ancestry, because the server
+    answers that per query and carrying it would put a table lookup on the one reading that needs
+    no table.
+    """
+
+    @pytest.fixture
+    def joined(self, graph: Connection[object]) -> Connection[object]:
+        graph.execute("create vlabel hub")
+        graph.execute("create vlabel leaf")
+        graph.execute("create elabel link")
+        graph.execute("create (:hub {n: 0})")
+        for i in range(20):
+            graph.execute(f"create (:leaf {{n: {i}}})")
+        graph.execute("match (h:hub), (l:leaf) create (h)-[:link]->(l)")
+        return graph
+
+    def test_a_row_is_a_tuple_and_the_names_are_read_once(
+        self, graph: Connection[object], dsn: str
+    ) -> None:
+        """Not a dict per row, and not a name scanned per lookup."""
+        name = graph.execute("select current_setting('graph_path')").fetchone()[0]
+        with agensgraph.connect(dsn) as conn:
+            conn.graph(name)
+            result = conn.execute_query("match (n:person) return n, n.name")
+        assert all(type(row) is tuple for row in result.records)
+        assert result.keys == ["n", "name"]
+
+    def test_the_same_vertex_in_many_rows_is_equal_but_not_identical(
+        self, joined: Connection[object], dsn: str
+    ) -> None:
+        """Deduplicating it would save one decode per repeat, which is not worth a pass over
+        every result to find out whether there are any repeats."""
+        name = joined.execute("select current_setting('graph_path')").fetchone()[0]
+        with agensgraph.connect(dsn) as conn:
+            conn.graph(name)
+            rows = conn.execute_query(
+                "match (h:hub)-[:link]->(l:leaf) return h, l"
+            ).records
+        hubs = [row[0] for row in rows]
+        assert len(hubs) == 20
+        assert len(set(hubs)) == 1, "they are one vertex"
+        assert len({id(hub) for hub in hubs}) == 20, "and twenty objects"
+
+    def test_ancestry_is_asked_of_the_server_rather_than_carried(
+        self, graph: Connection[object], dsn: str
+    ) -> None:
+        """``label()`` is the label a vertex was created with, which it carries; ``labels()`` is
+        the ancestry, own first, which lives in the catalog and is not in the value."""
+        name = graph.execute("select current_setting('graph_path')").fetchone()[0]
+        with agensgraph.connect(dsn) as conn:
+            conn.graph(name)
+            conn.execute("create vlabel base")
+            conn.execute("create vlabel derived inherits (base)")
+            conn.execute("create (:derived {n: 1})")
+            conn.refresh_labels()
+            result = conn.execute_query("match (n:derived) return n, label(n), labels(n)")
+        (vertex, own, ancestry) = result.records[0]
+        assert vertex.label == "derived"
+        assert own == "derived"
+        assert ancestry == ["derived", "base"]
+        assert not hasattr(vertex, "labels")
