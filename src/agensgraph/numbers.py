@@ -49,7 +49,11 @@ def read_numbers_exactly(enabled: bool = True) -> None:
     """Read a non-integer as a :class:`~decimal.Decimal` rather than a float.
 
     Process-wide, and meant to be called once at startup: a property map is decoded from a value that
-    holds no connection, so there is nothing narrower to attach the choice to.
+    holds no connection, so there is nothing narrower to attach the choice to. Once at startup is
+    also the only time it is unambiguous, because a map on the text path is decoded when it is first
+    read rather than when its row arrived -- so a row read before this was called and read after it
+    holds decimals, and one whose map was already touched holds floats. Two rows of one result can
+    disagree that way.
 
     Costs about 3.7 times as much to decode a map of numbers, and gives back every digit the server
     holds. An integer is read exactly either way.

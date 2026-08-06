@@ -12,7 +12,7 @@ therefore checked before the value, and never after.
 
 from __future__ import annotations
 
-import math
+from decimal import Decimal
 
 import msgspec
 import pytest
@@ -20,54 +20,10 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from agensgraph._protocol import decode
-from agensgraph.types import Edge, Path, Vertex
 
 from . import wire
+from .compare import same, same_element
 from .corpus import EDGES, PATHS, VERTICES
-
-
-def same(a: object, b: object) -> bool:
-    """Structural equality that does not paper over the traps of ``==``."""
-    if type(a) is not type(b):
-        return False
-    if isinstance(a, float):
-        assert isinstance(b, float)
-        if math.isnan(a) and math.isnan(b):
-            return True
-        if a == 0.0 and b == 0.0:
-            # -0.0 == 0.0 is true, so plain equality would hide a lost sign.
-            return math.copysign(1.0, a) == math.copysign(1.0, b)
-        return a == b
-    if isinstance(a, dict):
-        assert isinstance(b, dict)
-        if list(a.keys()) != list(b.keys()):
-            return False
-        return all(same(a[k], b[k]) for k in a)
-    if isinstance(a, list | tuple):
-        assert isinstance(b, list | tuple)
-        return len(a) == len(b) and all(same(x, y) for x, y in zip(a, b, strict=True))
-    return bool(a == b)
-
-
-def same_element(a: object, b: object) -> bool:
-    if type(a) is not type(b):
-        return False
-    if isinstance(a, Vertex):
-        assert isinstance(b, Vertex)
-        return a.id == b.id and a.label == b.label and same(a.properties, b.properties)
-    if isinstance(a, Edge):
-        assert isinstance(b, Edge)
-        return (
-            a.id == b.id
-            and a.label == b.label
-            and a.start == b.start
-            and a.end == b.end
-            and same(a.properties, b.properties)
-        )
-    if isinstance(a, Path):
-        assert isinstance(b, Path)
-        return len(a) == len(b) and all(same_element(x, y) for x, y in zip(a, b, strict=True))
-    raise TypeError(f"not a graph value: {type(a)}")
 
 
 class TestSameHelper:
@@ -88,6 +44,13 @@ class TestSameHelper:
 
     def test_key_order_matters(self):
         assert not same({"a": 1, "b": 2}, {"b": 2, "a": 1})
+
+    def test_a_decimal_does_not_pass_for_the_float_it_equals(self):
+        """The trap that is live: a map read exactly holds decimals where one read otherwise
+        holds floats, and ``Decimal('1.5') == 1.5``."""
+        assert not same(Decimal("1.5"), 1.5)
+        assert not same({"a": [Decimal("1.5")]}, {"a": [1.5]})
+        assert same(Decimal("1.5"), Decimal("1.5"))
 
 
 @pytest.mark.parametrize("buf,label,labid,locid,props", VERTICES)

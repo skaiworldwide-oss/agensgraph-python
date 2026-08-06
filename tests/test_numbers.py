@@ -12,6 +12,8 @@ from decimal import Decimal
 import pytest
 
 import agensgraph
+from agensgraph import GraphId, Vertex
+from agensgraph.numbers import read_numbers_exactly
 
 pytestmark = pytest.mark.server
 
@@ -113,3 +115,22 @@ class TestReadingThemExactly:
         assert (
             graph.execute_query("match (n:doc) return n").records[0][0].properties["v"] == "1.5"
         )
+
+
+def test_a_map_is_decoded_when_it_is_first_read_not_when_its_row_arrived() -> None:
+    """Which is why the setting is meant to be chosen once, at startup.
+
+    The text path holds the property map as the bytes it arrived as and decodes it on first
+    access, so what a row holds depends on when it was touched rather than when it was read.
+    """
+    read_numbers_exactly(False)
+    late = Vertex(GraphId(3, 1), "p", b'{"x": 1.5}')
+    early = Vertex(GraphId(3, 2), "p", b'{"x": 1.5}')
+    assert early.properties["x"] == 1.5
+    assert type(early.properties["x"]) is float
+    try:
+        read_numbers_exactly(True)
+        assert type(late.properties["x"]) is Decimal
+        assert type(early.properties["x"]) is float
+    finally:
+        read_numbers_exactly(False)

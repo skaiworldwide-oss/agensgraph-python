@@ -20,11 +20,29 @@ from agensgraph._protocol.labels import LabelCache
 from agensgraph.adapters import OIDS, assert_oids, register_binary
 from agensgraph.capabilities import Capabilities
 from agensgraph.errors import ConfigurationError, ReadOnlyGraphWrite, StaleLabelCache, translate
+from agensgraph.numbers import read_numbers_exactly, reading_numbers_exactly
+
+from .compare import same, same_element
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from psycopg import Connection
 
 pytestmark = pytest.mark.server
+
+
+def touch(value: object) -> None:
+    """Read every property of a decoded value, so a lazy map is decoded here and not later."""
+    if isinstance(value, Vertex | Edge):
+        _ = value.properties
+    elif isinstance(value, Path):
+        for element in value:
+            touch(element)
+    elif isinstance(value, list | tuple):
+        for item in value:
+            touch(item)
+
 
 TEXT_OID = 25
 """What a promoted read of a ``text`` property comes back as, where jsonb is 3802."""
@@ -79,17 +97,65 @@ class TestCapabilities:
 
 
 class TestBothRenderingsAgree:
-    """The differential check, against values the server itself produced."""
+    """The differential check, against values the server itself produced.
+
+    The two renderings decode the same rows by wholly independent routes -- one splits text and
+    measures each element, the other reads lengths off the wire -- so agreement between them is
+    the one correctness check that costs nothing to obtain and has no reference implementation to
+    be wrong.
+
+    Compared with :func:`tests.compare.same` and not with ``==``, which would pass on
+    disagreement and fail on agreement in five ways: ``nan != nan``, ``-0.0 == 0.0``, dict
+    equality ignoring key order, ``Decimal('1.5') == 1.5``, and a differing type comparing equal.
+    The last two are live here, since a map read exactly holds decimals where the same map read
+    otherwise holds floats, and a route that honoured that setting where the other did not would
+    pass ``==`` while losing every digit past the seventeenth.
+
+    Run in both number modes, over a property map holding what the server can actually produce at
+    the edges: an integer longer than a float can hold, a non-integer longer than one can hold, a
+    number below the smallest float, keys whose stored order is not the order they were written
+    in, an empty map, and a list of mixed types.
+    """
 
     @pytest.fixture(autouse=True)
     def _binary(self, graph: Connection[object], labels: LabelCache) -> None:
         register_binary(graph, labels)
 
-    def both(self, conn: Connection[object], query: str) -> tuple[object, object]:
-        return (
-            conn.execute(query).fetchall(),
-            conn.execute(query, binary=True).fetchall(),
+    @pytest.fixture(autouse=True, params=[False, True], ids=["floats", "decimals"])
+    def _numbers(self, request: pytest.FixtureRequest) -> Iterator[None]:
+        read_numbers_exactly(request.param)
+        yield
+        read_numbers_exactly(False)
+
+    @pytest.fixture
+    def awkward(self, graph: Connection[object], labels: LabelCache) -> Connection[object]:
+        graph.execute("create vlabel awkward")
+        graph.execute(
+            """create (:awkward {big: 12345678901234567890123456789,
+                                 frac: 0.12345678901234567890123,
+                                 tiny: 1e-400, vast: 1e400, neg: -0.0,
+                                 zz: 1, a: 2, mm: 3, b: 4,
+                                 empty: {}, lst: [1, 2.5, true, null],
+                                 nested: {inner: [0.1, 0.2]}, txt: 'x'})"""
         )
+        name = graph.execute("select current_setting('graph_path')").fetchone()[0]
+        labels.load(name, graph.execute(labels.query, (name,)).fetchall())
+        return graph
+
+    def both(self, conn: Connection[object], query: str) -> tuple[object, object]:
+        """Both readings, with every property touched inside one number mode.
+
+        The text rendering decodes a property map when it is first read, not when the row
+        arrived, so a map left untouched here would be decoded after the mode had been put back
+        and would disagree for that reason rather than for a real one.
+        """
+        from_text = conn.execute(query).fetchall()
+        from_binary = conn.execute(query, binary=True).fetchall()
+        for rows in (from_text, from_binary):
+            for row in rows:
+                for value in row:
+                    touch(value)
+        return from_text, from_binary
 
     @pytest.mark.parametrize(
         "query",
@@ -103,24 +169,51 @@ class TestBothRenderingsAgree:
     )
     def test_the_same_query_read_twice(self, graph: Connection[object], query: str) -> None:
         from_text, from_binary = self.both(graph, query)
-        assert from_text == from_binary
+        assert same(from_text, from_binary)
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "match (n:awkward) return n",
+            "match (n:awkward) return n.frac",
+            "match (n:awkward) return properties(n)",
+        ],
+    )
+    def test_values_at_the_edges_of_what_a_number_can_hold(
+        self, awkward: Connection[object], query: str
+    ) -> None:
+        from_text, from_binary = self.both(awkward, query)
+        assert same(from_text, from_binary)
+
+    def test_the_awkward_map_is_actually_awkward(self, awkward: Connection[object]) -> None:
+        """Or the comparison above is being asked nothing.
+
+        Reading exactly is what recovers the two values a float cannot hold: the non-integer
+        keeps every digit it was written with, and the number below the smallest float stops
+        being nought.
+        """
+        (row,) = awkward.execute("match (n:awkward) return n").fetchall()
+        properties = row[0].properties
+        assert list(properties) != sorted(properties), "the stored order is the written order"
+        assert properties["big"] == 12345678901234567890123456789
+        if reading_numbers_exactly():
+            assert str(properties["frac"]) == "0.12345678901234567890123"
+            assert properties["tiny"] != 0
+        else:
+            assert properties["frac"] == pytest.approx(0.12345678901234568)
+            assert properties["tiny"] == 0.0
 
     def test_and_the_parts_agree_too(self, graph: Connection[object]) -> None:
         """Equality is on identity alone, so it would not notice a wrong label or property."""
         query = "match (n:person) return n order by n.name"
         (from_text, from_binary) = self.both(graph, query)
         for (t,), (b,) in zip(from_text, from_binary, strict=True):
-            assert (t.id, t.label, t.properties) == (b.id, b.label, b.properties)
+            assert same_element(t, b)
 
     def test_an_edges_endpoints_agree(self, graph: Connection[object]) -> None:
         (from_text, from_binary) = self.both(graph, "match ()-[r:knows]->() return r")
         (t,), (b,) = from_text[0], from_binary[0]
-        assert (t.start, t.end, t.label, t.properties) == (
-            b.start,
-            b.end,
-            b.label,
-            b.properties,
-        )
+        assert same_element(t, b)
 
     def test_a_label_created_after_the_table_was_filled(
         self, graph: Connection[object], labels: LabelCache
