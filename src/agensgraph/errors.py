@@ -78,6 +78,7 @@ __all__ = [
     "InternalError",
     "NetworkError",
     "NetworkTimeout",
+    "NoEnclosingTransaction",
     "NotSupportedError",
     "OperationalError",
     "ProgrammingError",
@@ -356,6 +357,24 @@ class StaleLabelCache(_pg.OperationalError):
             "the composite rendering needs a label table to name a label from, and this "
             "connection has none. Call graph() or refresh_labels() first, or read the text "
             "rendering, which carries the name the server wrote"
+        )
+
+
+class NoEnclosingTransaction(_pg.ProgrammingError):
+    """A server-side cursor asked for on a connection in autocommit.
+
+    Such a cursor lives inside a transaction, and in autocommit there is none to live in. The
+    requirement is also what makes abandoning a half-read stream safe: leaving the transaction
+    closes the cursor with it, rather than leaving a statement running and a lock held.
+    """
+
+    @classmethod
+    def for_stream(cls) -> NoEnclosingTransaction:
+        """Build the report."""
+        return cls(
+            "reading in chunks needs a transaction for the cursor to live in, and this "
+            "connection is in autocommit. Open one -- `with conn.transaction():` -- or read "
+            "the statement whole with execute_query"
         )
 
 

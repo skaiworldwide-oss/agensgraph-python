@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Any, cast
 import psycopg
 from psycopg.rows import Row, tuple_row
 
-from ._core import GraphMixin, Result, statement_text, with_keepalives
+from ._core import GraphMixin, Result, statement_text, stream_name, with_keepalives
 from ._protocol.labels import CURRENT_GRAPH_QUERY
 from .bulk import (
     EDGE_COLUMN_TYPES,
@@ -36,7 +36,7 @@ from .bulk import (
 from .capabilities import VECTOR_AVAILABLE_QUERY, VECTOR_VERSION_QUERY
 from .columnar import CHUNK
 from .cypher import changes_graph_path, check_bindable_positions, wrap_for_cursor
-from .errors import BatchFailed
+from .errors import BatchFailed, NoEnclosingTransaction
 from .introspect import (
     CONSTRAINTS_QUERY,
     DECLARED_PROPERTIES_QUERY,
@@ -348,16 +348,25 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
         inside one. That requirement is also what makes abandoning the iterator safe, since
         leaving the transaction closes the cursor with it -- rather than leaving a connection
         with a statement still running and a lock still held, which is how the ordinary
-        generator form goes wrong.
+        generator form goes wrong. A connection in autocommit is refused here, saying so, rather
+        than at the server with a message about ``DECLARE``.
+
+        Each stream names its cursor for itself, so two open at once do not collide -- a
+        collision aborts the transaction, and would take the first stream down with the second.
+        ``name`` overrides that, for a cursor meant to be found by name.
 
         ``size`` is how many rows are fetched at a time. A hundred, because the standard's own
         default of one is a round trip per row.
         """
         if size < 1:
             raise ValueError(f"a chunk holds at least one row, got {size}")
+        # What is wrong with the statement is said before what is wrong with the connection,
+        # so a caller with both is not sent round twice.
         self._check(query)
         statement = wrap_for_cursor(query)
-        async with self.cursor(name=name or "agens_stream") as cursor:
+        if self.autocommit and name is None:
+            raise NoEnclosingTransaction.for_stream()
+        async with self.cursor(name=name or stream_name()) as cursor:
             cursor.itersize = size
             if binary_:
                 self._check_binary()

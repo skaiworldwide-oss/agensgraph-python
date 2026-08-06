@@ -37,11 +37,12 @@ class TestTheWrap:
     def test_it_adds_an_alias(self) -> None:
         """Without one the server reports that Cypher in a FROM needs an alias."""
         assert (
-            wrap_for_cursor("match (n) return n") == "select * from (match (n) return n) as t"
+            wrap_for_cursor("match (n) return n")
+            == "select * from (\nmatch (n) return n\n) as t"
         )
 
     def test_a_trailing_semicolon_is_dropped(self) -> None:
-        assert wrap_for_cursor("match (n) return n;").endswith("return n) as t")
+        assert wrap_for_cursor("match (n) return n;").endswith("return n\n) as t")
 
     @pytest.mark.parametrize(
         "statement",
@@ -278,3 +279,78 @@ class TestWhatTheWrapItselfTakes:
         agens.execute("create vlabel doc")
         with pytest.raises(agensgraph.errors.Error):
             agens.execute(wrap_for_cursor(statement))
+
+
+class TestTheWrapAroundAwkwardStatements:
+    def test_a_statement_ending_in_a_line_comment_keeps_its_bracket(self) -> None:
+        """On one line the closing bracket lands inside the comment."""
+        wrapped = wrap_for_cursor("match (n:t) return n -- why\n")
+        assert wrapped.endswith("\n) as t")
+        assert "-- why" in wrapped
+
+    def test_a_trailing_semicolon_is_taken_off(self) -> None:
+        assert wrap_for_cursor("match (n) return n;") == "select * from (\nmatch (n) return n\n) as t"
+
+    @pytest.mark.parametrize(
+        "statement",
+        [
+            "match (n) where n.s = 'a;b' return n",
+            "match (n) return n -- ends with ;\n",
+            "match (n) return n /* ; */",
+        ],
+    )
+    def test_a_semicolon_that_terminates_nothing_is_left_alone(self, statement: str) -> None:
+        assert statement.rstrip() in wrap_for_cursor(statement)
+
+    def test_insert_is_refused_as_create_is(self) -> None:
+        """It is the same clause under another name, so it writes."""
+        with pytest.raises(ValueError, match="cannot be read in chunks"):
+            check_can_wrap("insert (:t {x: 1}) return 1")
+
+    @pytest.mark.parametrize(
+        "statement",
+        ["match (n) return n.inserted", "match (n:insert) return n", "match (n) return n AS inserter"],
+    )
+    def test_and_a_name_that_merely_holds_the_word_is_not(self, statement: str) -> None:
+        check_can_wrap(statement)
+
+
+@pytest.mark.server
+class TestWhatAStreamNeeds:
+    def test_autocommit_is_refused_by_name(self, dsn: str) -> None:
+        from agensgraph.errors import NoEnclosingTransaction
+
+        with (
+            agensgraph.Connection.connect(dsn, autocommit=True) as conn,
+            pytest.raises(NoEnclosingTransaction, match="transaction"),
+        ):
+            list(conn.stream("match (n) return n"))
+
+    def test_what_is_wrong_with_the_statement_is_said_first(self, dsn: str) -> None:
+        """A caller with both faults is not sent round twice."""
+        with (
+            agensgraph.Connection.connect(dsn, autocommit=True) as conn,
+            pytest.raises(ValueError, match="cannot be read in chunks"),
+        ):
+            list(conn.stream("insert (:t {x: 1}) return 1"))
+
+    def test_two_streams_at_once_do_not_collide(self, agens, dsn: str) -> None:  # type: ignore[no-untyped-def]
+        """One name for both aborts the transaction, which takes down the reader as well."""
+        agens.execute("create vlabel t")
+        agens.execute("create (:t {x: 1}), (:t {x: 2})")
+        with agensgraph.Connection.connect(dsn) as conn:
+            conn.execute(f"set graph_path = {agens.label_table.graph}")
+            first = conn.stream("match (n:t) return n.x order by n.x")
+            second = conn.stream("match (n:t) return n.x order by n.x desc")
+            assert next(iter(first)) == (1,)
+            assert next(iter(second)) == (2,)
+            conn.rollback()
+
+    def test_a_statement_ending_in_a_comment_streams(self, agens, dsn: str) -> None:  # type: ignore[no-untyped-def]
+        agens.execute("create vlabel t")
+        agens.execute("create (:t {x: 1}), (:t {x: 2})")
+        with agensgraph.Connection.connect(dsn) as conn:
+            conn.execute(f"set graph_path = {agens.label_table.graph}")
+            rows = list(conn.stream("match (n:t) return n.x order by n.x -- why\n"))
+            assert [row[0] for row in rows] == [1, 2]
+            conn.rollback()

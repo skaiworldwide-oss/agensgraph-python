@@ -158,11 +158,13 @@ class TestTheCompositeRenderingWithNoTable:
                     conn.execute_query(statement, binary_=True)
 
     def test_reading_in_chunks_is_refused_too(self, dsn: str, second_graph: str) -> None:
-        with agensgraph.Connection.connect(dsn, autocommit=True) as conn:
+        """In a transaction, which is what reading in chunks needs of its own accord."""
+        with agensgraph.Connection.connect(dsn) as conn:
             conn.execute(f'set graph_path = "{second_graph}"')
             conn.execute("create (:account {n: 'x'})")
             with pytest.raises(StaleLabelCache, match="refresh_labels"):
                 list(conn.stream("match (n:account) return n", binary_=True))
+            conn.rollback()
 
     def test_the_text_rendering_needs_no_table(self, dsn: str, second_graph: str) -> None:
         with agensgraph.Connection.connect(dsn, autocommit=True) as conn:

@@ -303,7 +303,7 @@ def check_bindable_positions(statement: str) -> None:
 # Missing a write here costs nothing, since the server refuses one from the wrap anyway. Refusing
 # a read that never wrote anything is the mistake worth avoiding.
 _WRITE_CLAUSE = re.compile(
-    r'(?<![A-Za-z0-9_.":])(create|merge|set|delete|remove|detach)(?![A-Za-z0-9_]|\s*:)',
+    r'(?<![A-Za-z0-9_.":])(create|insert|merge|set|delete|remove|detach)(?![A-Za-z0-9_]|\s*:)',
     re.IGNORECASE,
 )
 
@@ -326,12 +326,15 @@ _WRITE_WORD = re.compile(
 )
 _WRITE_WORDS = tuple(WRITE_GROUPS)
 
-WRAP = "select * from ({statement}) as {alias}"
+WRAP = "select * from (\n{statement}\n) as {alias}"
 """How a Cypher statement is made readable by a server-side cursor.
 
 ``DECLARE ... CURSOR FOR MATCH`` is a syntax error -- the grammar has no arm for it -- so the
 only way to read a Cypher result in chunks is to put it where a subquery goes. The alias is not
 optional: without one the server reports that Cypher in a FROM needs an alias.
+
+The closing bracket goes on a line of its own, because a statement may end in a line comment and
+one on the same line would be inside it.
 """
 
 
@@ -347,7 +350,20 @@ def wrap_for_cursor(statement: str, *, alias: str = "t") -> str:
     ``CALL func() YIELD``, which the grammar allows only as a top-level clause.
     """
     check_can_wrap(statement)
-    return WRAP.format(statement=statement.rstrip().rstrip(";"), alias=quote_identifier(alias))
+    return WRAP.format(statement=_without_terminator(statement), alias=quote_identifier(alias))
+
+
+def _without_terminator(statement: str) -> str:
+    """The statement with a trailing semicolon taken off, if it has one.
+
+    A subquery cannot hold one. The semicolon is looked for in the statement with its literals
+    blanked out, so one inside a string or a comment is left where it is: it terminates nothing
+    and cutting the text there would end the statement somewhere else.
+    """
+    bare = without_literals(statement).rstrip()
+    if not bare.endswith(";"):
+        return statement
+    return statement[: len(bare) - 1].rstrip()
 
 
 def writable_counters(statement: str) -> frozenset[int]:

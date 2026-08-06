@@ -12,6 +12,7 @@ interface from the other: the more that lives here, the less there is to keep in
 
 from __future__ import annotations
 
+from itertools import count
 from typing import TYPE_CHECKING, Any, NamedTuple, Union
 
 from psycopg.adapt import AdaptersMap
@@ -38,6 +39,7 @@ __all__ = [
     "GraphMixin",
     "Result",
     "Statement",
+    "stream_name",
 ]
 
 GRAPH_ADAPTERS: AdaptersMap = graph_adapters()
@@ -89,6 +91,18 @@ the same wait unbounded. What it does do is bound the keepalive probing once tha
 useful alongside these and useless instead of them. It is left unset because it also applies to a
 connection that is busy sending, where too small a value would end a healthy one.
 """
+
+
+_stream_numbers = count(1)
+
+
+def stream_name() -> str:
+    """A name no other stream on this connection is using.
+
+    Two server-side cursors of one name collide, and the collision aborts the transaction --
+    which takes down the stream that was already reading, not only the one that failed.
+    """
+    return f"agens_stream_{next(_stream_numbers)}"
 
 
 def with_keepalives(kwargs: dict[str, Any], conninfo: str = "") -> dict[str, Any]:
