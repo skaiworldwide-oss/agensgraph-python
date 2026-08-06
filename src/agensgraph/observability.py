@@ -49,11 +49,15 @@ if TYPE_CHECKING:
 __all__ = [
     "Notice",
     "QueryRecord",
+    "add_notice_listener",
     "add_query_logger",
     "disable_tracing",
     "enable_tracing",
     "notice_from_diagnostic",
+    "notices_wanted",
+    "remove_notice_listener",
     "remove_query_logger",
+    "report_notice",
     "tracing_enabled",
 ]
 
@@ -203,6 +207,45 @@ def query_span(statement: str, *, graph: str | None = None) -> Any:
     if not _tracing:
         return _NO_SPAN
     return _real_span(statement, graph)
+
+
+_notice_handlers: list[Callable[[Notice], None]] = []
+
+
+def add_notice_listener(callback: Callable[[Notice], None]) -> None:
+    """Be told about every notice the server sends, as a :class:`Notice`.
+
+    psycopg delivers its own diagnostic object; this is that read into the shape above, with the
+    severity that is safe to compare and the code to match on. ``regather_graphmeta()`` alone
+    sends two, and planner and index notices are worth acting on.
+
+    Registered per process and delivered by every connection this driver makes. An exception
+    raised here is swallowed, as psycopg swallows one raised in its own handler.
+    """
+    _notice_handlers.append(callback)
+
+
+def remove_notice_listener(callback: Callable[[Notice], None]) -> None:
+    """Stop being told. Removing something never added is harmless."""
+    while callback in _notice_handlers:
+        _notice_handlers.remove(callback)
+
+
+def notices_wanted() -> bool:
+    """Whether anybody has asked to be told, which is what a connection checks."""
+    return bool(_notice_handlers)
+
+
+def report_notice(diag: Diagnostic) -> None:
+    """Hand one notice to everybody listening, letting none of them stop the others."""
+    if not _notice_handlers:
+        return
+    notice = notice_from_diagnostic(diag)
+    for handler in tuple(_notice_handlers):
+        try:
+            handler(notice)
+        except Exception:
+            logger.exception("a notice listener raised")
 
 
 def add_query_logger(callback: Callable[[QueryRecord], None]) -> None:

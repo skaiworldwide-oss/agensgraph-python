@@ -60,7 +60,7 @@ from .introspect import (
     reconcile_indexes,
 )
 from .notify import LISTENING_QUERY, NOTIFY_QUERY, listen_statement, unlisten_statement
-from .observability import Timer, query_span
+from .observability import Timer, query_span, report_notice
 from .summary import (
     ASSIGNED_TRANSACTION_QUERY,
     COUNTER_QUERY,
@@ -171,6 +171,7 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
         :data:`~agensgraph._core.KEEPALIVE_DEFAULTS` for what that is worth.
         """
         conn = super().connect(conninfo, **with_keepalives(kwargs, conninfo))
+        conn.add_notice_handler(report_notice)
         try:
             _ = conn.capabilities
         except BaseException:

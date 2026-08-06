@@ -224,3 +224,94 @@ class TestAgainstAServer:
             disable_tracing()
         assert taken
         assert not any("hunter2" in item for item in taken)
+
+
+class TestAskingForASpanCostsAlmostNothing:
+    def test_the_gate_is_not_behind_a_generator(self) -> None:
+        """A flag read inside an @contextmanager is not a cheap gate: the generator and the
+        protocol are built before its first line runs."""
+        import timeit
+
+        def ask() -> None:
+            with query_span("match (n) return n", graph="g"):
+                pass
+
+        per_call = min(timeit.repeat(ask, number=20000, repeat=5)) / 20000
+        assert per_call < 1e-6, f"asking for a span costs {per_call * 1e9:.0f} ns"
+
+    def test_it_is_the_same_object_every_time(self) -> None:
+        assert query_span("a") is query_span("b")
+
+
+class TestNoticesReachTheCaller:
+    def test_a_listener_is_given_the_driver_s_own_shape(self) -> None:
+
+        from agensgraph.observability import (
+            add_notice_listener,
+            remove_notice_listener,
+            report_notice,
+        )
+
+        seen: list[Notice] = []
+        add_notice_listener(seen.append)
+        try:
+            report_notice(_diagnostic())
+            assert len(seen) == 1
+            assert isinstance(seen[0], Notice)
+        finally:
+            remove_notice_listener(seen.append)
+
+    def test_one_listener_raising_does_not_stop_another(self) -> None:
+        from agensgraph.observability import (
+            add_notice_listener,
+            remove_notice_listener,
+            report_notice,
+        )
+
+        def angry(notice: Notice) -> None:
+            raise RuntimeError("no")
+
+        seen: list[Notice] = []
+        add_notice_listener(angry)
+        add_notice_listener(seen.append)
+        try:
+            report_notice(_diagnostic())
+            assert len(seen) == 1
+        finally:
+            remove_notice_listener(angry)
+            remove_notice_listener(seen.append)
+
+    def test_nobody_listening_builds_nothing(self) -> None:
+        from agensgraph.observability import notices_wanted, report_notice
+
+        assert not notices_wanted()
+        report_notice(_diagnostic())
+
+
+def _diagnostic():  # type: ignore[no-untyped-def]
+    """The fields notice_from_diagnostic reads, in the shape psycopg hands them over."""
+    from unittest.mock import Mock
+
+    diag = Mock()
+    diag.severity_nonlocalized = "NOTICE"
+    diag.sqlstate = "00000"
+    diag.message_primary = "something happened"
+    diag.message_detail = None
+    diag.message_hint = None
+    return diag
+
+
+@pytest.mark.server
+class TestNoticesFromARealServer:
+    def test_regather_graphmeta_reaches_a_listener(self, agens) -> None:  # type: ignore[no-untyped-def]
+        from agensgraph.observability import add_notice_listener, remove_notice_listener
+
+        seen: list[Notice] = []
+        add_notice_listener(seen.append)
+        try:
+            agens.execute("select regather_graphmeta()")
+            assert seen, "the server sends notices and none arrived"
+            assert all(isinstance(notice, Notice) for notice in seen)
+            assert all(notice.severity for notice in seen)
+        finally:
+            remove_notice_listener(seen.append)

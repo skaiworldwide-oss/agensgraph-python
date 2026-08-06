@@ -62,7 +62,7 @@ from .notify import (
     listen_statement,
     unlisten_statement,
 )
-from .observability import Timer, query_span
+from .observability import Timer, query_span, report_notice
 from .summary import (
     ASSIGNED_TRANSACTION_QUERY,
     COUNTER_QUERY,
@@ -184,6 +184,10 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
         :data:`~agensgraph._core.KEEPALIVE_DEFAULTS` for what that is worth.
         """
         conn = await super().connect(conninfo, **with_keepalives(kwargs, conninfo))
+        # Registered once here rather than per statement. psycopg calls this on every notice the
+        # server sends, and what it hands over is read into a Notice only when somebody is
+        # listening, so a caller who never asked pays one call that returns immediately.
+        conn.add_notice_handler(report_notice)
         try:
             _ = conn.capabilities
         except BaseException:
