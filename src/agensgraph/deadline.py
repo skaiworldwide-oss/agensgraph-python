@@ -114,7 +114,9 @@ class Deadline:
         remaining = self.remaining()
         if remaining is None:
             return None
-        return remaining - self._reserve
+        # Never below nothing. A negative wait is not a short one: handed to a socket it means
+        # no limit at all, which is the opposite of a budget that has run out.
+        return max(remaining - self._reserve, 0.0)
 
     @property
     def can_commit(self) -> bool:
@@ -152,7 +154,12 @@ class Deadline:
         available = self.available()
         if available is None:
             return None
-        return max(int((available - gap) * 1000), 1)
+        limit = int((available - gap) * 1000)
+        if limit < 1:
+            # A floor of one millisecond is a limit no statement can meet, and it outlives the
+            # caller it was set for. Nothing is left, so the caller is told rather than sent.
+            raise Expired.after(self.spent(), self._total or 0.0, doing="setting a limit")
+        return limit
 
     def __repr__(self) -> str:
         if self._at is None:

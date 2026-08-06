@@ -36,7 +36,8 @@ def test_a_reported_version_is_read_leniently(reported: str, expected: tuple[int
 
 @pytest.mark.parametrize("reported", ["", "devel", "2", "v2.18", "two.eighteen", "-2.18"])
 def test_something_that_is_not_a_version_is_refused(reported: str) -> None:
-    with pytest.raises(ValueError, match="version"):
+    """As a driver error, so a caller catching this driver's failures catches it."""
+    with pytest.raises(CapabilityError, match="version"):
         parse_version(reported)
 
 

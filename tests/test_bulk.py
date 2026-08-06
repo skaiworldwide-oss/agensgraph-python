@@ -13,7 +13,9 @@ import pytest
 import pytest_asyncio
 
 import agensgraph
+from agensgraph import GraphId
 from agensgraph.bulk import (
+    build_identity_map,
     edge_copy_statement,
     identity_map_statement,
     vertex_copy_statement,
@@ -270,3 +272,49 @@ class TestPausingTheCollector:
         agensgraph.freeze_after_import()
         assert gc.get_freeze_count() >= before
         gc.unfreeze()
+
+
+class TestAnIdentityMapNeedsAKeyThatIdentifies:
+    """What is lost is not an entry: an edge resolved through the map lands on whichever
+    element survived, or on nothing, and neither says so."""
+
+    def test_a_key_that_identifies_builds_a_map(self) -> None:
+        rows = [("a", GraphId(3, 1)), ("b", GraphId(3, 2))]
+        assert build_identity_map(rows, label="t", key="k") == {
+            "a": GraphId(3, 1),
+            "b": GraphId(3, 2),
+        }
+
+    def test_a_key_shared_by_two_elements_is_refused(self) -> None:
+        rows = [("a", GraphId(3, 1)), ("a", GraphId(3, 2))]
+        with pytest.raises(ValueError, match="shared by more than one"):
+            build_identity_map(rows, label="t", key="k")
+
+    def test_an_element_holding_no_key_is_refused(self) -> None:
+        rows = [("a", GraphId(3, 1)), (None, GraphId(3, 2))]
+        with pytest.raises(ValueError, match="hold no"):
+            build_identity_map(rows, label="t", key="k")
+
+    def test_the_message_names_the_label_and_the_key(self) -> None:
+        with pytest.raises(ValueError, match=r"'k' does not identify an element of 't'"):
+            build_identity_map([(None, GraphId(3, 1))], label="t", key="k")
+
+    def test_a_number_and_its_text_are_one_key(self) -> None:
+        """Both sides read the key as text, so 1 and '1' are the same element's key."""
+        with pytest.raises(ValueError, match="shared by more than one"):
+            build_identity_map([(1, GraphId(3, 1)), ("1", GraphId(3, 2))], label="t", key="k")
+
+
+class TestTheGraphIdBinaryLoader:
+    def test_a_payload_that_is_not_eight_bytes_is_refused(self) -> None:
+        """Read as a plain integer a truncated one is not short, it is another valid identity."""
+        from agensgraph.adapters import GraphIdBinaryLoader
+
+        for payload in (b"", b"\x00\x00\x00\x01", b"\x00" * 9):
+            with pytest.raises(ValueError, match="8 bytes"):
+                GraphIdBinaryLoader(7002).load(payload)
+
+    def test_eight_bytes_read_as_the_identity_they_hold(self) -> None:
+        from agensgraph.adapters import GraphIdBinaryLoader
+
+        assert GraphIdBinaryLoader(7002).load(b"\x00\x03\x00\x00\x00\x00\x00\x01") == GraphId(3, 1)

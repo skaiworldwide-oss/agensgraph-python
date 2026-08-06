@@ -130,11 +130,14 @@ class TestWhatTheServerIsAsked:
         budget = Deadline(10.0, commit_reserve=2.0)
         assert budget.statement_timeout_ms(gap=0.5) == 7500
 
-    def test_it_never_asks_for_nothing(self, clock) -> None:  # type: ignore[no-untyped-def]
-        """A limit of zero means no limit to the server, which is the opposite of intended."""
+    def test_a_budget_with_nothing_left_is_refused_rather_than_floored(self, clock) -> None:  # type: ignore[no-untyped-def]
+        """Zero means no limit to the server, and one millisecond is a limit no statement can
+        meet -- and it outlives the caller it was set for, on a pooled connection. Neither is
+        worth sending, so the caller is told the budget has gone."""
         budget = Deadline(0.1)
         clock.advance(0.2)
-        assert budget.statement_timeout_ms() == 1
+        with pytest.raises(Expired):
+            budget.statement_timeout_ms()
 
 
 def test_the_clock_is_the_monotonic_one() -> None:

@@ -27,6 +27,7 @@ from ._protocol.labels import CURRENT_GRAPH_QUERY
 from .bulk import (
     EDGE_COLUMN_TYPES,
     VERTEX_COLUMN_TYPES,
+    build_identity_map,
     edge_copy_statement,
     edge_rows,
     identity_map_statement,
@@ -540,10 +541,15 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
 
         One statement for the whole label. The key is read as text on both sides, because a key
         that is a number in one place and a string in the other would otherwise match nothing.
+
+        The key has to identify an element, and it is refused if it does not. A map is what
+        :meth:`load_edges` resolves an endpoint through, so an element sharing its key with
+        another, or holding no key at all, is not a smaller map -- it is edges attached to the
+        wrong vertex, or to none.
         """
         name = self._graph_of(graph)
         rows = await self._fetch(identity_map_statement(name, label), (key,))
-        return {str(value): identity for value, identity in rows if value is not None}
+        return build_identity_map(rows, label=label, key=key)
 
     # -- reading what is in the database -----------------------------------------------
 

@@ -32,12 +32,13 @@ from psycopg.types.json import Jsonb
 from .cypher import quote_identifier
 
 if TYPE_CHECKING:
-    from collections.abc import Generator, Iterable, Iterator, Mapping
+    from collections.abc import Generator, Iterable, Iterator, Mapping, Sequence
 
     from ._protocol.graphid import GraphId
 
 __all__ = [
     "BLOCK_SIZE",
+    "build_identity_map",
     "edge_blocks",
     "edge_copy_statement",
     "freeze_after_import",
@@ -201,3 +202,42 @@ def edge_rows(
         [start, end, Jsonb(dict(props) if props is not None else {})]
         for start, end, props in edges
     )
+
+
+def build_identity_map(
+    rows: Sequence[tuple[Any, Any]], *, label: str, key: str
+) -> dict[str, GraphId]:
+    """The identities of a label, keyed by a property, refusing a key that does not identify.
+
+    Two elements sharing a key, or one holding none, would each cost an entry. What is lost is
+    not the entry: an edge resolved through this map lands on whichever element survived, or on
+    nothing, and neither says so.
+    """
+    found: dict[str, GraphId] = {}
+    repeated: set[str] = set()
+    missing = 0
+    for value, identity in rows:
+        if value is None:
+            missing += 1
+            continue
+        text = str(value)
+        if text in found:
+            repeated.add(text)
+        found[text] = identity
+    if repeated or missing:
+        raise ValueError(
+            f"{key!r} does not identify an element of {label!r}: "
+            + ", ".join(
+                part
+                for part in (
+                    f"{len(repeated)} value(s) shared by more than one element "
+                    f"({sorted(repeated)[:5]})"
+                    if repeated
+                    else "",
+                    f"{missing} element(s) hold no {key!r}" if missing else "",
+                )
+                if part
+            )
+            + ". An edge resolved through this map would land on the wrong element or on none"
+        )
+    return found

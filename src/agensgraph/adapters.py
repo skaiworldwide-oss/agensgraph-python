@@ -65,7 +65,7 @@ from psycopg.types import json as _json
 from psycopg.types.string import StrBinaryDumper, StrDumper
 
 from ._protocol import decode
-from ._protocol.graphid import GraphId, pack, parse_text
+from ._protocol.graphid import GraphId, pack, parse_text, unpack
 from .errors import StaleLabelCache
 
 if TYPE_CHECKING:
@@ -128,12 +128,17 @@ class GraphIdLoader(Loader):
 
 
 class GraphIdBinaryLoader(Loader):
-    """Read the eight wire bytes of a graph id."""
+    """Read the eight wire bytes of a graph id.
+
+    Through the module's own reader, which refuses a payload that is not eight bytes. Read as
+    a plain integer instead, a truncated one is not short -- it is a different, valid identity,
+    and four zero bytes and a one read as ``0.1``.
+    """
 
     format = pq.Format.BINARY
 
     def load(self, data: Buffer) -> GraphId:
-        return GraphId.from_packed(int.from_bytes(_decode_bytes(data), "big"))
+        return unpack(_decode_bytes(data))
 
 
 class VertexLoader(Loader):

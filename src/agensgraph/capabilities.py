@@ -40,7 +40,10 @@ def parse_version(text: str) -> tuple[int, int]:
     """Read the major and minor numbers out of a reported version."""
     match = _VERSION.match(text.strip())
     if match is None:
-        raise ValueError(f"cannot read an AgensGraph version from {text!r}")
+        raise CapabilityError(
+            f"cannot read an AgensGraph version from {text!r}. The server reports one in "
+            f"`agversion`, as `2.18` or `2.18-devel`"
+        )
     return int(match.group(1)), int(match.group(2))
 
 
