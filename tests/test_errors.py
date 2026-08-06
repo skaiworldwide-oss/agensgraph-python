@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pickle
+from types import SimpleNamespace
 
 import psycopg.errors as pg
 import pytest
@@ -311,3 +312,65 @@ def test_the_driver_never_sees_a_raw_socket_failure() -> None:
     with pytest.raises(pg.OperationalError) as caught:
         agensgraph.Connection.connect("host=127.0.0.1 port=59999 connect_timeout=2")
     assert not isinstance(caught.value, OSError)
+
+
+class TestKeepingRowDataOutOfAMessage:
+    """PostgreSQL puts row data in DETAIL, so a plain ``logger.exception`` writes it to a log."""
+
+    class Faked(pg.UniqueViolation):
+        """psycopg's own class, since that is what redaction must leave a caller holding.
+
+        Only ``diag`` is supplied, because the real one reads a result this test has not got.
+        """
+
+        def __init__(self, primary: str, detail: str) -> None:
+            super().__init__(f"{primary}\nDETAIL:  {detail}" if detail else primary)
+            self._fake = SimpleNamespace(message_primary=primary, message_detail=detail)
+
+        @property
+        def diag(self) -> SimpleNamespace:  # type: ignore[override]
+            return self._fake
+
+    def make(self, primary: str, detail: str) -> pg.Error:
+        return self.Faked(primary, detail)
+
+    def test_the_detail_is_cut_from_the_message(self) -> None:
+        exc = self.make("duplicate key value", "Key (email)=(alice@example.com) already exists.")
+        assert "alice@example.com" in str(exc)
+        E.redact_details(exc)
+        assert str(exc) == "duplicate key value"
+        assert "alice@example.com" not in str(exc)
+
+    def test_the_data_is_still_there_to_look_at(self) -> None:
+        """Redact the rendering, keep the attribute -- a post-mortem still needs the value."""
+        exc = self.make("duplicate key value", "Key (email)=(alice@example.com) already exists.")
+        E.redact_details(exc)
+        assert exc.diag.message_detail == "Key (email)=(alice@example.com) already exists."
+
+    def test_it_stays_the_class_psycopg_raised(self) -> None:
+        """Or every except clause written against psycopg stops matching."""
+        exc = self.make("duplicate key value", "Key (email)=(x) already exists.")
+        assert E.redact_details(exc) is exc
+        assert isinstance(exc, pg.UniqueViolation)
+
+    def test_doing_it_twice_changes_nothing(self) -> None:
+        exc = self.make("duplicate key value", "Key (email)=(x) already exists.")
+        E.redact_details(exc)
+        once = str(exc)
+        E.redact_details(exc)
+        assert str(exc) == once
+
+    def test_a_message_that_is_only_the_primary_is_left_alone(self) -> None:
+        exc = self.make("syntax error", "")
+        assert str(E.redact_details(exc)) == "syntax error"
+
+    def test_a_caller_can_ask_for_the_detail_back(self) -> None:
+        E.show_error_details(True)
+        try:
+            assert E.showing_error_details()
+            exc = self.make("duplicate key value", "Key (email)=(alice@example.com) already exists.")
+            E.redact_details(exc)
+            assert "alice@example.com" in str(exc)
+        finally:
+            E.show_error_details(False)
+        assert not E.showing_error_details()

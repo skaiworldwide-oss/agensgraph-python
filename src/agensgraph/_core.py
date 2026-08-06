@@ -21,7 +21,13 @@ from ._protocol.labels import LabelCache
 from .adapters import graph_adapters, register_binary
 from .capabilities import Capabilities
 from .cypher import check_bindable_positions, quote_identifier, writable_counters
-from .errors import ReleasedConnection, StaleLabelCache, explain_string_type, translate
+from .errors import (
+    ReleasedConnection,
+    StaleLabelCache,
+    explain_string_type,
+    redact_details,
+    translate,
+)
 from .observability import QueryRecord, logging_wanted, report
 from .summary import GraphWriteCounts
 
@@ -292,6 +298,9 @@ class GraphMixin:
     ) -> None:
         """Tell anything listening what one statement did, and cost nothing when nothing is.
 
+        Called from the cursor rather than from the methods that build one, so that every
+        statement is reported once and the driver's own catalog reads are reported too.
+
         The connection is identified by an opaque number rather than by anything it was
         configured with, because its settings hold the password.
         """
@@ -315,7 +324,7 @@ class GraphMixin:
         A failure caused by a string's declared type also picks up a note saying why the
         parameter was text, which is the one thing the server's own message cannot know.
         """
-        replacement = translate(exc) or exc
+        replacement = redact_details(translate(exc) or exc)
         hint = explain_string_type(replacement)
         if hint is not None:
             replacement.add_note(hint)

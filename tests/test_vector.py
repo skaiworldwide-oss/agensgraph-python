@@ -559,9 +559,14 @@ class TestSparseVectorsAgainstAServer:
         assert isinstance(stored, SparseVector)
 
     def test_a_list_is_refused_by_the_server(self, sparse) -> None:  # type: ignore[no-untyped-def]
-        """Unlike a dense column, which takes one -- which is why the dumper exists."""
-        with pytest.raises(agensgraph.errors.Error, match="must start with"):
+        """Unlike a dense column, which takes one -- which is why the dumper exists.
+
+        What the server means is in the DETAIL, which is not part of the message by default
+        because that is where row data lands.
+        """
+        with pytest.raises(agensgraph.errors.Error, match="invalid input syntax") as caught:
             sparse.execute("create (:s {v: [1,0,0,2,0,0]})")
+        assert "must start with" in caught.value.diag.message_detail
 
     def test_the_dimension_is_enforced_at_write(self, sparse) -> None:  # type: ignore[no-untyped-def]
         with pytest.raises(agensgraph.errors.Error):

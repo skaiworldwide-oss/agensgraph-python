@@ -586,3 +586,26 @@ class TestTheMechanismsAReadRelieson:
             conn.execute_query("return 1")
             conn.refresh_labels()
         assert len(sent) >= 2
+
+
+class TestRowDataInAFailure:
+    """The server puts row data in DETAIL, so a message is not automatically safe to log."""
+
+    @pytest.fixture
+    def constrained(self, graph: Connection[object]) -> Connection[object]:
+        graph.execute("create vlabel account")
+        graph.execute("create constraint on account assert (email) is unique")
+        graph.execute("create (:account {email: 'alice@example.com'})")
+        return graph
+
+    def test_a_conflicting_value_does_not_reach_the_message(
+        self, constrained: Connection[object], dsn: str
+    ) -> None:
+        name = constrained.execute("select current_setting('graph_path')").fetchone()[0]
+        with agensgraph.connect(dsn) as conn:
+            conn.graph(name)
+            with pytest.raises(psycopg.Error) as caught:
+                conn.execute_query("create (:account {email: 'alice@example.com'})")
+        assert "alice@example.com" not in str(caught.value)
+        assert "alice@example.com" in caught.value.diag.message_detail
+        assert caught.value.sqlstate is not None

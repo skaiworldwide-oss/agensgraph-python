@@ -24,7 +24,10 @@ from .deadline import Expired as Expired
 from .errors import BatchFailed as BatchFailed
 from .errors import Retryability as Retryability
 from .errors import is_retryable as is_retryable
+from .errors import redact_details as redact_details
 from .errors import retryability as retryability
+from .errors import show_error_details as show_error_details
+from .errors import showing_error_details as showing_error_details
 from .introspect import Check as Check
 from .introspect import Constraint as Constraint
 from .introspect import DeclaredProperty as DeclaredProperty
@@ -113,8 +116,11 @@ __all__ = [
     "paused_collection",
     "read_numbers_exactly",
     "reading_numbers_exactly",
+    "redact_details",
     "remove_query_logger",
     "retryability",
+    "show_error_details",
+    "showing_error_details",
     "vector",
 ]
 

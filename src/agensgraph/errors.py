@@ -94,7 +94,10 @@ __all__ = [
     "explain_string_type",
     "is_retryable",
     "mask_dsn",
+    "redact_details",
     "retryability",
+    "show_error_details",
+    "showing_error_details",
     "translate",
 ]
 
@@ -579,6 +582,51 @@ def attach_retry_history(
     if exhausted and attempts > 1 and exc.args and not getattr(exc, "_agens_retry_noted", False):
         exc._agens_retry_noted = True  # type: ignore[attr-defined]
         exc.args = (f"{exc.args[0]} (reached max retries: {attempts})", *exc.args[1:])
+
+
+_show_details = False
+
+
+def show_error_details(enabled: bool = True) -> None:
+    """Whether a failure's DETAIL and CONTEXT belong in the message it prints as.
+
+    They do not, by default, and the reason is that PostgreSQL puts row data in them: a
+    uniqueness failure's DETAIL reads ``Key (email)=(alice@example.com) already exists``, so a
+    plain ``logger.exception`` writes a value into the log that the driver never saw as a
+    parameter. What the message loses, ``exc.diag.message_detail`` and ``exc.diag.context``
+    still hold -- the data stays for a post-mortem and only the rendering is cut.
+
+    Process-wide rather than per statement, so that it cannot be forgotten at one call site.
+    """
+    global _show_details
+    _show_details = enabled
+
+
+def showing_error_details() -> bool:
+    """Whether a failure's DETAIL and CONTEXT are currently part of its message."""
+    return _show_details
+
+
+def redact_details(exc: BaseException) -> BaseException:
+    """Cut the DETAIL and CONTEXT out of what a failure prints as, and return it.
+
+    The exception itself is returned, not a replacement: it is psycopg's class, raised by
+    psycopg, and re-raising something else would stop every ``except`` clause written against
+    it from matching. Only the message is rewritten, and only when it holds something the
+    diagnostics say is there.
+
+    Applying it twice changes nothing the second time.
+    """
+    if _show_details:
+        return exc
+    diag = getattr(exc, "diag", None)
+    primary = getattr(diag, "message_primary", None)
+    if primary is None or not exc.args or exc.args[0] == primary:
+        return exc
+    if not isinstance(exc.args[0], str) or not exc.args[0].startswith(primary):
+        return exc
+    exc.args = (primary, *exc.args[1:])
+    return exc
 
 
 def mask_dsn(dsn: str | None) -> str:

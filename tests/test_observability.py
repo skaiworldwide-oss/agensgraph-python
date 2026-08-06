@@ -128,12 +128,27 @@ class TestAgainstAServer:
             agens.execute_query("match (n:thing) return n")
         finally:
             remove_query_logger(seen.append)
-        assert len(seen) == 1, "execute_query is reported; psycopg's own execute is not"
-        record = seen[0]
-        assert record.statement == "match (n:thing) return n"
+        assert [record.statement for record in seen] == [
+            "create vlabel thing",
+            "match (n:thing) return n",
+        ], "every statement is reported, not only the ones execute_query sent"
+        record = seen[-1]
         assert not record.failed
         assert record.elapsed > 0
         assert record.rows == 0
+
+    def test_the_driver_s_own_statements_are_reported_too(self, agens) -> None:  # type: ignore[no-untyped-def]
+        """A caller asking what the driver sends wants its catalog reads, which are the ones
+        they did not write and cannot otherwise see."""
+        seen: list[QueryRecord] = []
+        add_query_logger(seen.append)
+        try:
+            agens.labels()
+            agens.refresh_labels()
+        finally:
+            remove_query_logger(seen.append)
+        assert len(seen) >= 2
+        assert all(record.elapsed > 0 for record in seen)
 
     def test_the_rows_are_counted(self, agens) -> None:  # type: ignore[no-untyped-def]
         agens.execute("create vlabel thing")

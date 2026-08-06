@@ -48,7 +48,7 @@ from .bulk import (
 from .capabilities import VECTOR_AVAILABLE_QUERY, VECTOR_VERSION_QUERY
 from .columnar import CHUNK
 from .cypher import changes_graph_path, check_bindable_positions, wrap_for_cursor
-from .errors import BatchFailed, NoEnclosingTransaction
+from .errors import BatchFailed, NoEnclosingTransaction, redact_details
 from .introspect import (
     CONSTRAINTS_QUERY,
     DECLARED_PROPERTIES_QUERY,
@@ -98,10 +98,15 @@ class Cursor(psycopg.Cursor[Row]):
     ``connection.execute`` builds one, and a caller may take one and use it directly. So one
     check here holds for all of them.
 
-    Two things are watched for. A statement whose parameter the server would read as something
-    else is refused before it is sent. A statement that moves the session to another graph
-    leaves the label table describing a graph the session is no longer reading, so the table
-    is dropped once such a statement has run.
+    Three things are watched for. A statement whose parameter the server would read as
+    something else is refused before it is sent. A statement that moves the session to another
+    graph leaves the label table describing a graph the session is no longer reading, so the
+    table is dropped once such a statement has run. And every statement is reported to whatever
+    is listening, which is why it is reported from here: a caller asking what the driver sends
+    wants the driver's own catalog reads too, and those do not come through ``execute_query``.
+
+    ``elapsed`` on a record is the round trip, from sending the statement to the server having
+    answered -- not the reading of the rows afterwards, which happens outside this call.
     """
 
     def execute(
@@ -113,9 +118,17 @@ class Cursor(psycopg.Cursor[Row]):
         binary: bool | None = None,
     ) -> Self:
         text = statement_text(query)
-        self._guard()
+        conn = self._guard()
         check_bindable_positions(text)
-        super().execute(cast("QueryNoTemplate", query), params, prepare=prepare, binary=binary)
+        timer = Timer.start()
+        try:
+            super().execute(
+                cast("QueryNoTemplate", query), params, prepare=prepare, binary=binary
+            )
+        except psycopg.Error as exc:
+            conn._report_query(text, timer, rows=0, error=redact_details(exc))
+            raise
+        conn._report_query(text, timer, rows=self.rowcount, error=None)
         self._watch_graph_path(text)
         return self
 
@@ -123,9 +136,15 @@ class Cursor(psycopg.Cursor[Row]):
         self, query: Query, params_seq: Iterable[Params], *, returning: bool = False
     ) -> None:
         text = statement_text(query)
-        self._guard()
+        conn = self._guard()
         check_bindable_positions(text)
-        super().executemany(query, params_seq, returning=returning)
+        timer = Timer.start()
+        try:
+            super().executemany(query, params_seq, returning=returning)
+        except psycopg.Error as exc:
+            conn._report_query(text, timer, rows=0, error=redact_details(exc))
+            raise
+        conn._report_query(text, timer, rows=self.rowcount, error=None)
         self._watch_graph_path(text)
 
     def _guard(self) -> Connection[Row]:
@@ -269,7 +288,6 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
         is no way to tell a number this statement earned from one it inherited.
         """
         text = statement_text(query)
-        timer = Timer()
         with query_span(text, graph=self.label_table.graph):
             with self.cursor(row_factory=row_) if row_ else self.cursor() as cursor:
                 if binary_:
@@ -281,15 +299,12 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
                 try:
                     cursor.execute(query, params, prepare=prepare_)
                 except psycopg.Error as exc:
-                    failure = self._translated(exc)
-                    self._report_query(text, timer, rows=0, error=failure)
-                    raise failure from None
+                    raise self._translated(exc) from None
                 described = cursor.description
                 records = cursor.fetchall() if described is not None else []
                 keys = [column.name for column in described or ()]
                 oids = tuple(int(column.type_code) for column in described or ())
         after = self._counters() if counts_ else None
-        self._report_query(text, timer, rows=len(records), error=None)
         return Result(records, keys, self._counts_for(text, before, after), oids)
 
     def transaction_id(self, *, assign: bool = False) -> int | None:
@@ -362,6 +377,7 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
         statement = wrap_for_cursor(query)
         if self.autocommit and name is None:
             raise NoEnclosingTransaction.for_stream()
+        timer = Timer.start()
         with self.cursor(name=name or stream_name()) as cursor:
             cursor.itersize = size
             if binary_:
@@ -370,7 +386,10 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
             try:
                 cursor.execute(statement, params)
             except psycopg.Error as exc:
-                raise self._translated(exc) from None
+                failure = self._translated(exc)
+                self._report_query(statement, timer, rows=0, error=failure)
+                raise failure from None
+            self._report_query(statement, timer, rows=cursor.rowcount, error=None)
             while True:
                 rows = cursor.fetchmany(size)
                 if not rows:

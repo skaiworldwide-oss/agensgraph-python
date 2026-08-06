@@ -749,11 +749,35 @@ agensgraph.add_query_logger(log)
 agensgraph.enable_tracing()      # needs agensgraph-python[otel]
 ```
 
+Every statement is reported, not only the ones `execute_query` sent: `conn.execute`, a cursor a
+caller took for themselves, and the driver's own catalog reads all arrive at the same place. A
+caller asking what the driver sends wants the round trips they did not write. `elapsed` is the
+round trip — sending the statement until the server has answered — and not the reading of the rows
+afterwards.
+
 Off costs a boolean test — measured at 165 µs per statement with a logger attached against 165
-with none. A clock is not read unless something is going to ask for the number. Spans are per
-statement and never per row, the tracing API is imported only when asked for and the SDK never,
-the record carries an opaque connection number rather than the connection's settings, and no
-parameter value ever reaches a span.
+with none, and the reporting adds about 360 ns to a statement whose round trip is 140 µs. A clock
+is not read, and a timer is not even allocated, unless something is going to ask for the number.
+Spans are per statement and never per row, the tracing API is imported only when asked for and the
+SDK never, the record carries an opaque connection number rather than the connection's settings,
+and no parameter value ever reaches a span.
+
+### What a failure prints as
+
+PostgreSQL puts row data in a failure's DETAIL: a uniqueness failure reads `Key
+(email)=(alice@example.com) already exists`, so a plain `logger.exception` writes into the log a
+value the driver never saw as a parameter. DETAIL and CONTEXT are therefore not part of the message
+by default. What the message loses, `exc.diag.message_detail` and `exc.diag.context` still hold —
+the data stays for a post-mortem and only the rendering is cut, and the exception is still the class
+psycopg raised, so every `except` clause keeps matching.
+
+```python
+agensgraph.show_error_details(True)     # process-wide, so it cannot be forgotten at a call site
+```
+
+It cuts DETAIL and CONTEXT and nothing else. A primary message can still echo what was sent —
+`invalid input syntax for type sparsevec: "[1, 0, 0, 2, 0, 0]"` — because that is the server
+quoting the value it was given rather than a value belonging to another row.
 
 ## Using it from a generic tool
 

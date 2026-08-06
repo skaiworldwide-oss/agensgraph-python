@@ -45,7 +45,7 @@ from .bulk import (
 from .capabilities import VECTOR_AVAILABLE_QUERY, VECTOR_VERSION_QUERY
 from .columnar import CHUNK
 from .cypher import changes_graph_path, check_bindable_positions, wrap_for_cursor
-from .errors import BatchFailed, NoEnclosingTransaction
+from .errors import BatchFailed, NoEnclosingTransaction, redact_details
 from .introspect import (
     CONSTRAINTS_QUERY,
     DECLARED_PROPERTIES_QUERY,
@@ -101,10 +101,15 @@ class AsyncCursor(psycopg.AsyncCursor[Row]):
     ``connection.execute`` builds one, and a caller may take one and use it directly. So one
     check here holds for all of them.
 
-    Two things are watched for. A statement whose parameter the server would read as something
-    else is refused before it is sent. A statement that moves the session to another graph
-    leaves the label table describing a graph the session is no longer reading, so the table
-    is dropped once such a statement has run.
+    Three things are watched for. A statement whose parameter the server would read as
+    something else is refused before it is sent. A statement that moves the session to another
+    graph leaves the label table describing a graph the session is no longer reading, so the
+    table is dropped once such a statement has run. And every statement is reported to whatever
+    is listening, which is why it is reported from here: a caller asking what the driver sends
+    wants the driver's own catalog reads too, and those do not come through ``execute_query``.
+
+    ``elapsed`` on a record is the round trip, from sending the statement to the server having
+    answered -- not the reading of the rows afterwards, which happens outside this call.
     """
 
     async def execute(
@@ -116,14 +121,20 @@ class AsyncCursor(psycopg.AsyncCursor[Row]):
         binary: bool | None = None,
     ) -> Self:
         text = statement_text(query)
-        self._guard()
+        conn = self._guard()
         check_bindable_positions(text)
+        timer = Timer.start()
         # psycopg offers this as two overloads, one of which takes a template and no
         # parameters. Its own body takes either and sorts them out, which is what is wanted
         # here: one check, then whatever was written goes on unchanged.
-        await super().execute(
-            cast("QueryNoTemplate", query), params, prepare=prepare, binary=binary
-        )
+        try:
+            await super().execute(
+                cast("QueryNoTemplate", query), params, prepare=prepare, binary=binary
+            )
+        except psycopg.Error as exc:
+            conn._report_query(text, timer, rows=0, error=redact_details(exc))
+            raise
+        conn._report_query(text, timer, rows=self.rowcount, error=None)
         self._watch_graph_path(text)
         return self
 
@@ -131,9 +142,15 @@ class AsyncCursor(psycopg.AsyncCursor[Row]):
         self, query: Query, params_seq: Iterable[Params], *, returning: bool = False
     ) -> None:
         text = statement_text(query)
-        self._guard()
+        conn = self._guard()
         check_bindable_positions(text)
-        await super().executemany(query, params_seq, returning=returning)
+        timer = Timer.start()
+        try:
+            await super().executemany(query, params_seq, returning=returning)
+        except psycopg.Error as exc:
+            conn._report_query(text, timer, rows=0, error=redact_details(exc))
+            raise
+        conn._report_query(text, timer, rows=self.rowcount, error=None)
         self._watch_graph_path(text)
 
     def _guard(self) -> AsyncConnection[Row]:
@@ -288,7 +305,6 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
         is no way to tell a number this statement earned from one it inherited.
         """
         text = statement_text(query)
-        timer = Timer()
 
         # The span is taken outside, and is not something to wait for: it is a plain block
         # in both interfaces, so it stays one rather than being converted into a wait.
@@ -303,9 +319,7 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
                 try:
                     await cursor.execute(query, params, prepare=prepare_)
                 except psycopg.Error as exc:
-                    failure = self._translated(exc)
-                    self._report_query(text, timer, rows=0, error=failure)
-                    raise failure from None
+                    raise self._translated(exc) from None
                 # A statement that changed something without returning rows still has a
                 # result, and asking that result for rows raises.  What distinguishes the
                 # two is whether it describes any columns.
@@ -314,7 +328,6 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
                 keys = [column.name for column in described or ()]
                 oids = tuple(int(column.type_code) for column in described or ())
         after = await self._counters() if counts_ else None
-        self._report_query(text, timer, rows=len(records), error=None)
         return Result(records, keys, self._counts_for(text, before, after), oids)
 
     async def transaction_id(self, *, assign: bool = False) -> int | None:
@@ -389,6 +402,9 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
         statement = wrap_for_cursor(query)
         if self.autocommit and name is None:
             raise NoEnclosingTransaction.for_stream()
+        # Reported here rather than at the cursor: a server-side cursor is psycopg's own class
+        # and not the one that reports for itself, and a stream is a statement like any other.
+        timer = Timer.start()
         async with self.cursor(name=name or stream_name()) as cursor:
             cursor.itersize = size
             if binary_:
@@ -397,7 +413,10 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
             try:
                 await cursor.execute(statement, params)
             except psycopg.Error as exc:
-                raise self._translated(exc) from None
+                failure = self._translated(exc)
+                self._report_query(statement, timer, rows=0, error=failure)
+                raise failure from None
+            self._report_query(statement, timer, rows=cursor.rowcount, error=None)
             while True:
                 rows = await cursor.fetchmany(size)
                 if not rows:
