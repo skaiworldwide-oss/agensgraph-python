@@ -140,13 +140,14 @@ class TestExecuteQuery:
         assert result.counts.inserted_vertices == 1
         assert result.counts.total == 1
 
-    def test_a_write_that_returns_rows_reports_only_what_it_can(self, conn) -> None:  # type: ignore[no-untyped-def]
-        """The insert counters still hold the fixture's two vertices and one edge."""
+    def test_a_write_that_returns_rows_is_credited_with_its_own_clauses(self, conn) -> None:  # type: ignore[no-untyped-def]
+        """The insert counters still hold the fixture's vertices, and a SET cannot have
+        inserted anything, so they are nought for this statement whatever they hold."""
         conn.execute_query("create (:person {name: 'd'}), (:person {name: 'e'})")
         result = conn.execute_query("match (n:person) set n.x = 1 return n", counts_=True)
         assert result.counts.updated_properties == len(result.records)
-        assert result.counts.inserted_vertices is None
-        assert not result.counts.complete
+        assert result.counts.inserted_vertices == 0
+        assert result.counts.inserted_edges == 0
 
     def test_counters_are_not_read_unless_asked_for(self, conn) -> None:  # type: ignore[no-untyped-def]
         result = conn.execute_query("create (:person {name: 'f'})")
@@ -239,12 +240,12 @@ class TestTheAwaitingInterface:
         assert result.counts.inserted_vertices == 1
 
     @pytest.mark.asyncio
-    async def test_a_write_that_returns_rows_reports_only_what_it_can(self, aconn) -> None:  # type: ignore[no-untyped-def]
+    async def test_a_write_that_returns_rows_is_credited_with_its_own_clauses(self, aconn) -> None:  # type: ignore[no-untyped-def]
         await aconn.execute_query("create (:person {name: 'd'})")
         result = await aconn.execute_query(
             "match (n:person) set n.x = 1 return n", counts_=True
         )
-        assert result.counts.inserted_vertices is None
+        assert result.counts.inserted_vertices == 0
         assert result.counts.updated_properties == len(result.records)
 
     @pytest.mark.asyncio

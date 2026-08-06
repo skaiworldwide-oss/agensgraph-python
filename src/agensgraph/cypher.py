@@ -19,6 +19,10 @@ are refused here before the statement is sent.
 from __future__ import annotations
 
 import re
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 __all__ = [
     "WRAP",
@@ -303,6 +307,25 @@ _WRITE_CLAUSE = re.compile(
     re.IGNORECASE,
 )
 
+# Which of the five write counters a clause can move, read from `initGraphWRStats`: a pattern
+# zeroes the two insert counters, a delete expression the two delete counters, and a set list
+# the property counter. `MERGE` carries a pattern and a set list, and `INSERT` is a synonym of
+# `CREATE`.
+WRITE_GROUPS: Mapping[str, tuple[int, ...]] = {
+    "create": (0, 1),
+    "insert": (0, 1),
+    "merge": (0, 1, 4),
+    "delete": (2, 3),
+    "detach": (2, 3),
+    "set": (4,),
+    "remove": (4,),
+}
+
+_WRITE_WORD = re.compile(
+    r'(?<![a-z0-9_.":])(create|insert|merge|set|delete|remove|detach)(?![a-z0-9_]|\s*:)'
+)
+_WRITE_WORDS = tuple(WRITE_GROUPS)
+
 WRAP = "select * from ({statement}) as {alias}"
 """How a Cypher statement is made readable by a server-side cursor.
 
@@ -325,6 +348,32 @@ def wrap_for_cursor(statement: str, *, alias: str = "t") -> str:
     """
     check_can_wrap(statement)
     return WRAP.format(statement=statement.rstrip().rstrip(";"), alias=quote_identifier(alias))
+
+
+def writable_counters(statement: str) -> frozenset[int]:
+    """Which write counters this statement's clauses could move.
+
+    The server zeroes a counter only for a clause that can write it, so a counter no clause
+    here names was neither zeroed nor written and its answer for this statement is nought.
+    A statement naming no write clause at all can move none of them.
+
+    Read from the statement as written, with strings and comments blanked out, and the words
+    are the ones a clause is spelled with. A statement that is not Cypher and happens to hold
+    one of them is read as though it could write, which costs an unanswered counter rather
+    than a wrong one.
+
+    A statement holding none of the words is answered by substring tests over the text as
+    written, which is what an ordinary read is. Blanking a literal writes spaces, so it can
+    only take a word away and never add one, and a statement without one has nothing here to
+    find whatever its strings hold.
+    """
+    if not any(word in statement.lower() for word in _WRITE_WORDS):
+        return frozenset()
+    lowered = without_literals(statement).lower()
+    groups: set[int] = set()
+    for found in _WRITE_WORD.finditer(lowered):
+        groups.update(WRITE_GROUPS[found.group(1)])
+    return frozenset(groups)
 
 
 def check_can_wrap(statement: str) -> None:

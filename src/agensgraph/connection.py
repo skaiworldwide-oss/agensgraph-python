@@ -258,10 +258,9 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
                 records = cursor.fetchall() if described is not None else []
                 keys = [column.name for column in described or ()]
                 oids = tuple(int(column.type_code) for column in described or ())
-                tag = cursor.statusmessage
         after = self._counters() if counts_ else None
         self._report_query(text, timer, rows=len(records), error=None)
-        return Result(records, keys, self._counts_for(tag, before, after), oids)
+        return Result(records, keys, self._counts_for(text, before, after), oids)
 
     def transaction_id(self, *, assign: bool = False) -> int | None:
         """The id of the transaction now open, so its fate can be asked about if it is lost.

@@ -19,7 +19,7 @@ from psycopg.adapt import AdaptersMap
 from ._protocol.labels import LabelCache
 from .adapters import graph_adapters, register_binary
 from .capabilities import Capabilities
-from .cypher import check_bindable_positions, quote_identifier
+from .cypher import check_bindable_positions, quote_identifier, writable_counters
 from .errors import StaleLabelCache, explain_string_type, translate
 from .observability import QueryRecord, logging_wanted, report
 from .summary import GraphWriteCounts
@@ -218,22 +218,34 @@ class GraphMixin:
 
     @staticmethod
     def _counts_for(
-        tag: str | None, before: Sequence[int] | None, after: Sequence[int] | None
+        statement: str, before: Sequence[int] | None, after: Sequence[int] | None
     ) -> GraphWriteCounts:
         """Read the counters as far as the statement allows.
 
-        A write with no ``RETURN`` reports its command as an update, and starting one zeroes
-        all five counters, so all five belong to it. A write that returned rows reports a
-        select, and only the counters for the clauses it has were zeroed, so it is held to
-        the ones that changed and to the ones that were zero to begin with.
+        The counters live on the session and only a graph write moves them, so reading them
+        after a statement says what the session holds and not what the statement did. Two
+        things narrow that to the statement.
+
+        Its clauses say which counters it could move at all: the server zeroes a counter only
+        for a clause that can write it, so a counter no clause names is nought for this
+        statement whatever the session holds.
+
+        For the rest, a reading from before the statement says which of them it moved. A
+        counter that changed can only have been changed here. One that did not, and was
+        already nought, is nought either way. One that did not and was not nought is the one
+        case a stale number and a real one look alike, and it is left unanswered.
+
+        The command tag is not consulted. A graph write reports its command as an update, and
+        so does an ordinary SQL update, whose row count has nothing to do with these.
         """
         if after is None:
             return GraphWriteCounts.unknown()
-        if tag is not None and tag.split(" ", 1)[0].upper() == "UPDATE":
-            return GraphWriteCounts.exact(after)
+        movable = writable_counters(statement)
         if before is None:
-            return GraphWriteCounts.unknown()
-        return GraphWriteCounts.between(before, after)
+            return GraphWriteCounts(
+                *(int(after[i]) if i in movable else 0 for i in range(5))
+            )
+        return GraphWriteCounts.for_statement(before, after, movable)
 
     def _report_query(
         self, statement: str, timer: Any, *, rows: int, error: BaseException | None

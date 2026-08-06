@@ -97,3 +97,130 @@ class TestUnknown:
     def test_it_is_not_zeros(self) -> None:
         """A statement that changed nothing and a statement never asked about are different."""
         assert GraphWriteCounts.unknown() != GraphWriteCounts.exact([0, 0, 0, 0, 0])
+
+
+class TestWhichCountersAStatementCouldMove:
+    """The server zeroes a counter only for a clause that can write it."""
+
+    @pytest.mark.parametrize(
+        ("statement", "expected"),
+        [
+            ("create (:t)", {0, 1}),
+            ("insert (:t)", {0, 1}),
+            ("merge (:t {a: 1})", {0, 1, 4}),
+            ("match (n) delete n", {2, 3}),
+            ("match (n) detach delete n", {2, 3}),
+            ("match (n) set n.a = 1", {4}),
+            ("match (n) remove n.a", {4}),
+            ("match (n) return n", set()),
+            ("select 1", set()),
+            ("match (n) where n.s = 'create' return n", set()),
+            ("-- create (:t)\nmatch (n) return n", set()),
+        ],
+    )
+    def test_the_clauses_are_read_from_the_statement(
+        self, statement: str, expected: set[int]
+    ) -> None:
+        from agensgraph.cypher import writable_counters
+
+        assert writable_counters(statement) == expected
+
+
+class TestForStatement:
+    """A counter no clause of the statement can write is nought for that statement."""
+
+    def test_a_counter_no_clause_names_is_nought(self) -> None:
+        counts = GraphWriteCounts.for_statement([9, 9, 9, 9, 9], [9, 9, 9, 9, 9], {0, 1})
+        assert counts.deleted_vertices == 0
+        assert counts.deleted_edges == 0
+        assert counts.updated_properties == 0
+
+    def test_a_counter_that_moved_is_reported_whatever_the_clauses_say(self) -> None:
+        """A statement can write without naming a clause, by calling something that does, and
+        nothing else ran between the two readings."""
+        counts = GraphWriteCounts.for_statement([0, 0, 0, 0, 0], [1, 0, 0, 0, 0], set())
+        assert counts.inserted_vertices == 1
+
+    def test_a_counter_a_clause_names_is_read_as_between_reads_it(self) -> None:
+        counts = GraphWriteCounts.for_statement([9, 0, 0, 0, 0], [4, 0, 0, 0, 0], {0, 1})
+        assert counts.inserted_vertices == 4
+        counts = GraphWriteCounts.for_statement([9, 0, 0, 0, 0], [9, 0, 0, 0, 0], {0, 1})
+        assert counts.inserted_vertices is None
+
+    def test_a_statement_with_no_write_clause_reports_five_zeros(self) -> None:
+        counts = GraphWriteCounts.for_statement([2, 3, 4, 5, 6], [2, 3, 4, 5, 6], set())
+        assert tuple(counts) == (0, 0, 0, 0, 0)
+        assert counts.total == 0
+
+    def test_five_counters_each_are_required(self) -> None:
+        with pytest.raises(ValueError, match="five counters each"):
+            GraphWriteCounts.for_statement([0], [0, 0, 0, 0, 0], set())
+
+
+@pytest.mark.server
+class TestCountersAgainstAServer:
+    """The counters live on the session, so what a statement is credited with matters."""
+
+    def test_a_statement_that_wrote_no_graph_elements_reports_none_of_them(self, agens) -> None:  # type: ignore[no-untyped-def]
+        """An ordinary SQL update reports its command as an update, exactly as a graph write
+        does, and its row count has nothing to do with these counters."""
+        agens.execute("create vlabel t")
+        agens.refresh_labels()
+        agens.execute("create table plain (x int)")
+        agens.execute("insert into plain values (1), (2), (3)")
+        try:
+            written = agens.execute_query("create (:t {a: 1}), (:t {a: 2})", counts_=True)
+            assert written.counts.inserted_vertices == 2
+
+            plain = agens.execute_query("update plain set x = x + 1", counts_=True)
+            assert plain.counts.inserted_vertices == 0
+            assert plain.counts.total == 0
+        finally:
+            agens.execute("drop table plain")
+
+    def test_a_read_reports_five_zeros(self, agens) -> None:  # type: ignore[no-untyped-def]
+        agens.execute("create vlabel t")
+        agens.refresh_labels()
+        agens.execute("create (:t {a: 1})")
+        counts = agens.execute_query("match (n:t) return n", counts_=True).counts
+        assert tuple(counts) == (0, 0, 0, 0, 0)
+
+    def test_a_write_is_not_credited_with_an_earlier_statement_s_numbers(self, agens) -> None:  # type: ignore[no-untyped-def]
+        """A write with RETURN zeroes only the counters its own clauses touch, so the rest
+        still hold whatever the statement before it left."""
+        agens.execute("create vlabel t")
+        agens.refresh_labels()
+        created = agens.execute_query("create (:t {a: 1}), (:t {a: 2})", counts_=True)
+        assert created.counts.inserted_vertices == 2
+
+        updated = agens.execute_query(
+            "match (n:t) where n.a = 1 set n.b = 9 return n", counts_=True
+        ).counts
+        assert updated.inserted_vertices == 0
+        assert updated.updated_properties == 1
+
+    def test_a_delete_reports_only_what_it_deleted(self, agens) -> None:  # type: ignore[no-untyped-def]
+        agens.execute("create vlabel t")
+        agens.refresh_labels()
+        agens.execute("create (:t {a: 1}), (:t {a: 2})")
+        counts = agens.execute_query("match (n:t) where n.a = 1 delete n", counts_=True).counts
+        assert counts.deleted_vertices == 1
+        assert counts.inserted_vertices == 0
+
+
+@pytest.mark.server
+class TestAWriteThatNamesNoClause:
+    """A statement's text is not the only way it can write."""
+
+    def test_a_function_that_writes_is_still_counted(self, agens) -> None:  # type: ignore[no-untyped-def]
+        agens.execute("create vlabel t")
+        agens.refresh_labels()
+        agens.execute(
+            "create or replace function writes_one() returns void as $$ "
+            "begin execute 'create (:t {a: 1})'; end $$ language plpgsql"
+        )
+        try:
+            counts = agens.execute_query("select writes_one()", counts_=True).counts
+            assert counts.inserted_vertices == 1
+        finally:
+            agens.execute("drop function writes_one()")

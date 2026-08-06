@@ -26,7 +26,7 @@ import enum
 from typing import TYPE_CHECKING, NamedTuple
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Collection, Sequence
 
 __all__ = [
     "ASSIGNED_TRANSACTION_QUERY",
@@ -79,12 +79,15 @@ class GraphWriteCounts(NamedTuple):
 
     @classmethod
     def between(cls, before: Sequence[int], after: Sequence[int]) -> GraphWriteCounts:
-        """Only the counters a statement can be held to, for a write that returned rows.
+        """Only the counters a statement can be held to, from two readings alone.
 
         A counter is reported when it changed, since only the statement could have changed
         it, and when it was already zero, since a counter the statement zeroed and a counter
         that was zero already are both zero. It is left unreported when it is unchanged and
         was not zero, which is the one case where a stale number and a real one look alike.
+
+        :meth:`for_statement` answers more of them, by reading which counters the statement's
+        own clauses could move.
         """
         if len(before) != 5 or len(after) != 5:
             raise ValueError(f"expected five counters each, got {len(before)} and {len(after)}")
@@ -92,6 +95,34 @@ class GraphWriteCounts(NamedTuple):
             *(
                 int(now) if now != then or then == 0 else None
                 for then, now in zip(before, after, strict=True)
+            )
+        )
+
+    @classmethod
+    def for_statement(
+        cls, before: Sequence[int], after: Sequence[int], movable: Collection[int]
+    ) -> GraphWriteCounts:
+        """The counters, with the statement's own clauses settling what two readings cannot.
+
+        The two readings come first and are never overruled: a counter that moved was moved by
+        this statement, whatever its clauses appear to say, because nothing else ran in
+        between. A statement can write without naming a clause -- a function it calls may run
+        one -- so a counter that changed is reported even when no clause of the text explains
+        it.
+
+        *movable* settles the one case two readings cannot: a counter that did not move and
+        was not already nought. If no clause of this statement can write that counter, the
+        server never zeroed it and the statement never wrote it, so it is nought for this
+        statement. If a clause can, a stale number and a real one look alike and it goes
+        unreported.
+        """
+        if len(before) != 5 or len(after) != 5:
+            raise ValueError(f"expected five counters each, got {len(before)} and {len(after)}")
+        held = cls.between(before, after)
+        return cls(
+            *(
+                value if value is not None else (None if i in movable else 0)
+                for i, value in enumerate(held)
             )
         )
 
