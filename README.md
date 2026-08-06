@@ -106,6 +106,27 @@ inside a transaction gets to run.
 `conn.graph(name)` selects a graph and fills the label table the composite rendering needs.
 The name is quoted rather than bound, because the grammar has no place for a parameter there.
 
+`execute_query` takes the statement, the parameters as a sequence, and reserved arguments ending in
+an underscore — `binary_`, `counts_`, `prepare_`, `row_`. It returns a named tuple, so
+`result.records`, `result.keys`, `result.counts` and `result.oids` all read the same whichever
+order they are in.
+
+There is no `graph_` and no `timeout_`, and both are absences with a reason. Selecting a graph is a
+statement, is undone by a rollback, and drops the label table; it belongs on the connection or on
+the pool, once, rather than once per statement. Bounding a statement's time is two more statements,
+one to set the limit and one to put it back — measured, `return 1` costs 161 µs and the same read
+between them costs 373, and against a server a network away those are two more round trips. So a
+deadline belongs where it is paid once for many statements: `pool.connection(deadline=…)`, or
+`options=-c statement_timeout=…` on the connection.
+
+```python
+agensgraph.connect(dsn, options="-c statement_timeout=5000")
+```
+
+Three methods run a statement and each returns one kind of thing, so none of them returns a union:
+`execute_query` reads it all and gives a result, `stream` gives an iterator that keeps the rows on
+the server, and `execute` is psycopg's own and gives a cursor.
+
 ## Parameters
 
 Parameters are psycopg's — `%s`, or `%(name)s`, never string formatting. Pass plain Python

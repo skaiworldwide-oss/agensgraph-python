@@ -302,3 +302,27 @@ class TestKeepaliveDefaults:
         from agensgraph._core import with_keepalives
 
         assert with_keepalives({}, "postgresql://h/db?keepalives=0") == {}
+
+
+def test_the_reserved_arguments_are_the_four_that_are_documented() -> None:
+    """So that a fifth is a decision rather than an accident.
+
+    Two a caller might look for are absent on purpose: a graph to read for this statement alone,
+    and a time limit for it. Each would cost round trips that belong where they are paid once for
+    many statements.
+    """
+    import inspect
+
+    signature = inspect.signature(agensgraph.Connection.execute_query)
+    reserved = [
+        name
+        for name, parameter in signature.parameters.items()
+        if parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    ]
+    assert reserved == ["binary_", "counts_", "prepare_", "row_"]
+    positional = [
+        name
+        for name, parameter in signature.parameters.items()
+        if parameter.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+    ]
+    assert positional == ["self", "query", "params"]

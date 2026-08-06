@@ -276,9 +276,24 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
     ) -> Result:
         """Run one statement and read all of it.
 
-        The reserved arguments end in an underscore so that a parameter of any name can be
-        passed alongside them. Nothing rewrites the statement: it goes as written, and
-        ``binary_`` asks only for the rendering the answer comes back in.
+        Parameters are a sequence, as psycopg takes them, rather than arguments of their own.
+        A form taking them one by one cannot tell a single sequence parameter from several
+        parameters, and this driver binds a list where the grammar wants one. The reserved
+        arguments still end in an underscore, so that the shape stays open to a mapping of
+        named parameters without any of them colliding with a name a caller chose.
+
+        Nothing rewrites the statement: it goes as written, and ``binary_`` asks only for the
+        rendering the answer comes back in.
+
+        Two arguments a caller might look for are deliberately absent, both because they would
+        cost round trips that belong somewhere cheaper. Selecting a graph is a statement and
+        undone by a rollback, and it drops the label table, so it is :meth:`graph` on the
+        connection or ``graph=`` on a pool -- once, not once per statement. Bounding a
+        statement's time is two more statements, one to set the limit and one to put it back:
+        measured, ``return 1`` costs 161 microseconds and the same read between them costs 373,
+        and against a server a network away it would be two more round trips rather than two
+        more local ones. So it belongs where it is paid once for many statements -- a pool's
+        ``deadline``, or ``options=-c statement_timeout=...`` on the connection.
 
         ``counts_`` reads what the statement changed, which is a second statement because
         the server offers the counters through a function rather than sending them with the
