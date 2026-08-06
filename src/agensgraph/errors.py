@@ -82,6 +82,7 @@ __all__ = [
     "OperationalError",
     "ProgrammingError",
     "ReadOnlyGraphWrite",
+    "ReleasedConnection",
     "Retryability",
     "StaleGeneration",
     "StaleLabelCache",
@@ -355,6 +356,27 @@ class StaleLabelCache(_pg.OperationalError):
             "the composite rendering needs a label table to name a label from, and this "
             "connection has none. Call graph() or refresh_labels() first, or read the text "
             "rendering, which carries the name the server wrote"
+        )
+
+
+class ReleasedConnection(_pg.InterfaceError):
+    """A pooled connection used after its holder gave it back.
+
+    A pool lends the connection itself, so a handle kept past the block that borrowed it is the
+    same object the pool later lends to somebody else. Whatever is done through it lands on
+    that other caller's work -- a ``rollback`` discards their transaction, a statement runs in
+    it -- and none of it looks like a mistake from either side.
+
+    Take a connection for each piece of work, and let the block end it.
+    """
+
+    @classmethod
+    def for_use(cls) -> ReleasedConnection:
+        """Build the report."""
+        return cls(
+            "this connection has gone back to the pool, and may already have been lent to "
+            "somebody else. Take one with `with pool.connection() as conn:` for each piece of "
+            "work, and do not keep the handle past the block"
         )
 
 

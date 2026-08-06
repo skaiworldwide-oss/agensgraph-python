@@ -104,6 +104,7 @@ class Cursor(psycopg.Cursor[Row]):
         binary: bool | None = None,
     ) -> Self:
         text = statement_text(query)
+        self._guard()
         check_bindable_positions(text)
         super().execute(cast("QueryNoTemplate", query), params, prepare=prepare, binary=binary)
         self._watch_graph_path(text)
@@ -113,9 +114,16 @@ class Cursor(psycopg.Cursor[Row]):
         self, query: Query, params_seq: Iterable[Params], *, returning: bool = False
     ) -> None:
         text = statement_text(query)
+        self._guard()
         check_bindable_positions(text)
         super().executemany(query, params_seq, returning=returning)
         self._watch_graph_path(text)
+
+    def _guard(self) -> Connection[Row]:
+        """The connection, refused if its holder has given it back."""
+        conn = cast("Connection[Row]", self.connection)
+        conn._check_lent()
+        return conn
 
     def _watch_graph_path(self, text: str) -> None:
         """Drop the label table if the statement that just ran moved the session elsewhere.
@@ -144,6 +152,11 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.cursor_factory = Cursor
+
+    def commit(self) -> None:
+        self._check_lent()
+        super().commit()
+        self._agens_graph_path_in_transaction = False
 
     @classmethod
     def connect(cls, conninfo: str = "", **kwargs: Any) -> Connection[Any]:
@@ -199,10 +212,6 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
         name = rows[0][0] if rows else ""
         return name or None
 
-    def commit(self) -> None:
-        super().commit()
-        self._agens_graph_path_in_transaction = False
-
     def rollback(self) -> None:
         """Roll back, and drop the label table if the graph path is going back with it.
 
@@ -210,6 +219,7 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
         session to the graph it was reading before, and a table filled inside that transaction
         describes somewhere the session no longer is.
         """
+        self._check_lent()
         super().rollback()
         if self._agens_graph_path_in_transaction:
             self.label_table.invalidate()

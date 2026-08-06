@@ -42,6 +42,7 @@ that could not finish in what is left is turned away before a connection is take
 from __future__ import annotations
 
 import inspect
+import threading
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
 
@@ -116,6 +117,7 @@ class ConnectionPool:
         self._user_configure = configure
         self._user_reset = reset
         self._generation = 0
+        self._counters = threading.Lock()
         self._statement_timeout_gap = statement_timeout_gap
         self._retired = 0
         self._pool: psycopg_pool.ConnectionPool[Connection[Any]] = psycopg_pool.ConnectionPool(
@@ -126,7 +128,7 @@ class ConnectionPool:
             max_size=max_size,
             open=False,
             configure=self._configure,
-            check=psycopg_pool.ConnectionPool.check_connection if check_connections else None,
+            check=self._check if check_connections else None,
             reset=self._reset,
             timeout=timeout,
             max_waiting=max_waiting,
@@ -189,6 +191,25 @@ class ConnectionPool:
     def __exit__(self, *exc: object) -> None:
         self.close()
 
+    @contextmanager
+    def _working_on(self, conn: Connection[Any]) -> Generator[None]:
+        """Mark a connection as the pool's own to use for the moment.
+
+        Every hook here runs on a connection no caller holds, and so does the check, which
+        sends an empty statement. Without this the guard against a caller keeping a handle
+        would refuse the pool its own connections.
+        """
+        conn._agens_lent = True
+        try:
+            yield
+        finally:
+            conn._agens_lent = False
+
+    def _check(self, conn: Connection[Any]) -> None:
+        """psycopg's own check, on a connection the pool is holding rather than lending."""
+        with self._working_on(conn):
+            psycopg_pool.ConnectionPool.check_connection(conn)
+
     def _configure(self, conn: Connection[Any]) -> None:
         """Once per new connection: everything that follows the socket rather than the caller.
 
@@ -197,6 +218,12 @@ class ConnectionPool:
         committed before the connection goes into the pool.
         """
         conn._agens_generation = self._generation
+        with self._working_on(conn):
+            self._set_up(conn)
+        conn._agens_pooled = True
+
+    def _set_up(self, conn: Connection[Any]) -> None:
+        """What a new connection needs before it can be lent."""
         if self._graph is not None:
             conn.graph(self._graph)
         if self._user_configure is not None:
@@ -212,12 +239,14 @@ class ConnectionPool:
         own bookkeeping to retire a set of connections.
         """
         if conn._agens_generation != self._generation:
-            self._retired += 1
+            with self._counters:
+                self._retired += 1
             raise StaleGeneration.for_connection(
                 conn._agens_generation, current=self._generation
             )
         if self._user_reset is not None:
-            self._user_reset(conn)
+            with self._working_on(conn):
+                self._user_reset(conn)
 
     @contextmanager
     def connection(
@@ -233,15 +262,35 @@ class ConnectionPool:
         budget = deadline if deadline is not None else Deadline(timeout)
         budget.check("waiting for a connection")
         wait = budget.bounded(timeout)
-        with self._pool.connection(timeout=wait) as conn:
-            self._prepare(conn, budget)
-            yield conn
+        lent: Connection[Any] | None = None
+        try:
+            with self._pool.connection(timeout=wait) as conn:
+                lent = conn
+                conn._agens_lent = True
+                self._prepare(conn, budget)
+                yield conn
+        finally:
+            if lent is not None:
+                lent._agens_lent = False
 
     def _prepare(self, conn: Connection[Any], budget: Deadline) -> None:
-        """Once per use: what follows the caller rather than the socket."""
+        """Once per use: what follows the caller rather than the socket.
+
+        A statement timeout belongs to the caller it was worked out for, so one left by the
+        caller before is taken off rather than inherited. Inherited, it cancels a statement
+        that was given no budget at all, and the cancellation is reported as a failure that
+        another attempt would not fix.
+
+        Only ever one statement: a caller with a budget replaces whatever was there, and a
+        caller without one pays nothing unless the connection is carrying a limit.
+        """
         limit = budget.statement_timeout_ms(gap=self._statement_timeout_gap)
         if limit is not None:
             conn.execute(f"set statement_timeout = {limit}")
+            conn._agens_statement_timeout = True
+        elif conn._agens_statement_timeout:
+            conn.execute("set statement_timeout = default")
+            conn._agens_statement_timeout = False
         if self._setup is not None:
             self._setup(conn)
 
@@ -266,8 +315,9 @@ class ConnectionPool:
         is closed the next time it is taken out and returned. So a server restart costs one
         call rather than one failure per connection.
         """
-        self._generation += 1
-        return self._generation
+        with self._counters:
+            self._generation += 1
+            return self._generation
 
     @property
     def generation(self) -> int:

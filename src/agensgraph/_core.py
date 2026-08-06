@@ -21,7 +21,7 @@ from ._protocol.labels import LabelCache
 from .adapters import graph_adapters, register_binary
 from .capabilities import Capabilities
 from .cypher import check_bindable_positions, quote_identifier, writable_counters
-from .errors import StaleLabelCache, explain_string_type, translate
+from .errors import ReleasedConnection, StaleLabelCache, explain_string_type, translate
 from .observability import QueryRecord, logging_wanted, report
 from .summary import GraphWriteCounts
 
@@ -140,6 +140,26 @@ class GraphMixin:
     Setting it is part of the transaction, so a rollback puts it back and takes the label
     table out of step with the session.
     """
+
+    _agens_pooled: bool = False
+    """Whether a pool owns this connection, and so decides who may use it and when."""
+
+    _agens_lent: bool = False
+    """Whether a pool has lent this connection to somebody, and not had it back."""
+
+    _agens_statement_timeout: bool = False
+    """Whether a statement timeout was set on this connection for the caller now holding it."""
+
+    def _check_lent(self) -> None:
+        """Refuse a connection its holder has already given back.
+
+        A pool hands out the connection itself, so a caller who keeps it past the block that
+        borrowed it holds the same object the pool later lends to somebody else. Using it then
+        reaches into another caller's work: a ``rollback`` through such a handle discards a
+        transaction that belongs to whoever holds it now.
+        """
+        if self._agens_pooled and not self._agens_lent:
+            raise ReleasedConnection.for_use()
 
     @property
     def adapters(self) -> AdaptersMap:

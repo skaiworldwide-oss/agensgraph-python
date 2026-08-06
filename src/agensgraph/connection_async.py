@@ -107,6 +107,7 @@ class AsyncCursor(psycopg.AsyncCursor[Row]):
         binary: bool | None = None,
     ) -> Self:
         text = statement_text(query)
+        self._guard()
         check_bindable_positions(text)
         # psycopg offers this as two overloads, one of which takes a template and no
         # parameters. Its own body takes either and sorts them out, which is what is wanted
@@ -121,9 +122,16 @@ class AsyncCursor(psycopg.AsyncCursor[Row]):
         self, query: Query, params_seq: Iterable[Params], *, returning: bool = False
     ) -> None:
         text = statement_text(query)
+        self._guard()
         check_bindable_positions(text)
         await super().executemany(query, params_seq, returning=returning)
         self._watch_graph_path(text)
+
+    def _guard(self) -> AsyncConnection[Row]:
+        """The connection, refused if its holder has given it back."""
+        conn = cast("AsyncConnection[Row]", self.connection)
+        conn._check_lent()
+        return conn
 
     def _watch_graph_path(self, text: str) -> None:
         """Drop the label table if the statement that just ran moved the session elsewhere.
@@ -152,6 +160,16 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.cursor_factory = AsyncCursor
+
+    # -- refusing a handle its holder gave back ------------------------------------------
+    #
+    # Only what can reach another caller's work: running a statement, taking a cursor to run
+    # one with, and ending a transaction that is now somebody else's.
+
+    async def commit(self) -> None:
+        self._check_lent()
+        await super().commit()
+        self._agens_graph_path_in_transaction = False
 
     @classmethod
     async def connect(cls, conninfo: str = "", **kwargs: Any) -> AsyncConnection[Any]:
@@ -210,10 +228,6 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
         name = rows[0][0] if rows else ""
         return name or None
 
-    async def commit(self) -> None:
-        await super().commit()
-        self._agens_graph_path_in_transaction = False
-
     async def rollback(self) -> None:
         """Roll back, and drop the label table if the graph path is going back with it.
 
@@ -221,6 +235,7 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
         session to the graph it was reading before, and a table filled inside that transaction
         describes somewhere the session no longer is.
         """
+        self._check_lent()
         await super().rollback()
         if self._agens_graph_path_in_transaction:
             self.label_table.invalidate()

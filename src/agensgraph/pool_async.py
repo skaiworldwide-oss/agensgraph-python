@@ -39,6 +39,7 @@ that could not finish in what is left is turned away before a connection is take
 from __future__ import annotations
 
 import inspect
+import threading
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any
 
@@ -115,6 +116,9 @@ class AsyncConnectionPool:
         self._user_configure = configure
         self._user_reset = reset
         self._generation = 0
+        # psycopg returns connections from any of its worker threads, so the two counters
+        # a returning connection touches are not incremented from one thread alone.
+        self._counters = threading.Lock()
         self._statement_timeout_gap = statement_timeout_gap
         self._retired = 0
         self._pool: psycopg_pool.AsyncConnectionPool[AsyncConnection[Any]] = (
@@ -129,9 +133,7 @@ class AsyncConnectionPool:
                 # way to hear that the server is unreachable.
                 open=False,
                 configure=self._configure,
-                check=psycopg_pool.AsyncConnectionPool.check_connection
-                if check_connections
-                else None,
+                check=self._check if check_connections else None,
                 reset=self._reset,
                 timeout=timeout,
                 max_waiting=max_waiting,
@@ -205,6 +207,25 @@ class AsyncConnectionPool:
 
     # -- the hooks psycopg has, and the one it does not ---------------------------------
 
+    @asynccontextmanager
+    async def _working_on(self, conn: AsyncConnection[Any]) -> AsyncGenerator[None]:
+        """Mark a connection as the pool's own to use for the moment.
+
+        Every hook here runs on a connection no caller holds, and so does the check, which
+        sends an empty statement. Without this the guard against a caller keeping a handle
+        would refuse the pool its own connections.
+        """
+        conn._agens_lent = True
+        try:
+            yield
+        finally:
+            conn._agens_lent = False
+
+    async def _check(self, conn: AsyncConnection[Any]) -> None:
+        """psycopg's own check, on a connection the pool is holding rather than lending."""
+        async with self._working_on(conn):
+            await psycopg_pool.AsyncConnectionPool.check_connection(conn)
+
     async def _configure(self, conn: AsyncConnection[Any]) -> None:
         """Once per new connection: everything that follows the socket rather than the caller.
 
@@ -213,6 +234,12 @@ class AsyncConnectionPool:
         committed before the connection goes into the pool.
         """
         conn._agens_generation = self._generation
+        async with self._working_on(conn):
+            await self._set_up(conn)
+        conn._agens_pooled = True
+
+    async def _set_up(self, conn: AsyncConnection[Any]) -> None:
+        """What a new connection needs before it can be lent."""
         if self._graph is not None:
             await conn.graph(self._graph)
         if self._user_configure is not None:
@@ -228,12 +255,14 @@ class AsyncConnectionPool:
         own bookkeeping to retire a set of connections.
         """
         if conn._agens_generation != self._generation:
-            self._retired += 1
+            with self._counters:
+                self._retired += 1
             raise StaleGeneration.for_connection(
                 conn._agens_generation, current=self._generation
             )
         if self._user_reset is not None:
-            await self._user_reset(conn)
+            async with self._working_on(conn):
+                await self._user_reset(conn)
 
     # -- taking one out -----------------------------------------------------------------
 
@@ -251,15 +280,37 @@ class AsyncConnectionPool:
         budget = deadline if deadline is not None else Deadline(timeout)
         budget.check("waiting for a connection")
         wait = budget.bounded(timeout)
-        async with self._pool.connection(timeout=wait) as conn:
-            await self._prepare(conn, budget)
-            yield conn
+        lent: AsyncConnection[Any] | None = None
+        try:
+            async with self._pool.connection(timeout=wait) as conn:
+                # Given back after psycopg's own block has ended, because that block commits
+                # and resets, and the pool doing so is not a caller reaching past its turn.
+                lent = conn
+                conn._agens_lent = True
+                await self._prepare(conn, budget)
+                yield conn
+        finally:
+            if lent is not None:
+                lent._agens_lent = False
 
     async def _prepare(self, conn: AsyncConnection[Any], budget: Deadline) -> None:
-        """Once per use: what follows the caller rather than the socket."""
+        """Once per use: what follows the caller rather than the socket.
+
+        A statement timeout belongs to the caller it was worked out for, so one left by the
+        caller before is taken off rather than inherited. Inherited, it cancels a statement
+        that was given no budget at all, and the cancellation is reported as a failure that
+        another attempt would not fix.
+
+        Only ever one statement: a caller with a budget replaces whatever was there, and a
+        caller without one pays nothing unless the connection is carrying a limit.
+        """
         limit = budget.statement_timeout_ms(gap=self._statement_timeout_gap)
         if limit is not None:
             await conn.execute(f"set statement_timeout = {limit}")
+            conn._agens_statement_timeout = True
+        elif conn._agens_statement_timeout:
+            await conn.execute("set statement_timeout = default")
+            conn._agens_statement_timeout = False
         if self._setup is not None:
             await self._setup(conn)
 
@@ -286,8 +337,9 @@ class AsyncConnectionPool:
         is closed the next time it is taken out and returned. So a server restart costs one
         call rather than one failure per connection.
         """
-        self._generation += 1
-        return self._generation
+        with self._counters:
+            self._generation += 1
+            return self._generation
 
     @property
     def generation(self) -> int:

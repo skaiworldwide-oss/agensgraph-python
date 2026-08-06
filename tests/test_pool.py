@@ -16,7 +16,7 @@ import pytest_asyncio
 
 import agensgraph
 from agensgraph.deadline import Deadline
-from agensgraph.errors import Retryability, StaleGeneration, retryability
+from agensgraph.errors import ReleasedConnection, Retryability, StaleGeneration, retryability
 
 pytestmark = pytest.mark.server
 
@@ -439,3 +439,78 @@ async def test_the_awaiting_pool_opens_without_autocommit(dsn: str) -> None:
         await p.close()
         async with await agensgraph.AsyncConnection.connect(dsn, autocommit=True) as conn:
             await conn.execute(f'drop graph "{name}" cascade')
+
+
+@pytest.mark.server
+class TestAHandleKeptPastItsBlock:
+    """The pool lends the connection itself, so a handle held past the block is the object
+    the pool later lends to somebody else."""
+
+    def test_every_way_of_using_one_is_refused(self, dsn: str) -> None:
+        with agensgraph.ConnectionPool(dsn, min_size=1, max_size=1, timeout=5.0) as pool:
+            with pool.connection() as conn:
+                escaped, escaped_cursor = conn, conn.cursor()
+            for run in (
+                lambda: escaped.execute("select 1"),
+                lambda: escaped.rollback(),
+                lambda: escaped.commit(),
+                lambda: escaped.execute_query("return 1"),
+                lambda: escaped_cursor.execute("select 1"),
+            ):
+                with pytest.raises(ReleasedConnection):
+                    run()
+
+    def test_it_is_refused_while_the_connection_sits_in_the_pool(self, dsn: str) -> None:
+        with agensgraph.ConnectionPool(dsn, min_size=1, max_size=1, timeout=5.0) as pool:
+            with pool.connection() as conn:
+                escaped = conn
+            with pytest.raises(ReleasedConnection):
+                escaped.rollback()
+
+    @pytest.mark.xfail(
+        reason="the pool lends the connection itself, so once it is lent again the stale "
+        "handle and the live one are one object and no state on it can tell them apart. "
+        "Catching this needs a handle of its own per borrow, which changes what "
+        "pool.connection() yields",
+        strict=True,
+    )
+    def test_it_is_refused_once_the_connection_is_lent_to_somebody_else(
+        self, dsn: str
+    ) -> None:
+        with agensgraph.ConnectionPool(dsn, min_size=1, max_size=1, timeout=5.0) as pool:
+            with pool.connection() as conn:
+                escaped = conn
+            with pool.connection(), pytest.raises(ReleasedConnection):
+                escaped.rollback()
+
+    def test_a_connection_of_one_s_own_is_never_refused(self, dsn: str) -> None:
+        """The guard is the pool's, so a connection nobody pooled is unaffected."""
+        with agensgraph.Connection.connect(dsn) as conn:
+            conn.execute("select 1")
+            conn.rollback()
+            conn.commit()
+
+
+@pytest.mark.server
+class TestAStatementTimeoutBelongsToOneBorrow:
+    def test_it_is_not_inherited_by_the_next_caller(self, dsn: str) -> None:
+        """Inherited, it cancels a statement given no budget, and reports it as a failure
+        another attempt would not fix."""
+        from agensgraph.deadline import Deadline
+
+        with agensgraph.ConnectionPool(dsn, min_size=1, max_size=1, timeout=5.0) as pool:
+            with pool.connection(deadline=Deadline(2.0)) as conn:
+                held = conn.execute("show statement_timeout").fetchone()[0]
+                assert held not in ("0", "")
+            with pool.connection() as conn:
+                assert conn.execute("show statement_timeout").fetchone()[0] == "0"
+
+    def test_a_later_budget_replaces_an_earlier_one(self, dsn: str) -> None:
+        from agensgraph.deadline import Deadline
+
+        with agensgraph.ConnectionPool(dsn, min_size=1, max_size=1, timeout=5.0) as pool:
+            with pool.connection(deadline=Deadline(2.0)) as conn:
+                first = conn.execute("show statement_timeout").fetchone()[0]
+            with pool.connection(deadline=Deadline(20.0)) as conn:
+                second = conn.execute("show statement_timeout").fetchone()[0]
+            assert first != second
