@@ -606,7 +606,5 @@ class TestAnIndexDeclarationQuotesEveryNameInIt:
     def test_an_ordinary_declaration_is_unchanged(self) -> None:
         (statement,) = reconcile_indexes([DesiredIndex("doc", ("name",))], [])
         assert statement == "create property index on doc (name)"
-        (statement,) = reconcile_indexes(
-            [DesiredIndex("doc", ("tags",), method="gin")], []
-        )
+        (statement,) = reconcile_indexes([DesiredIndex("doc", ("tags",), method="gin")], [])
         assert statement == "create property index on doc using gin (tags)"

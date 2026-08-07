@@ -335,7 +335,9 @@ class TestKeepingRowDataOutOfAMessage:
         return self.Faked(primary, detail)
 
     def test_the_detail_is_cut_from_the_message(self) -> None:
-        exc = self.make("duplicate key value", "Key (email)=(alice@example.com) already exists.")
+        exc = self.make(
+            "duplicate key value", "Key (email)=(alice@example.com) already exists."
+        )
         assert "alice@example.com" in str(exc)
         E.redact_details(exc)
         assert str(exc) == "duplicate key value"
@@ -343,7 +345,9 @@ class TestKeepingRowDataOutOfAMessage:
 
     def test_the_data_is_still_there_to_look_at(self) -> None:
         """Redact the rendering, keep the attribute -- a post-mortem still needs the value."""
-        exc = self.make("duplicate key value", "Key (email)=(alice@example.com) already exists.")
+        exc = self.make(
+            "duplicate key value", "Key (email)=(alice@example.com) already exists."
+        )
         E.redact_details(exc)
         assert exc.diag.message_detail == "Key (email)=(alice@example.com) already exists."
 
@@ -368,7 +372,9 @@ class TestKeepingRowDataOutOfAMessage:
         E.show_error_details(True)
         try:
             assert E.showing_error_details()
-            exc = self.make("duplicate key value", "Key (email)=(alice@example.com) already exists.")
+            exc = self.make(
+                "duplicate key value", "Key (email)=(alice@example.com) already exists."
+            )
             E.redact_details(exc)
             assert "alice@example.com" in str(exc)
         finally:

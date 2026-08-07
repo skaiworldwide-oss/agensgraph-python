@@ -135,7 +135,6 @@ separate allowances would each say yes to their own three.
 """
 
 
-
 class Attempt:
     """What was decided about one failure, and why.
 
@@ -293,9 +292,7 @@ class RetryPolicy:
         to different places. This is the one place that can say so, being the one that knows
         no further attempt will be made.
         """
-        attach_retry_history(
-            exc, attempts=attempts, previous_errors=previous, exhausted=True
-        )
+        attach_retry_history(exc, attempts=attempts, previous_errors=previous, exhausted=True)
         return exc
 
     def __repr__(self) -> str:

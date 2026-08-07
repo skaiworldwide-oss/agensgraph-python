@@ -128,31 +128,29 @@ class AsyncConnectionPool:
         self._statement_timeout_gap = statement_timeout_gap
         self._retired = 0
         self._interrupted = 0
-        self._pool: psycopg_pool.AsyncConnectionPool[AsyncConnection[Any]] = (
-            self._pool_class(
-                conninfo,
-                connection_class=AsyncConnection,
-                kwargs=kwargs,
-                min_size=min_size,
-                max_size=max_size,
-                # Never opened by constructing one: psycopg deprecated that and will make it an
-                # error, and opening in a constructor gives a caller nothing to await and no
-                # way to hear that the server is unreachable.
-                open=False,
-                configure=self._configure,
-                check=self._check if check_connections else None,
-                reset=self._reset,
-                timeout=timeout,
-                max_waiting=max_waiting,
-                # The jitter psycopg subtracts from this is kept: it is there so that a pool
-                # filled at once does not empty itself all at once an hour later.
-                max_lifetime=max_lifetime,
-                max_idle=max_idle,
-                reconnect_timeout=reconnect_timeout,
-                reconnect_failed=reconnect_failed,
-                num_workers=num_workers,
-                name=name,
-            )
+        self._pool: psycopg_pool.AsyncConnectionPool[AsyncConnection[Any]] = self._pool_class(
+            conninfo,
+            connection_class=AsyncConnection,
+            kwargs=kwargs,
+            min_size=min_size,
+            max_size=max_size,
+            # Never opened by constructing one: psycopg deprecated that and will make it an
+            # error, and opening in a constructor gives a caller nothing to await and no
+            # way to hear that the server is unreachable.
+            open=False,
+            configure=self._configure,
+            check=self._check if check_connections else None,
+            reset=self._reset,
+            timeout=timeout,
+            max_waiting=max_waiting,
+            # The jitter psycopg subtracts from this is kept: it is there so that a pool
+            # filled at once does not empty itself all at once an hour later.
+            max_lifetime=max_lifetime,
+            max_idle=max_idle,
+            reconnect_timeout=reconnect_timeout,
+            reconnect_failed=reconnect_failed,
+            num_workers=num_workers,
+            name=name,
         )
 
     # -- opening and closing ------------------------------------------------------------

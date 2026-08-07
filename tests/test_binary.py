@@ -146,9 +146,7 @@ class TestTheFixedPrefix:
         assert v.properties == {"n": 1}
 
     def test_a_wrong_oid_in_the_identity_column_is_refused(self):
-        buf = wire.record(
-            [(23, b"\x00" * 8), (3802, wire.jsonb(b"{}")), (27, b"\x00" * 6)]
-        )
+        buf = wire.record([(23, b"\x00" * 8), (3802, wire.jsonb(b"{}")), (27, b"\x00" * 6)])
         with pytest.raises(ValueError):
             decode.vertex_from_binary(buf, resolve)
 
@@ -160,9 +158,7 @@ class TestTheFixedPrefix:
             decode.vertex_from_binary(good[:-4], resolve)
 
     def test_a_bad_jsonb_version_is_refused(self):
-        buf = wire.record(
-            [(7002, wire.graphid(5, 1)), (3802, b"\x09{}"), (27, b"\x00" * 6)]
-        )
+        buf = wire.record([(7002, wire.graphid(5, 1)), (3802, b"\x09{}"), (27, b"\x00" * 6)])
         with pytest.raises(ValueError, match="version"):
             decode.vertex_from_binary(buf, resolve)
 

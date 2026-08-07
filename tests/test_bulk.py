@@ -317,4 +317,6 @@ class TestTheGraphIdBinaryLoader:
     def test_eight_bytes_read_as_the_identity_they_hold(self) -> None:
         from agensgraph.adapters import GraphIdBinaryLoader
 
-        assert GraphIdBinaryLoader(7002).load(b"\x00\x03\x00\x00\x00\x00\x00\x01") == GraphId(3, 1)
+        assert GraphIdBinaryLoader(7002).load(b"\x00\x03\x00\x00\x00\x00\x00\x01") == GraphId(
+            3, 1
+        )

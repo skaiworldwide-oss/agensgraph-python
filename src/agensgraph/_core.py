@@ -301,9 +301,7 @@ class GraphMixin:
             return GraphWriteCounts.unknown()
         movable = writable_counters(statement)
         if before is None:
-            return GraphWriteCounts(
-                *(int(after[i]) if i in movable else 0 for i in range(5))
-            )
+            return GraphWriteCounts(*(int(after[i]) if i in movable else 0 for i in range(5)))
         return GraphWriteCounts.for_statement(before, after, movable)
 
     def _report_query(

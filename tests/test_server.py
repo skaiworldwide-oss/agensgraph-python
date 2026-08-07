@@ -652,9 +652,7 @@ class TestThreeThingsTheObjectModelDoesNotDo:
         name = joined.execute("select current_setting('graph_path')").fetchone()[0]
         with agensgraph.connect(dsn) as conn:
             conn.graph(name)
-            rows = conn.execute_query(
-                "match (h:hub)-[:link]->(l:leaf) return h, l"
-            ).records
+            rows = conn.execute_query("match (h:hub)-[:link]->(l:leaf) return h, l").records
         hubs = [row[0] for row in rows]
         assert len(hubs) == 20
         assert len(set(hubs)) == 1, "they are one vertex"

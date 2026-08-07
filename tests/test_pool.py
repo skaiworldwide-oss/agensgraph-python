@@ -474,9 +474,7 @@ class TestAHandleKeptPastItsBlock:
         "pool.connection() yields",
         strict=True,
     )
-    def test_it_is_refused_once_the_connection_is_lent_to_somebody_else(
-        self, dsn: str
-    ) -> None:
+    def test_it_is_refused_once_the_connection_is_lent_to_somebody_else(self, dsn: str) -> None:
         with agensgraph.ConnectionPool(dsn, min_size=1, max_size=1, timeout=5.0) as pool:
             with pool.connection() as conn:
                 escaped = conn
@@ -596,7 +594,10 @@ class TestAPoolWideStatementTimeout:
         from agensgraph.deadline import Deadline
 
         with agensgraph.ConnectionPool(
-            dsn, min_size=1, max_size=1, timeout=5.0,
+            dsn,
+            min_size=1,
+            max_size=1,
+            timeout=5.0,
             kwargs={"options": "-c statement_timeout=5000"},
         ) as pool:
             pool.wait()

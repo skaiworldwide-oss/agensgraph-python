@@ -281,7 +281,9 @@ class TestWhatAConnectionFillsForItself:
         finally:
             other.close()
 
-    def test_the_version_gate_is_answered_before_anybody_holds_the_connection(self, agens) -> None:  # type: ignore[no-untyped-def]
+    def test_the_version_gate_is_answered_before_anybody_holds_the_connection(
+        self, agens
+    ) -> None:  # type: ignore[no-untyped-def]
         """So the one field that is still filled on first use cannot be reached by two callers."""
         assert agens._agens_capabilities is not None
 
@@ -293,7 +295,9 @@ class TestWhatAConnectionFillsForItself:
         def ask() -> None:
             for _ in range(20):
                 answers.append(
-                    agens.execute_query("match (n:cached) return n.n", prepare_=True).records[0][0]
+                    agens.execute_query("match (n:cached) return n.n", prepare_=True).records[
+                        0
+                    ][0]
                 )
 
         run_on_threads(ask)

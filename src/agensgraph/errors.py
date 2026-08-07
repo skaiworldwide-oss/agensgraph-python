@@ -434,7 +434,6 @@ class StaleGeneration(_pg.OperationalError):
         return exc
 
 
-
 # Most specific first, since a class is matched by the first entry it belongs to.
 #
 # The pool's three failures are here because they are all an OperationalError carrying no
@@ -579,7 +578,12 @@ def attach_retry_history(
     """
     exc.attempts = attempts  # type: ignore[attr-defined]
     exc.previous_errors = tuple(previous_errors)  # type: ignore[attr-defined]
-    if exhausted and attempts > 1 and exc.args and not getattr(exc, "_agens_retry_noted", False):
+    if (
+        exhausted
+        and attempts > 1
+        and exc.args
+        and not getattr(exc, "_agens_retry_noted", False)
+    ):
         exc._agens_retry_noted = True  # type: ignore[attr-defined]
         exc.args = (f"{exc.args[0]} (reached max retries: {attempts})", *exc.args[1:])
 

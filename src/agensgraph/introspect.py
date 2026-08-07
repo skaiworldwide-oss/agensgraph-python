@@ -549,7 +549,9 @@ def create_index_statement(desired: DesiredIndex) -> str:
     name = f"{quote_identifier(desired.name)} " if desired.name else ""
     # An access method is named by an identifier, and the server takes it quoted.
     method = (
-        "" if desired.method.lower() == "btree" else f"using {quote_identifier(desired.method)} "
+        ""
+        if desired.method.lower() == "btree"
+        else f"using {quote_identifier(desired.method)} "
     )
     keys = ", ".join(element.rendered() for element in desired.elements)
     where = f" where {desired.where}" if desired.where is not None else ""

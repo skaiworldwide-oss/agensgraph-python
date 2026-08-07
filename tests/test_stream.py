@@ -289,7 +289,10 @@ class TestTheWrapAroundAwkwardStatements:
         assert "-- why" in wrapped
 
     def test_a_trailing_semicolon_is_taken_off(self) -> None:
-        assert wrap_for_cursor("match (n) return n;") == "select * from (\nmatch (n) return n\n) as t"
+        assert (
+            wrap_for_cursor("match (n) return n;")
+            == "select * from (\nmatch (n) return n\n) as t"
+        )
 
     @pytest.mark.parametrize(
         "statement",
@@ -309,7 +312,11 @@ class TestTheWrapAroundAwkwardStatements:
 
     @pytest.mark.parametrize(
         "statement",
-        ["match (n) return n.inserted", "match (n:insert) return n", "match (n) return n AS inserter"],
+        [
+            "match (n) return n.inserted",
+            "match (n:insert) return n",
+            "match (n) return n AS inserter",
+        ],
     )
     def test_and_a_name_that_merely_holds_the_word_is_not(self, statement: str) -> None:
         check_can_wrap(statement)

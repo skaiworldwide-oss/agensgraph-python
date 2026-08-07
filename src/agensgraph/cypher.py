@@ -327,6 +327,7 @@ _WRITE_WORD = re.compile(
 )
 _WRITE_WORDS = tuple(WRITE_GROUPS)
 
+
 def needs_a_reading_first(statement: str) -> bool:
     """Whether the write counters have to be read before a statement as well as after.
 

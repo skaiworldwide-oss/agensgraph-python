@@ -192,13 +192,13 @@ class TestTheLabelNameTable:
         assert a.label is b.label
 
     def test_a_label_the_table_has_never_seen_still_reads(self):
-        assert decode.vertex_from_text('사람[3.1]{}'.encode()).label == "사람"
-        assert decode.vertex_from_text(b'a,b[3.1]{}').label == "a,b"
+        assert decode.vertex_from_text("사람[3.1]{}".encode()).label == "사람"
+        assert decode.vertex_from_text(b"a,b[3.1]{}").label == "a,b"
 
     def test_an_edge_reads_its_label_through_the_same_table(self):
-        edge = decode.edge_from_text(b'knows[4.1][3.1,3.2]{}')
+        edge = decode.edge_from_text(b"knows[4.1][3.1,3.2]{}")
         assert edge.label == "knows"
-        assert edge.label is decode.vertex_from_text(b'knows[3.9]{}').label
+        assert edge.label is decode.vertex_from_text(b"knows[3.9]{}").label
 
     def test_the_table_does_not_grow_without_bound(self):
         """It holds label names, which are schema rather than data -- but a process that

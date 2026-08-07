@@ -78,7 +78,9 @@ class TestTheTableFollowsTheSession:
 class TestABinaryReadAfterTheSessionMoves:
     """The defect this exists to prevent: a vertex of one graph named from another's table."""
 
-    def test_it_refuses_rather_than_naming_the_wrong_label(self, agens, second_graph: str) -> None:  # type: ignore[no-untyped-def]
+    def test_it_refuses_rather_than_naming_the_wrong_label(
+        self, agens, second_graph: str
+    ) -> None:  # type: ignore[no-untyped-def]
         agens.execute("create vlabel person")
         agens.refresh_labels()
         agens.execute(f'set graph_path = "{second_graph}"')
@@ -178,5 +180,7 @@ class TestTheCompositeRenderingWithNoTable:
             conn.execute(f'set graph_path = "{second_graph}"')
             conn.execute("create (:account {n: 'x'})")
             conn.refresh_labels()
-            (vertex,) = conn.execute_query("match (n:account) return n", binary_=True).records[0]
+            (vertex,) = conn.execute_query("match (n:account) return n", binary_=True).records[
+                0
+            ]
             assert vertex.label == "account"

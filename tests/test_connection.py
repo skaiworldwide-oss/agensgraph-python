@@ -240,7 +240,9 @@ class TestTheAwaitingInterface:
         assert result.counts.inserted_vertices == 1
 
     @pytest.mark.asyncio
-    async def test_a_write_that_returns_rows_is_credited_with_its_own_clauses(self, aconn) -> None:  # type: ignore[no-untyped-def]
+    async def test_a_write_that_returns_rows_is_credited_with_its_own_clauses(
+        self, aconn
+    ) -> None:  # type: ignore[no-untyped-def]
         await aconn.execute_query("create (:person {name: 'd'})")
         result = await aconn.execute_query(
             "match (n:person) set n.x = 1 return n", counts_=True
