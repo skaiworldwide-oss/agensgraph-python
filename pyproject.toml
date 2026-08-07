@@ -58,7 +58,11 @@ typing = [
     "mypy>=1.13",
     "typing-extensions>=4.12",
 ]
-lint = ["ruff>=0.16"]
+# Pinned exactly, not floored. Formatting and lint rules move between releases -- 0.16.0 went
+# from 59 default rules to 413 -- so a floor lets a build start failing on code nobody touched.
+# It also decouples the build from a release being published: an in-flight upload of 0.16.2, with
+# its Linux x86-64 wheel not yet up, failed a job that a pin would not have noticed.
+lint = ["ruff==0.16.1"]
 dev = [
     {include-group = "tests"},
     {include-group = "typing"},

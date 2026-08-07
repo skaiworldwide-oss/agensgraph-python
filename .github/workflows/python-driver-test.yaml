@@ -252,14 +252,21 @@ jobs:
       - name: Install
         run: uv sync --group dev --all-extras
 
-      # The tests needing a server are skipped without this variable, so its absence would turn
-      # the whole live half of the suite into a silent pass. That is checked, not assumed.
+      # A test needing a server skips itself when this variable is absent, so a job that lost it
+      # would report a clean pass over the half of the suite that matters. Reaching the server is
+      # therefore checked before the suite runs -- an unset variable and an unreachable server
+      # both stop the job here rather than turning into several hundred quiet skips.
       - name: The full suite, against the server
         env:
           AGENSGRAPH_TEST_DSN: host=localhost dbname=agensgraph_test
         run: |
+          uv run python - <<'EOF'
+          import os
+          import agensgraph
+          with agensgraph.connect(os.environ["AGENSGRAPH_TEST_DSN"]) as conn:
+              print("reached", conn.capabilities.reported, "with", len(agensgraph.__all__), "names")
+          EOF
           uv run python -X dev -W error -m pytest -q
-          uv run python -m pytest -q --collect-only -m server | tail -2
 
       - name: The server's own log, if anything failed
         if: failure()
