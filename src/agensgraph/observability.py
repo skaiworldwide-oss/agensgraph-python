@@ -139,7 +139,10 @@ def enable_tracing(tracer: Any = None) -> None:
     global _tracing, _tracer
     if tracer is None:
         try:
-            from opentelemetry import trace
+            # Imported as a submodule rather than as a name from the package, because
+            # `opentelemetry` is a namespace package with nothing in its own `__init__`, and a
+            # type checker reading it that way finds no `trace` to import.
+            import opentelemetry.trace as trace
         except ImportError as exc:  # pragma: no cover - depends on what is installed
             raise RuntimeError(
                 "tracing needs opentelemetry-api, which is not installed: "
