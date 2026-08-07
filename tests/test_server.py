@@ -91,7 +91,7 @@ class TestCapabilities:
         self, conn: Connection[object]
     ) -> None:
         caps = Capabilities.of(conn)
-        assert caps.version >= (2, 16)
+        assert caps.version >= agensgraph.MINIMUM_VERSION
         assert caps.reported == conn.info.parameter_status("agversion")
 
     def test_the_graph_path_does_not_arrive_that_way(self, conn: Connection[object]) -> None:
@@ -602,7 +602,7 @@ class TestTheMechanismsAReadRelieson:
     def test_the_capability_gate_costs_no_statement(self, dsn: str) -> None:
         """It is read from what the server reported at startup, so it asks nothing."""
         with agensgraph.connect(dsn) as conn, counting_statements() as sent:
-            assert conn.capabilities.version >= (2, 16)
+            assert conn.capabilities.version >= agensgraph.MINIMUM_VERSION
             assert conn.capabilities.has_property_promotion() in (True, False)
             assert sent == []
 

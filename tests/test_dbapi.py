@@ -13,6 +13,7 @@ import psycopg
 import pytest
 
 from agensgraph import dbapi
+from agensgraph.capabilities import MINIMUM_VERSION
 
 REQUIRED_MODULE_ATTRIBUTES = ["apilevel", "threadsafety", "paramstyle", "connect"]
 
@@ -156,6 +157,6 @@ class TestAgainstAServer:
         """Connecting by the generic name must not be a way around the check."""
         conn = dbapi.connect(dsn)
         try:
-            assert conn.capabilities.version >= (2, 16)
+            assert conn.capabilities.version >= MINIMUM_VERSION
         finally:
             conn.close()

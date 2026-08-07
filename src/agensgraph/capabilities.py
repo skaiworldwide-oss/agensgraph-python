@@ -23,8 +23,12 @@ from .errors import CapabilityError
 
 __all__ = ["MINIMUM_VERSION", "Capabilities", "parse_version"]
 
-MINIMUM_VERSION = (2, 16)
-"""The oldest server this driver reads. Older ones lack catalogs it depends on."""
+MINIMUM_VERSION = (2, 17)
+"""The oldest server this driver reads.
+
+Older ones lack catalogs it depends on. The floor is also what the build tests against, so a
+release below it is not a release this driver is claimed to work on.
+"""
 
 _PROPERTY_PROMOTION = (2, 18)
 _GQL_CLAUSES = (2, 18)

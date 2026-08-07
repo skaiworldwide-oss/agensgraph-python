@@ -121,7 +121,7 @@ def test_classification_of_failures_that_are_not_the_servers(
         (E.StaleLabelCache.for_label(9, graph="g"), R.RESET_STATE),
         (E.UnresolvedCommit.for_transaction(7, reason="lost"), R.UNKNOWN),
         (E.ConfigurationError("a setting refused it"), R.FATAL),
-        (E.CapabilityError.for_feature("x", required="2.18", found="2.16"), R.FATAL),
+        (E.CapabilityError.for_feature("x", required="2.18", found="2.17"), R.FATAL),
     ],
 )
 def test_the_drivers_own_failures_are_classified_by_class(
@@ -274,7 +274,7 @@ class TestPickling:
     @pytest.mark.parametrize(
         "exc",
         [
-            E.CapabilityError.for_feature("f", required="2.18", found="2.16"),
+            E.CapabilityError.for_feature("f", required="2.18", found="2.17"),
             E.StaleLabelCache.for_label(9, graph="g"),
             E.UnresolvedCommit.for_transaction(77, reason="the connection was lost"),
             E.ConfigurationError("a setting refused it"),

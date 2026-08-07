@@ -41,10 +41,10 @@ def test_something_that_is_not_a_version_is_refused(reported: str) -> None:
         parse_version(reported)
 
 
-@pytest.mark.parametrize("reported", ["2.15", "2.0", "1.9", "2.15-devel"])
+@pytest.mark.parametrize("reported", ["2.16", "2.15", "2.0", "1.9", "2.16-devel"])
 def test_a_server_below_the_minimum_is_refused_at_once(reported: str) -> None:
     """Rather than at whichever later query first wants a catalog it does not have."""
-    with pytest.raises(CapabilityError, match=r"2\.16"):
+    with pytest.raises(CapabilityError, match=r"2\.17"):
         Capabilities(reported)
 
 
@@ -53,7 +53,7 @@ def test_the_minimum_is_itself_accepted() -> None:
     assert Capabilities(reported).version == MINIMUM_VERSION
 
 
-@pytest.mark.parametrize("reported", ["2.16", "2.17"])
+@pytest.mark.parametrize("reported", ["2.17", "2.17.3"])
 @pytest.mark.parametrize("feature", GATED)
 def test_the_older_servers_carry_none_of_the_gated_features(
     reported: str, feature: str
@@ -72,14 +72,14 @@ def test_the_newer_servers_carry_all_of_them(reported: str, feature: str) -> Non
 
 @pytest.mark.parametrize("feature", GATED)
 def test_a_checked_question_says_what_is_missing_and_what_would_carry_it(feature: str) -> None:
-    caps = Capabilities("2.16")
+    caps = Capabilities("2.17")
     with pytest.raises(CapabilityError) as caught:
         getattr(caps, feature)(check=True)
     assert caught.value.required == "2.18"
-    assert caught.value.found == "2.16"
+    assert caught.value.found == "2.17"
     assert caught.value.feature
     assert "2.18" in str(caught.value)
-    assert "2.16" in str(caught.value)
+    assert "2.17" in str(caught.value)
 
 
 def test_the_version_reported_is_kept_exactly_as_given() -> None:

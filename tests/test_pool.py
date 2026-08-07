@@ -669,7 +669,7 @@ class TestKeepingNothing:
         try:
             with p.connection() as conn:
                 assert conn.label_table.graph == graph_name
-                assert conn.capabilities.version >= (2, 16)
+                assert conn.capabilities.version >= agensgraph.MINIMUM_VERSION
                 assert conn.execute_query("match (t:thing) return t.n").records == [(1,)]
         finally:
             p.close()

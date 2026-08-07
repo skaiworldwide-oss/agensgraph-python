@@ -2,7 +2,7 @@
 
 [![PyPI](https://img.shields.io/pypi/v/agensgraph-python.svg)](https://pypi.org/project/agensgraph-python/)
 [![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue.svg)](https://pypi.org/project/agensgraph-python/)
-[![AgensGraph](https://img.shields.io/badge/AgensGraph-2.16%2B-1f6feb.svg)](https://github.com/skaiworldwide-oss/agensgraph)
+[![AgensGraph](https://img.shields.io/badge/AgensGraph-2.17%2B-1f6feb.svg)](https://github.com/skaiworldwide-oss/agensgraph)
 [![Tests](https://github.com/skaiworldwide-oss/agensgraph-python/actions/workflows/python-driver-test.yaml/badge.svg)](https://github.com/skaiworldwide-oss/agensgraph-python/actions/workflows/python-driver-test.yaml)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
@@ -31,7 +31,7 @@ with agensgraph.connect("host=localhost dbname=graph") as conn:
 pip install agensgraph-python
 ```
 
-Python 3.11 or later. AgensGraph 2.16 or later.
+Python 3.11 or later. AgensGraph 2.17 or later.
 
 Optional extras, imported only where they are used, so they never load on a read path:
 
@@ -1039,8 +1039,12 @@ escape the colon.
 
 ## Server versions
 
-The driver reads AgensGraph 2.16 and later. It learns which it is talking to from the `agversion`
-parameter the server sends at startup, so the check costs no round trip.
+The driver reads AgensGraph 2.17 and later, and refuses anything older at connect rather than at
+whichever later query first wants a catalog it does not have. It learns which it is talking to from
+the `agversion` parameter the server sends at startup, so the check costs no round trip.
+
+The floor is what the build tests against: every release named here has the whole suite run against
+it on every change, so support is a thing that is checked rather than a thing that is claimed.
 
 ```python
 caps = conn.capabilities
@@ -1063,9 +1067,10 @@ recorded in and one not. Where the answer has to be right rather than free, ask 
 conn.can_promote_properties()     # asks the catalog, once per connection, and keeps the answer
 ```
 
-The wire and type layer is identical across every supported release, so binary graph ids, the
-composite decode, write counters, introspection and the commit resolution path need no version gating
-at all. What is 2.18 only is property promotion, the GQL clause set, and ordering by a graph element.
+The wire and type layer is identical across every supported release, even though they sit on
+different PostgreSQL bases (2.17 on 17, 2.18 and main on 18), so binary graph ids, the composite
+decode, write counters, introspection and the commit resolution path need no version gating at all.
+What is 2.18 only is property promotion, the GQL clause set, and ordering by a graph element.
 
 ## Performance
 
@@ -1098,7 +1103,7 @@ Everything exported from `agensgraph`. The submodules `agensgraph.columnar`, `ag
 | `connect(conninfo, **kwargs)` | open a blocking connection |
 | `Connection` / `AsyncConnection` | the connection classes, both psycopg subclasses |
 | `Capabilities` | what one server can do, built from the version at no round trip |
-| `MINIMUM_VERSION` | `(2, 16)`, the oldest server this driver reads |
+| `MINIMUM_VERSION` | `(2, 17)`, the oldest server this driver reads |
 
 **Pools**
 
