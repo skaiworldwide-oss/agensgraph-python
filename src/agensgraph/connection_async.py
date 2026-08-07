@@ -653,9 +653,14 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
     ) -> list[DeclaredProperty]:
         """Every property given a column of its own, with that column's type.
 
-        A property living in the JSON map is not declared anywhere and so cannot be listed;
-        before 2.18 nothing can be promoted at all and this is always empty.
+        A property living in the JSON map is not declared anywhere and so cannot be listed.
+
+        Before 2.18 nothing can be promoted at all, and the catalog that would record it does not
+        exist -- so the answer is none, and reaching for the catalog would raise instead of saying
+        so. The version arrived with the connection, so knowing which server this is costs nothing.
         """
+        if not self.capabilities.has_property_promotion():
+            return []
         name = self._graph_of(graph)
         query = DECLARED_PROPERTIES_QUERY if label is None else DECLARED_PROPERTIES_FOR_LABEL
         rows = await self._fetch(query, (name,) if label is None else (name, label))
