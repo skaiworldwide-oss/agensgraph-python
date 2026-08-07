@@ -23,7 +23,7 @@ ROWS = 250
 def many(agens):  # type: ignore[no-untyped-def]
     agens.execute("create vlabel thing")
     agens.execute("create elabel links")
-    agens.execute(f"unwind range(1, {ROWS}) as i create (:thing {{n: i}})")
+    agens.execute(f"unwind range(1, {ROWS})::jsonb as i create (:thing {{n: i}})")
     # The labels were made after the graph was selected, so the table the composite rendering
     # resolves names through has not heard of them yet.
     agens.refresh_labels()
@@ -117,9 +117,17 @@ class TestReadingInChunks:
             next(iter(many.stream("match (n:thing) set n.a = 1 return n")))
 
     def test_a_mid_query_limit_is_the_servers_to_refuse(self, many) -> None:  # type: ignore[no-untyped-def]
-        """Left to the server rather than kept as a second copy of its grammar."""
-        with pytest.raises(psycopg.Error):
-            next(iter(many.stream("match (n:thing) with n limit 2 return n")))
+        """Left to the server rather than kept as a second copy of its grammar.
+
+        Which is the point of leaving it there: 2.18 refuses this and 2.17 runs it, so a driver
+        holding its own copy of the boundary would be wrong on one of them.
+        """
+        rows = many.stream("match (n:thing) with n limit 2 return n")
+        if many.capabilities.has_gql_clauses():
+            with pytest.raises(psycopg.Error):
+                next(iter(rows))
+        else:
+            assert len(list(rows)) == 2
 
     @pytest.mark.parametrize("size", [0, -1])
     def test_a_chunk_has_to_hold_something(self, many, size: int) -> None:  # type: ignore[no-untyped-def]
@@ -165,7 +173,7 @@ class TestTheAwaitingInterface:
             await conn.execute(f'create graph "{graph}"')
             await conn.graph(graph)
             await conn.execute("create vlabel thing")
-            await conn.execute(f"unwind range(1, {ROWS}) as i create (:thing {{n: i}})")
+            await conn.execute(f"unwind range(1, {ROWS})::jsonb as i create (:thing {{n: i}})")
             await conn.set_autocommit(False)
             try:
                 yield conn
@@ -250,11 +258,7 @@ class TestWhatTheWrapItselfTakes:
             "match (n:doc) return n order by n.a",
             "match (n:doc) return n limit 1",
             "match (n:doc) with n return n",
-            "let x = 1 return x",
             "unwind [1,2] as x return x",
-            "for x in [1,2] return x",
-            "call { match (n:doc) return n as v } return v",
-            "match (n:doc) finish",
             "(match (n:doc) return 1) union (match (n:doc) return 2)",
             "(match (n:doc) return 1) intersect (match (n:doc) return 1)",
             "(match (n:doc) return 1) except (match (n:doc) return 2)",
@@ -269,8 +273,27 @@ class TestWhatTheWrapItselfTakes:
     @pytest.mark.parametrize(
         "statement",
         [
+            "let x = 1 return x",
+            "for x in [1,2] return x",
+            "call { match (n:doc) return n as v } return v",
+            "match (n:doc) finish",
+        ],
+    )
+    def test_a_gql_clause_is_accepted_where_the_grammar_has_one(self, agens, statement) -> None:  # type: ignore[no-untyped-def]
+        """These are the clauses 2.18 added, so on an older server the wrap is smaller."""
+        agens.execute("create vlabel doc")
+        agens.execute("create (:doc {a: 1})")
+        if not agens.capabilities.has_gql_clauses():
+            with pytest.raises(agensgraph.errors.Error):
+                agens.execute(wrap_for_cursor(statement))
+            return
+        agens.execute(wrap_for_cursor(statement))
+
+    @pytest.mark.server
+    @pytest.mark.parametrize(
+        "statement",
+        [
             "match (n:doc) filter n.a > 0 return n",
-            "match (n:doc) with n limit 1 return n",
             "call generate_series(1,2) yield generate_series as g return g",
         ],
     )
@@ -279,6 +302,21 @@ class TestWhatTheWrapItselfTakes:
         agens.execute("create vlabel doc")
         with pytest.raises(agensgraph.errors.Error):
             agens.execute(wrap_for_cursor(statement))
+
+    @pytest.mark.server
+    def test_a_limit_that_is_not_last_is_refused_only_where_it_is(self, agens) -> None:  # type: ignore[no-untyped-def]
+        """2.18 refuses a `LIMIT` the wrap cannot carry; 2.17 takes the same statement.
+
+        So the boundary belongs to the server's grammar and not to the driver, which is why
+        nothing here tries to predict it -- the statement goes as written and the server judges.
+        """
+        agens.execute("create vlabel doc")
+        statement = wrap_for_cursor("match (n:doc) with n limit 1 return n")
+        if agens.capabilities.has_gql_clauses():
+            with pytest.raises(agensgraph.errors.Error):
+                agens.execute(statement)
+        else:
+            agens.execute(statement)
 
 
 class TestTheWrapAroundAwkwardStatements:

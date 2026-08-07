@@ -310,13 +310,20 @@ class TestRefusalsTheServerReportsBadly:
 
 class TestShapesTheServerAcceptsAndMisreads:
     def test_a_variable_length_bound_binds_without_complaint(
-        self, graph: Connection[object]
+        self, graph: Connection[object], dsn: str
     ) -> None:
         """It is read as an unbounded walk plus a property map, and nothing says so.
 
-        Every other position that cannot take a parameter fails with a syntax error, so this
-        one shape has to be refused by the driver before it is sent.
+        Only from 2.18. Before that the server refuses the shape outright -- so the hazard the
+        driver's own guard exists for appeared with the release that accepts it, and the guard is
+        right on both: it refuses the statement before it is sent whatever the server would do.
         """
+        with agensgraph.connect(dsn) as conn:
+            promoted = conn.capabilities.has_property_promotion()
+        if not promoted:
+            with pytest.raises(psycopg.Error):
+                graph.execute("prepare vle as match (a)-[r*1..$1]->(b) return a")
+            return
         graph.execute("prepare vle as match (a)-[r*1..$1]->(b) return a")
         try:
             (types,) = graph.execute(
@@ -381,7 +388,6 @@ class TestWhatBindsAsWhat:
             ("create (:person $1)", ["jsonb"]),
             ("match (n:person) set n = $1", ["jsonb"]),
             ("match (n:person) where id(n) = $1 return n", ["graphid"]),
-            ("match (n:person) return size($1)", ["text"]),
         ],
     )
     def test_the_binding(
@@ -395,6 +401,26 @@ class TestWhatBindsAsWhat:
         finally:
             graph.execute("deallocate p")
         assert types == expected
+
+    def test_a_size_argument_binds_as_text_from_the_release_that_takes_one(
+        self, graph: Connection[object], dsn: str
+    ) -> None:
+        """``size($1)`` is the one entry of that table that is not the same on every server:
+        2.18 binds it as text, and before that the parser does not take a parameter there."""
+        with agensgraph.connect(dsn) as conn:
+            promoted = conn.capabilities.has_property_promotion()
+        if not promoted:
+            with pytest.raises(psycopg.Error):
+                graph.execute("prepare s as match (n:person) return size($1)")
+            return
+        graph.execute("prepare s as match (n:person) return size($1)")
+        try:
+            (types,) = graph.execute(
+                "select parameter_types::text[] from pg_prepared_statements where name = 's'"
+            ).fetchone()
+        finally:
+            graph.execute("deallocate s")
+        assert types == ["text"]
 
     @pytest.mark.parametrize(
         "statement",
