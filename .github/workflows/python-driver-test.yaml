@@ -135,9 +135,22 @@ jobs:
   # The full suite, against a server built from the engine's own tree.
   against-a-server:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Every server the driver says it reads, each on its own PostgreSQL base. Running the same
+        # suite against all of them is what checks the version gates: a test that needs something
+        # only the newest has, and does not say so, fails on the older ones instead of passing
+        # everywhere by accident.
+        engine: [v2.17, v2.18, main]
+    name: against-a-server (${{ matrix.engine }})
     steps:
       - name: Find the engine's latest commit
-        run: echo "AG_COMMIT_HASH=$(git ls-remote https://github.com/skaiworldwide-oss/agensgraph.git HEAD | awk '{print $1}')" >> $GITHUB_ENV
+        run: |
+          hash=$(git ls-remote https://github.com/skaiworldwide-oss/agensgraph.git \
+                   "refs/heads/${{ matrix.engine }}" | awk '{print $1}')
+          test -n "$hash" || { echo "no branch ${{ matrix.engine }}"; exit 1; }
+          echo "AG_COMMIT_HASH=$hash" >> $GITHUB_ENV
 
       # Resolved rather than pinned, so the build tracks pgvector's releases the way it already
       # tracks the engine's commits. Both go in the cache key: the extension is installed into the
@@ -154,7 +167,7 @@ jobs:
         id: agcache
         with:
           path: ~/agensgraph_build
-          key: ${{ runner.os }}-v3-agensgraph-${{ env.AG_COMMIT_HASH }}-pgvector-${{ env.PGVECTOR_TAG }}
+          key: ${{ runner.os }}-v3-agensgraph-${{ matrix.engine }}-${{ env.AG_COMMIT_HASH }}-pgvector-${{ env.PGVECTOR_TAG }}
 
       - name: System dependencies
         run: |
@@ -165,7 +178,8 @@ jobs:
       - name: Build the engine
         if: steps.agcache.outputs.cache-hit != 'true'
         run: |
-          git clone --depth 1 https://github.com/skaiworldwide-oss/agensgraph.git ~/agensgraph_source
+          git clone --depth 1 --branch ${{ matrix.engine }} \
+            https://github.com/skaiworldwide-oss/agensgraph.git ~/agensgraph_source
           cd ~/agensgraph_source
           ./configure --prefix=$HOME/agensgraph_build
           make -j$(nproc)
@@ -210,6 +224,20 @@ jobs:
           test "$found" = "2" || { echo "expected the vector and sparsevec types, found $found"; exit 1; }
           $HOME/agensgraph_build/bin/psql -d agensgraph_test -tAc \
             "SELECT extname || ' ' || extversion FROM pg_extension WHERE extname = 'vector'"
+
+      # Every version gate in the suite reads `agversion`, so a build of the wrong branch would
+      # test the wrong thing without saying so -- a cache key that collided, or a branch that
+      # moved. A release branch has to report its own number; `main` may report anything.
+      - name: Which server this is
+        run: |
+          reported=$($HOME/agensgraph_build/bin/psql -d agensgraph_test -tAc \
+            "SELECT current_setting('agversion')")
+          echo "branch ${{ matrix.engine }} reports agversion $reported"
+          wanted=${{ matrix.engine }}
+          if [ "$wanted" != main ] && [ "${reported#"${wanted#v}"}" = "$reported" ]; then
+            echo "expected an agversion beginning ${wanted#v}"
+            exit 1
+          fi
 
       - uses: actions/checkout@v4
         with:
