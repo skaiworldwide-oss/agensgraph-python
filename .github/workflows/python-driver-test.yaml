@@ -139,12 +139,22 @@ jobs:
       - name: Find the engine's latest commit
         run: echo "AG_COMMIT_HASH=$(git ls-remote https://github.com/skaiworldwide-oss/agensgraph.git HEAD | awk '{print $1}')" >> $GITHUB_ENV
 
+      # Resolved rather than pinned, so the build tracks pgvector's releases the way it already
+      # tracks the engine's commits. Both go in the cache key: the extension is installed into the
+      # engine's prefix, so a cached prefix built before either moved is the wrong prefix.
+      - name: Find pgvector's latest release
+        run: |
+          tag=$(git ls-remote --tags --refs --sort=-v:refname \
+                  https://github.com/pgvector/pgvector.git | head -1 | sed 's#.*/##')
+          test -n "$tag"
+          echo "PGVECTOR_TAG=$tag" >> $GITHUB_ENV
+
       - name: Cache the build
         uses: actions/cache@v4
         id: agcache
         with:
           path: ~/agensgraph_build
-          key: ${{ runner.os }}-v2-agensgraph-${{ env.AG_COMMIT_HASH }}
+          key: ${{ runner.os }}-v3-agensgraph-${{ env.AG_COMMIT_HASH }}-pgvector-${{ env.PGVECTOR_TAG }}
 
       - name: System dependencies
         run: |
@@ -161,6 +171,19 @@ jobs:
           make -j$(nproc)
           make install
 
+      # Built against the engine that was just installed, not against a system PostgreSQL, so the
+      # extension links to the server it will be loaded into. OPTFLAGS is emptied because pgvector
+      # compiles with -march=native by default, which builds for whichever runner happened to run
+      # the build and can then fault on the one that restores the cache.
+      - name: Build pgvector against it
+        if: steps.agcache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch "$PGVECTOR_TAG" \
+            https://github.com/pgvector/pgvector.git ~/pgvector_source
+          cd ~/pgvector_source
+          make -j$(nproc) OPTFLAGS="" PG_CONFIG="$HOME/agensgraph_build/bin/pg_config"
+          make install OPTFLAGS="" PG_CONFIG="$HOME/agensgraph_build/bin/pg_config"
+
       - name: Start it
         run: |
           echo "LD_LIBRARY_PATH=$HOME/agensgraph_build/lib:$LD_LIBRARY_PATH" >> $GITHUB_ENV
@@ -174,6 +197,19 @@ jobs:
             sleep 1
           done
           $HOME/agensgraph_build/bin/createdb agensgraph_test
+
+      # The extension is created per database, so this runs on every build and not only on a cache
+      # miss. Asserted afterwards for the same reason the DSN is: the vector suite asks the server
+      # whether the type is there and skips itself when it is not, so an extension that failed to
+      # install would turn that whole half of the file into a silent pass.
+      - name: Vectors, in the database the suite uses
+        run: |
+          $HOME/agensgraph_build/bin/psql -d agensgraph_test -c "CREATE EXTENSION vector"
+          found=$($HOME/agensgraph_build/bin/psql -d agensgraph_test -tAc \
+            "SELECT count(*) FROM pg_type WHERE typname IN ('vector', 'sparsevec')")
+          test "$found" = "2" || { echo "expected the vector and sparsevec types, found $found"; exit 1; }
+          $HOME/agensgraph_build/bin/psql -d agensgraph_test -tAc \
+            "SELECT extname || ' ' || extversion FROM pg_extension WHERE extname = 'vector'"
 
       - uses: actions/checkout@v4
         with:
