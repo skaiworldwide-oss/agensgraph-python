@@ -95,15 +95,21 @@ class Blocking(ast.NodeTransformer):
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> ast.AST | None:
         if _is_only_async(node):
             return None
-        plain = ast.FunctionDef(
-            name=_rename(node.name),
-            args=node.args,
-            body=node.body,
-            decorator_list=node.decorator_list,
-            returns=node.returns,
-            type_comment=node.type_comment,
-            type_params=list(node.type_params),
-        )
+        fields = {
+            "name": _rename(node.name),
+            "args": node.args,
+            "body": node.body,
+            "decorator_list": node.decorator_list,
+            "returns": node.returns,
+            "type_comment": node.type_comment,
+        }
+        # A function's own type parameters, which the syntax for arrived in 3.12. Carried when the
+        # node has the field rather than always, because this runs on 3.11 as well, where the
+        # field does not exist and reading it raises. Copied rather than skipped, since a function
+        # that declared one and lost it here would not be the same function.
+        if hasattr(node, "type_params"):
+            fields["type_params"] = list(node.type_params)
+        plain = ast.FunctionDef(**fields)
         # Visited as one node afterwards rather than child by child, so that nothing --
         # an argument's annotation above all -- can be left out by being forgotten here.
         return ast.copy_location(self.generic_visit(plain), node)
