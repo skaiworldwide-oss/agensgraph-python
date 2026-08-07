@@ -145,6 +145,11 @@ class GraphMixin:
     pgconn: PGconn
 
     _agens_capabilities: Capabilities | None = None
+    _agens_can_promote: bool | None = None
+    """Whether this server has the catalog a promoted property is recorded in.
+
+    Asked once and kept, since a server does not grow the catalog while a connection is open.
+    """
     _agens_labels: LabelCache
     _agens_binary_ready: bool = False
     _agens_generation: int = 0

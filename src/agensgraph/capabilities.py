@@ -126,6 +126,13 @@ class Capabilities:
         so a property read is not always JSON. Where it cannot, it always is. Either way
         the decoder follows the type the result declares, so this is a question about what
         can be declared rather than about how anything is read.
+
+        This reads the version and nothing else, which is what makes it free -- and it is
+        therefore a claim about the release rather than about the build in front of it. Two
+        servers reporting ``2.18-devel`` were found to differ, one carrying the catalog a
+        promoted property is recorded in and one not, so a development build may report a
+        version whose features it does not have. Where the answer has to be right rather than
+        free, ask the catalog: :meth:`~agensgraph.Connection.can_promote_properties`.
         """
         return self._at_least(
             _PROPERTY_PROMOTION, "storing a property in its own column", check=check

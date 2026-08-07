@@ -63,6 +63,7 @@ from .introspect import (
     INDEXES_FOR_LABEL,
     INDEXES_QUERY,
     LABELS_QUERY,
+    PROMOTION_CATALOG_QUERY,
     Check,
     Constraint,
     DeclaredProperty,
@@ -598,6 +599,21 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
         """
         return [Label(*row) for row in self._fetch(LABELS_QUERY, (self._graph_of(graph),))]
 
+    def can_promote_properties(self) -> bool:
+        """Whether this server can store a property in a column of its own.
+
+        Asked of the catalog once per connection and kept. :meth:`Capabilities.has_property_promotion`
+        answers the same question from the version at no round trip, and is right about a release;
+        this is right about the server actually connected, which is not the same thing on a
+        development build -- two reporting ``2.18-devel`` were found to differ.
+        """
+        held = self._agens_can_promote
+        if held is None:
+            rows = self._fetch(PROMOTION_CATALOG_QUERY, ())
+            held = bool(rows[0][0])
+            self._agens_can_promote = held
+        return held
+
     def declared_properties(
         self, label: str | None = None, *, graph: str | None = None
     ) -> list[DeclaredProperty]:
@@ -605,11 +621,13 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
 
         A property living in the JSON map is not declared anywhere and so cannot be listed.
 
-        Before 2.18 nothing can be promoted at all, and the catalog that would record it does not
-        exist -- so the answer is none, and reaching for the catalog would raise instead of saying
-        so. The version arrived with the connection, so knowing which server this is costs nothing.
+        A server that cannot promote a property has nowhere to record one, and reading the catalog
+        that is not there would raise instead of saying none -- so the catalog is asked for first,
+        once per connection. Asked rather than worked out from the version, because the version
+        does not answer it: the 2.18 release branch and main both report ``2.18-devel`` and only
+        one of them has the catalog.
         """
-        if not self.capabilities.has_property_promotion():
+        if not self.can_promote_properties():
             return []
         name = self._graph_of(graph)
         query = DECLARED_PROPERTIES_QUERY if label is None else DECLARED_PROPERTIES_FOR_LABEL

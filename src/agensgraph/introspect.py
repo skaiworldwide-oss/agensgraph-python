@@ -32,6 +32,7 @@ __all__ = [
     "GRAPHS_QUERY",
     "INDEXES_QUERY",
     "LABELS_QUERY",
+    "PROMOTION_CATALOG_QUERY",
     "Check",
     "Constraint",
     "DeclaredProperty",
@@ -105,6 +106,17 @@ join pg_catalog.ag_graph g on g.oid = l.graphid
 join pg_catalog.pg_attribute a on a.attrelid = l.relid and a.attnum = p.attnum
 where g.graphname = %s{label}
 order by l.labname, p.propname
+"""
+
+PROMOTION_CATALOG_QUERY = """
+select to_regclass('pg_catalog.ag_label_property') is not null
+"""
+"""Whether this server can store a property in a column of its own.
+
+Asked of the catalog rather than worked out from the version, because the version cannot answer
+it: the 2.18 release branch and main both report ``2.18-devel`` and only one of them has the
+catalog. A server that cannot promote a property has nowhere to record one, so the presence of the
+catalog is the feature.
 """
 
 DECLARED_PROPERTIES_QUERY = _DECLARED_PROPERTIES.format(label="")
