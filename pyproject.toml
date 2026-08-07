@@ -48,6 +48,11 @@ tests = [
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
     "hypothesis>=6.100",
+    # Not a dependency of anything shipped. The dialect is an acceptance test for the PEP 249
+    # surface, and without this it skips itself rather than saying the surface is untested. The
+    # floor is 2.0.31 because that is the first release that imports at all on the Pythons tested
+    # here -- earlier ones assert against class attributes 3.13 added.
+    "sqlalchemy>=2.0.31",
 ]
 typing = [
     "mypy>=1.13",
@@ -102,7 +107,9 @@ python_version = "3.11"
 strict = true
 files = ["src/agensgraph"]
 
-# Tracing is optional and its package ships no stubs, so the one import of it is unchecked.
+# Tracing is optional, so the package may not be installed at all -- which is not an error here,
+# since the one import of it is inside a try that says what to install. It does ship its own types
+# when it is present, and is checked then.
 [[tool.mypy.overrides]]
 module = "opentelemetry.*"
 ignore_missing_imports = true

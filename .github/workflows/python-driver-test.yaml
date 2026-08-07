@@ -34,7 +34,9 @@ jobs:
           enable-cache: true
 
       - name: Install
-        run: uv sync --group dev --python ${{ matrix.python-version }}
+        # --all-extras, so the columnar backends are present. Without them the whole of
+        # columnar.py's suite skips itself, which reads as a pass.
+        run: uv sync --group dev --all-extras --python ${{ matrix.python-version }}
 
       - name: Format and lint
         run: |
@@ -248,7 +250,7 @@ jobs:
           enable-cache: true
 
       - name: Install
-        run: uv sync --group dev
+        run: uv sync --group dev --all-extras
 
       # The tests needing a server are skipped without this variable, so its absence would turn
       # the whole live half of the suite into a silent pass. That is checked, not assumed.
