@@ -1,89 +1,19 @@
-# AgensGraph Python Driver
+# agensgraph-python
 
-A driver for [AgensGraph](https://github.com/skaiworldwide-oss/agensgraph), built on
-[psycopg 3](https://www.psycopg.org/psycopg3/). It reads the graph types the server
-returns — `graphid`, `vertex`, `edge` and `graphpath` — as Python values, in both the text
-and the binary wire format.
+[![PyPI](https://img.shields.io/pypi/v/agensgraph-python.svg)](https://pypi.org/project/agensgraph-python/)
+[![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue.svg)](https://pypi.org/project/agensgraph-python/)
+[![AgensGraph](https://img.shields.io/badge/AgensGraph-2.16%2B-1f6feb.svg)](https://github.com/skaiworldwide-oss/agensgraph)
+[![Tests](https://github.com/skaiworldwide-oss/agensgraph-python/actions/workflows/python-driver-test.yaml/badge.svg)](https://github.com/skaiworldwide-oss/agensgraph-python/actions/workflows/python-driver-test.yaml)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
-Requires Python 3.11 or later and AgensGraph 2.16 or later.
+Read and write an [AgensGraph](https://github.com/skaiworldwide-oss/agensgraph) graph from Python,
+in blocking or awaiting code, over [psycopg 3](https://www.psycopg.org/psycopg3/).
 
-## Install
-
-```sh
-pip install agensgraph-python
-```
-
-## Graph values
-
-A vertex, an edge and a path are read from the wire. They are structs the garbage collector does not
-track, which is most of what makes a large result cheap: nothing here can take part in a reference
-cycle — a property map holds only what JSON can — so going untracked loses nothing and keeps a
-large result out of the collector's way entirely.
-
-The public surface is read-only — `id`, `label`, `properties`, and `start`/`end` on an edge have no
-setters — and it is read-only by having none rather than by refusing writes. That is not only
-taste: routing every field through a `__setattr__` that raises costs more than storing the value
-does, on every element of every result.
-
-A vertex and an edge are values rather than handles. Each is immutable, compares and
-hashes on its identity alone, and so can be used as a dictionary key or a set member.
-
-```python
-from agensgraph import Edge, GraphId, Vertex
-
-v = Vertex(GraphId(3, 1), "person", {"name": "Arthur"})
-v.id.labid, v.id.locid       # (3, 1)
-v.label                      # 'person'
-v.properties["name"]         # 'Arthur'
-v.get("nickname", "none")    # 'none'
-{v: "seen"}                  # hashable
-```
-
-A property map is decoded on first access rather than when the value is built, so a
-result whose properties are never read is never parsed.
-
-A path is a sequence of alternating vertices and edges. Indexing and iteration walk the
-elements in the order the server wrote them, and `len` counts elements, so a path of one
-vertex and no edges has length one and is truthy. The number of hops is `path.length`.
-
-```python
-p.vertices    # (Vertex, ...)
-p.edges       # (Edge, ...)
-p.start, p.end
-p[0], p[1]    # first vertex, first edge
-p.length      # hop count
-```
-
-`label` is the label a vertex was created with, and it is in the value the server sent. Its
-ancestry is not, and is not carried: `labels(n)` is a Cypher function and the server answers it
-with the row — `MATCH (n:derived) RETURN n, labels(n)` gives `["derived", "base"]`, own first.
-Carrying it on the vertex would put a label-table lookup on the text rendering, which is the one
-reading that needs no table at all.
-
-A row is a tuple and the column names are read once per result into `result.keys`, so there is no
-dict per row and no name scanned per lookup. The same vertex appearing in many rows of a join is
-many objects that compare equal rather than one shared object: collapsing them saves one property
-decode per repeat, and on a join of three hundred rows with kilobyte property maps that is under a
-hundredth of the read — against a pass over every result to find out whether there are any repeats
-at all.
-
-A label or a property key cannot be bound as a parameter — the grammar has no place for one
-there — so a statement naming one dynamically has to carry it in its text. `agensgraph.cypher`
-is where that quoting lives:
-
-```python
-from agensgraph.cypher import quote_identifier
-
-quote_identifier("Person")      # 'Person'
-quote_identifier("my label")    # '"my label"'
-quote_identifier('a"b')         # '"a""b"'
-quote_identifier("MATCH")       # '"MATCH"'
-```
-
-A name holding a null byte is refused rather than quoted, because the server's lexer stops at
-one and the statement would end somewhere other than where it appears to.
-
-## Connecting
+A vertex, an edge and a path come back as values you can use rather than strings you have to parse.
+Cypher and SQL run on the same connection, in the same transaction, so a graph traversal and a join
+are one query when you want them to be. Everything psycopg does (cursors, server-side cursors,
+`COPY`, pipelines, `LISTEN`, two-phase commit) keeps working, because the connection *is* a psycopg
+connection.
 
 ```python
 import agensgraph
@@ -95,7 +25,83 @@ with agensgraph.connect("host=localhost dbname=graph") as conn:
         print(person.properties["name"])
 ```
 
-The awaiting interface is the same, awaited:
+## Install
+
+```console
+pip install agensgraph-python
+```
+
+Python 3.11 or later. AgensGraph 2.16 or later.
+
+Optional extras, imported only where they are used, so they never load on a read path:
+
+```console
+pip install "agensgraph-python[arrow]"     # to_arrow
+pip install "agensgraph-python[pandas]"    # to_pandas
+pip install "agensgraph-python[polars]"    # to_polars
+pip install "agensgraph-python[otel]"      # spans through opentelemetry-api
+```
+
+## Contents
+
+**Basics**
+[Connecting](#connecting) ·
+[Running a statement](#running-a-statement) ·
+[Graph values](#graph-values) ·
+[Parameters](#parameters) ·
+[Identifiers](#identifiers)
+
+**Reading**
+[Two wire formats](#two-wire-formats) ·
+[Streaming a large result](#streaming-a-large-result) ·
+[Numbers](#numbers-in-a-property-map) ·
+[Columnar export](#columnar-export)
+
+**Writing**
+[What a write changed](#what-a-write-changed) ·
+[Bulk loading](#bulk-loading) ·
+[A burst of statements](#a-burst-of-statements)
+
+**Schema**
+[Reading the catalogs](#reading-the-catalogs) ·
+[Declaring what should exist](#declaring-what-should-exist)
+
+**Vectors**
+[Storing and reading](#embedding-vectors) ·
+[Indexing and search](#indexing-and-searching) ·
+[Sparse vectors](#sparse-vectors) ·
+[Tuning](#tuning-a-search)
+
+**Running it in production**
+[Pooling](#pooling) ·
+[Deadlines](#deadlines) ·
+[Retrying](#retrying) ·
+[Losing a connection mid-commit](#losing-a-connection-mid-commit) ·
+[Cancellation](#cancellation) ·
+[When the network goes quiet](#when-the-network-goes-quiet)
+
+**Everything else**
+[Observability](#observability) ·
+[Errors](#errors) ·
+[LISTEN and NOTIFY](#listen-and-notify) ·
+[Two-phase commit](#two-phase-commit) ·
+[Generic tools and SQLAlchemy](#generic-tools-and-sqlalchemy) ·
+[Server versions](#server-versions) ·
+[Performance](#performance) ·
+[API reference](#api-reference) ·
+[Development](#development)
+
+## Connecting
+
+```python
+import agensgraph
+
+with agensgraph.connect("host=localhost dbname=graph") as conn:
+    conn.graph("social")
+    ...
+```
+
+The awaiting interface is the same interface, awaited:
 
 ```python
 conn = await agensgraph.AsyncConnection.connect("host=localhost dbname=graph")
@@ -104,40 +110,108 @@ async with conn:
     result = await conn.execute_query("MATCH (n:Person) RETURN n")
 ```
 
-Both are built on psycopg's own connection, so cursors, server cursors, `COPY`, pipelines,
-`LISTEN`, transactions and plain SQL are all there unchanged. The transaction model is
-psycopg's: a statement outside a transaction opens one, `commit()` and `rollback()` are on
-the connection, closing rolls back, and `autocommit=True` is how a statement that cannot run
-inside a transaction gets to run.
+Only the methods that wait for the server are written twice. Everything else (adapters, the label
+table, statement checks, building a result) exists once and is shared, and the blocking interface is
+generated from the awaiting one, so the two cannot drift.
 
-`conn.graph(name)` selects a graph and fills the label table the composite rendering needs.
-The name is quoted rather than bound, because the grammar has no place for a parameter there.
+`conn.graph(name)` selects a graph and fills the label table that the composite rendering needs. The
+name is quoted rather than bound, because the grammar has no place for a parameter there. The table
+is dropped again automatically when anything moves the session somewhere else, including a rollback
+that undoes the move.
 
-`execute_query` takes the statement, the parameters as a sequence, and reserved arguments ending in
-an underscore — `binary_`, `counts_`, `prepare_`, `row_`. It returns a named tuple, so
-`result.records`, `result.keys`, `result.counts` and `result.oids` all read the same whichever
-order they are in.
+**Transactions are psycopg's**, unchanged: a statement outside a transaction opens one, `commit()`
+and `rollback()` are on the connection, closing rolls back, and `autocommit=True` is how a statement
+that cannot run inside a transaction gets to run.
 
-There is no `graph_` and no `timeout_`, and both are absences with a reason. Selecting a graph is a
-statement, is undone by a rollback, and drops the label table; it belongs on the connection or on
-the pool, once, rather than once per statement. Bounding a statement's time is two more statements,
-one to set the limit and one to put it back, which measures **2.3×** a bare `return 1` on a local
-server and is two more round trips against one a network away. So a deadline belongs where it is
-paid once for many statements: `pool.connection(deadline=…)`, or
-`options=-c statement_timeout=…` on the connection.
+**The server is checked at connect.** The version arrives in the startup packet, so refusing a
+server this driver cannot read costs no round trip and happens before the first statement rather
+than at whichever later one first wanted a catalog the server has never had.
+
+## Running a statement
 
 ```python
-agensgraph.connect(dsn, options="-c statement_timeout=5000")
+result = conn.execute_query("MATCH (n:Person) WHERE n.name = %s RETURN n", ("Arthur",))
+
+result.records     # a list of tuples
+result.keys        # the column names, read once per result
+result.counts      # what the statement changed, if you asked
+result.oids        # the type of each column, as the server described it
 ```
 
-Three methods run a statement and each returns one kind of thing, so none of them returns a union:
-`execute_query` reads it all and gives a result, `stream` gives an iterator that keeps the rows on
-the server, and `execute` is psycopg's own and gives a cursor.
+`execute_query` takes the statement, the parameters as a sequence, and reserved arguments ending in
+an underscore:
+
+| | |
+|---|---|
+| `binary_=True` | ask for the composite rendering, see [Two wire formats](#two-wire-formats) |
+| `counts_=True` | read what the statement changed, see [What a write changed](#what-a-write-changed) |
+| `prepare_=` | override when psycopg prepares the statement |
+| `row_=` | a psycopg row factory |
+
+Three methods run a statement, and each returns one kind of thing, so none of them returns a union:
+`execute_query` reads it all and gives a result, [`stream`](#streaming-a-large-result) gives an
+iterator that keeps the rows on the server, and `execute` is psycopg's own and gives a cursor.
+
+There is no `graph_` and no `timeout_`, and both absences have a reason. Selecting a graph is a
+statement, is undone by a rollback, and drops the label table, so it belongs on the connection or on
+the pool, once, rather than once per statement. Bounding a statement's time is two more statements,
+one to set the limit and one to put it back, which measures over twice a bare `RETURN 1` on a local
+server and is two more round trips against one a network away. A deadline therefore belongs where it
+is paid once for many statements: see [Deadlines](#deadlines).
+
+## Graph values
+
+```python
+(v,) = conn.execute_query("MATCH (n:Person) RETURN n LIMIT 1").records[0]
+
+v.id                 # GraphId(labid=3, locid=1), prints as 3.1
+v.label              # 'person', lower case: the server folded it, see Identifiers below
+v.properties         # {'age': 42, 'name': 'Arthur'}, in the order the server stores them
+
+(e,) = conn.execute_query("MATCH ()-[r:KNOWS]->() RETURN r LIMIT 1").records[0]
+e.start, e.end       # the GraphIds of the two vertices
+
+(p,) = conn.execute_query("MATCH p = (:Person)-[:KNOWS]->() RETURN p LIMIT 1").records[0]
+p.vertices, p.edges  # in order
+list(p)              # interleaved: vertex, edge, vertex, ...
+len(p)               # element count
+p.length             # hop count
+```
+
+A vertex and an edge are values rather than handles. Each is immutable, compares and hashes on its
+**identity alone** (which is what the server does too), and so can be a dictionary key or a set
+member.
+
+**A property map is decoded when you first read it**, not when the row arrives. A query that ranks
+or counts vertices without looking inside them never pays for the map at all, and what that is worth
+grows with the map: parsing a vertex whose properties are never touched is about 1.4 times cheaper
+on a map of three keys, 2.8 times on a map of sixty, and 3.5 times on a 1536-dimension embedding.
+
+It also means the map is decoded under whatever
+[number setting](#numbers-in-a-property-map) is in force at the moment you touch it, rather than at
+the moment the row was fetched.
+
+They are structs the garbage collector does not track, which is most of what makes a large result
+cheap: nothing here can take part in a reference cycle, since a property map holds only what JSON
+can. The public surface is read-only, and it is read-only by having no setters rather than by
+refusing writes; that is not only taste, because routing every field through a `__setattr__` that
+raises costs more than storing the value does, on every element of every result.
+
+`label` is the label a vertex was created with, and it is in the value the server sent. Its
+**ancestry is not**, and is not carried: `labels(n)` is a Cypher function the server answers with the
+row, own label first. Carrying it would put a label table lookup on the text rendering, which is the
+one reading that needs no table at all.
+
+A row is a tuple, and the column names are read once per result into `result.keys`, so there is no
+dict per row and no name scanned per lookup. The same vertex appearing in many rows of a join is
+many objects that compare equal rather than one shared object; collapsing them would save one
+property decode per repeat, which on a join of a few hundred rows with kilobyte maps is under a
+hundredth of the read, against a pass over every result to discover whether there are any repeats at
+all.
 
 ## Parameters
 
-Parameters are psycopg's — `%s`, or `%(name)s`, never string formatting. Pass plain Python
-values:
+Placeholders are psycopg's `%s`. Cypher's own `$n` also works where the server accepts it.
 
 ```python
 conn.execute_query("MATCH (n:Person) WHERE n.name = %s RETURN n", ("Arthur",))
@@ -146,53 +220,61 @@ conn.execute_query("CREATE (:Person %s)", ({"name": "Arthur", "age": 42},))
 conn.execute_query("MATCH (n) WHERE id(n) = %s RETURN n", (vertex.id,))
 ```
 
-A string is sent as `text` rather than with its type left for the server to work out. That
-matters more than it sounds. Cypher reads almost every parameter as `jsonb`, and an untyped
-one is handed straight to jsonb's parser — so `"123"` would arrive as the *number* 123,
-`"null"` as a JSON null, and a search for either would quietly match nothing. Saying the type
-reaches the server's own `cypher_to_jsonb` conversion instead, which keeps a string a string.
+**A Python `str` is sent as `text`.** That matters more than it sounds. Left untyped, the server
+parses the bytes as JSON, so `"Arthur"` was an error and `"123"`, `"null"`, `"true"` and `"1.5"` were
+accepted and **silently matched nothing**. Declared as text, the server's own text to JSON coercion
+runs instead and every one of those becomes a correct answer. The plans and index conditions are
+unchanged by this, which was checked across equality, ranges, `STARTS WITH`, `IN`, `ORDER BY` and
+`<>`, including under a forced generic plan.
 
-The price is one thing: in plain SQL, a string standing in for some other type now wants a
-cast, because the server no longer guesses.
+What it costs: a `str` passed where the type is *not* text-like no longer resolves, and says so while
+the statement is parsed, naming both types. The fix is psycopg's own documented idiom, `%s::date`.
+Passing the value's real type (`date`, `UUID`, `int`, `Decimal`, `bytes`) is untouched, and
+`concat(%s, %s)`, which fails without this, works. To send a value the old way for one parameter:
 
 ```python
-conn.execute("select * from t where d = %s::date", ("2026-08-05",))   # cast
-conn.execute("select * from t where d = %s", (date(2026, 8, 5),))     # or the real type
-conn.execute("select * from t where d = %s",
-             (agensgraph.Unspecified("2026-08-05"),))                 # or opt back out
+from agensgraph import Unspecified
+conn.execute_query("SELECT %s", (Unspecified("123"),))
 ```
 
-Passing the value's own type — `date`, `UUID`, `int`, `Decimal`, `bytes` — behaves exactly as
-psycopg does, as do all `text`, `varchar` and `name` positions. When a cast is missing the
-server says so while parsing, naming both types, and the driver attaches a note pointing at
-the fix. This is what the PostgreSQL JDBC driver does by default, so AgensGraph's own Java
-driver already works this way.
+**A mapping is sent as jsonb**, because psycopg cannot adapt a bare `dict` at all and nearly every
+parameter a Cypher statement takes is read as jsonb. A `list` stays a PostgreSQL array, because plain
+SQL on the same connection needs `WHERE x = ANY(%s)` to keep working.
 
-A `list` stays a PostgreSQL array, since plain SQL on the same connection needs it to be one.
-Wrap it as `Jsonb([...])` for a JSON array.
+### Where a parameter is allowed
 
-One shape is refused before it is sent:
+| position | binds as |
+|---|---|
+| a general expression, `WHERE`, `RETURN`, list and map values, `ORDER BY` | jsonb |
+| `LIMIT`, `SKIP`, `OFFSET` | bigint |
+| a pattern property map, `SET a = %s`, `CREATE (:l %s)` | jsonb |
+| `a[%s]` | jsonb |
+| `id(a) = %s` | graphid |
+| `size(%s)` | text (2.18 and later; earlier parsers take no parameter there) |
+| a label, `a.%s`, `{%s: v}`, the lower bound of a walk | not allowed, syntax error |
+| `UNWIND %s`, `x IN %s` | needs an explicit `::jsonb` |
+
+**One shape is refused by the driver before it is sent.** A parameter as the *upper* bound of a
+variable-length relationship, `[r*1..%s]`, is not a syntax error: the server reads it as an unbounded
+walk plus a property map, prepares without complaint, and quietly returns the wrong rows. All three
+spellings of it are refused, in both placeholder styles:
 
 ```python
 conn.execute_query("MATCH (a)-[r*1..%s]->(b) RETURN a", (3,))   # ValueError
 ```
 
-The server accepts that and reads the parameter as a property map, so the statement prepares,
-reports its parameter as `jsonb`, and matches a walk of *any* length. Every other position
-that cannot take a parameter reports a syntax error of its own and is left to the server.
-
 ### Sending a property map
 
-Rendered with msgspec, which is where most of the cost of a write is: several times faster than
-the standard library on a small map, and about ten times on an embedding, where the numbers
-dominate.
+Rendered with msgspec, which is where most of the cost of a write is: several times faster than the
+standard library on a small map, and about ten times on an embedding, where the numbers dominate.
 
-`NaN` and the infinities are refused. jsonb has no way to store one, and encoding it would write
-`null` instead — which is the wrong value rather than an error. The check runs only when the output
-holds a `null` at all, so a map of numbers never pays for it.
+`NaN` and the infinities are refused, wherever they appear. jsonb has no way to store one, and
+encoding it would write `null` instead, which is the wrong value rather than an error. Sent alone
+rather than in a map, a non-finite float reaches the server as a `float8` and converting one to jsonb
+stores the *text* `"NaN"`, so what came back would be a string where a number was sent. Both are
+refused.
 
-A value JSON has no type for is rendered rather than refused, and reads back as what it was
-rendered to rather than as what was sent:
+Values that are rendered to rather than stored as what was sent:
 
 | written | stored as | reads back as |
 |---|---|---|
@@ -201,80 +283,437 @@ rendered to rather than as what was sent:
 | `bytes` | base64 text | `str` |
 | `set` | a JSON array | `list` |
 
-A `Decimal` is **not** in that table: it is stored as a JSON number and keeps every digit. jsonb
-does not narrow one — asked for it as text the server returns
-`3.14159265358979323846264338327950288`, all thirty-six digits — so with
-`read_numbers_exactly()` on, a decimal written and read back is the decimal that was written.
+A `Decimal` is **not** in that table: it is stored as a JSON number and keeps every digit, because
+jsonb stores a number as `numeric`, which is arbitrary precision.
 
-A non-finite `float` is refused wherever it appears — in a property map, and as a parameter of its
-own. Sent alone it reaches the server as a `float8`, and converting one to jsonb stores the *text*
-`"NaN"`, so what came back was a string where a number was sent.
+## Identifiers
+
+A label or a property key cannot be bound as a parameter, since the grammar has no place for one
+there, so a statement naming one dynamically has to carry it in its text. That quoting lives in one
+place:
+
+```python
+from agensgraph.cypher import quote_identifier, quote_string
+
+quote_identifier("person")      # person
+quote_identifier("Person")      # "Person", since the server folds an unquoted name to lower case
+quote_identifier("my label")    # "my label"
+quote_identifier('a"b')         # "a""b"
+quote_identifier("MATCH")       # "MATCH"
+```
+
+A name holding a null byte is refused rather than quoted, because the server's lexer stops at one and
+the statement would end somewhere other than where it appears to. Everything in this driver that
+builds a statement around a name (the index and constraint builders, the vector helpers, the identity
+map, `LISTEN`) goes through this.
+
+## Two wire formats
+
+The driver never rewrites a query. `RETURN n` is sent as written, the server answers in its text
+rendering, and the driver reads that. It needs nothing from the server beyond the answer itself.
+
+The same query can be asked for in the composite rendering instead, per-statement, with
+`binary_=True`. That form leaves the label name out of the value, so it needs a label table for the
+connection, which `conn.graph(name)` fills.
+
+**Ask for it when the result is large and the link is not the bottleneck.** It trades bandwidth for
+parsing: every element repeats its column oids, its lengths and a tuple id the text form never
+writes, so a vertex is about a fifth more bytes and an edge several times more. In exchange the
+driver reads lengths instead of measuring where each value ends.
+
+How much it pays depends on the shape. Over a few thousand rows it reads edges about 1.45 times
+faster, paths about 1.3, and whole vertices only about 1.15, since a vertex is mostly its property
+map and both renderings hand that to the same decoder. It stops paying on a short result, where the
+round trip costs more than either parse: at a few hundred rows, whole vertices are about 0.8 times,
+which is to say slower. [Embeddings](#embedding-vectors) are the clearest case for it, because a
+vector's text is decimal and its binary is the numbers themselves.
+
+When in doubt, leave it off and turn it on for the one query that is slow.
+
+Both renderings produce the same objects, and the suite asserts that against values the server itself
+produced, comparing them strictly rather than with `==`, which would pass on disagreement and fail on
+agreement in five separate ways.
 
 ## What a write changed
 
 ```python
 result = conn.execute_query("CREATE (:Person {name: 'a'})", counts_=True)
 result.counts.inserted_vertices     # 1
-result.counts.complete              # True
 ```
 
-The server resets its counters unevenly. A write with no `RETURN` zeroes all five before it
-runs, so all five belong to it. A write *with* a `RETURN` zeroes only the counters for the
-clauses it has, and the rest still hold whatever an earlier statement left. So:
+Five counters: `inserted_vertices`, `inserted_edges`, `deleted_vertices`, `deleted_edges`,
+`updated_properties`.
+
+A counter is `None` rather than `0` when it cannot be attributed to this statement, which is a real
+case rather than a formality. The counters live on the session, and the server zeroes them per
+*clause group*, so a write that returns rows leaves the groups its own clauses do not touch holding
+whatever an earlier write left there. The driver reads them before and after and reports only what it
+can account for: a counter that changed can only have been changed here, one that did not and was
+already zero is zero either way, and the one case where a stale number and a real one look alike is
+left unanswered instead of guessed.
+
+That extra reading is only taken where it is needed. A write that returns no rows zeroes all five on
+the server, so one reading afterwards is the whole answer.
+
+## Streaming a large result
 
 ```python
-conn.execute_query("CREATE (:Person {name: 'a'}), (:Person {name: 'b'})")
-result = conn.execute_query("MATCH (n:Person) SET n.x = 1 RETURN n", counts_=True)
-result.counts.updated_properties    # 2
-result.counts.inserted_vertices     # None -- not 2, which is the earlier statement's
-result.counts.complete              # False
+with conn.transaction():
+    for (person,) in conn.stream("MATCH (n:Person) RETURN n"):
+        ...
 ```
 
-`None` means the counter was not answered for. It is never reported as zero, and a total that
-is missing one of its terms is not reported at all.
+A server-side cursor, so the rows stay on the server. A hundred rows are fetched at a time by
+default, because the standard's own default of one is a round trip per row.
 
-## Two wire formats
+The grammar has no Cypher arm for `DECLARE ... CURSOR`, so the statement is wrapped in
+`SELECT * FROM (...) t`, and that wrap accepts only the read-only subset. A write is refused by name
+before anything is sent. A trailing `LIMIT` or `ORDER BY` is fine; one in the middle is not, and the
+server says so rather than the driver keeping a second copy of the server's grammar (the two releases
+disagree about that case, which is exactly why).
 
-The driver never rewrites a query. `RETURN n` is sent as written, the server answers in
-its text rendering, and the driver reads that — which is the default and needs nothing
-from the server beyond the answer itself.
+A transaction is required, and not as a formality: it is what makes abandoning the iterator safe,
+because leaving the transaction closes the cursor with it. Each stream names its own cursor, so two
+open at once do not collide.
 
-The same query can be asked for in the composite rendering instead, per statement. That
-form leaves out the label name, so it needs a label table for the connection.
+## Numbers in a property map
 
-**Ask for it when the result is large and the link is not the bottleneck.** It trades bandwidth
-for parsing: every element repeats its column oids, its lengths and a tuple id the text form never
-writes, so a vertex is about a fifth more bytes and an edge several times more. In exchange the
-driver reads lengths instead of measuring where each value ends.
+jsonb keeps an arbitrary precision decimal; Python's float does not. Integers of any length survive
+exactly. Only non-integers lose anything, past about seventeen significant digits.
 
-That trade pays most on edges and paths and barely at all on whole vertices, and it stops paying
-on a short result, where the round trip costs more than either parse — a few hundred rows of whole
-vertices is slower in the composite rendering than in text. Embeddings are the clearest case for
-it, because a vector's text is decimal and its binary is the numbers themselves.
+`1e400` is worth calling out: the server stores it as an exact 401 digit integer, not an infinity.
 
-When in doubt, leave it off and turn it on for the one query that is slow.
-
-Both renderings produce the same objects, and the test suite asserts that against values
-the server itself produced.
-
-## Versions
-
-The driver reads AgensGraph 2.16 and later. It learns which it is talking to from the
-`agversion` parameter the server sends at startup, so the check costs no round trip.
-
-Everything above works on every supported version. Four features do not exist before
-2.18, and asking for one on an older server says so rather than letting the server fail
-on syntax it has never seen:
+For the cases where the lost digits matter:
 
 ```python
-caps = agensgraph.Capabilities.of(conn)
-caps.has_property_promotion()   # a property stored in a column of its own
-caps.has_gql_clauses()          # LET, NEXT, FINISH, FILTER, FOR, CALL
-caps.has_element_ordering()     # ORDER BY on a vertex or an edge
-caps.has_endpoint_elision()     # visible in a plan
+agensgraph.read_numbers_exactly()      # once, at startup
 ```
 
-## A pool
+Every non-integer then reads as a `Decimal`, keeping whatever the server holds, `1e-400` included.
+What it costs depends on what the map holds, since only a non-integer takes the slower path: a map of
+integers is unchanged, a mixed one costs twice as much, one of non-integers about four times, and an
+embedding of a thousand floats closer to six. It applies to a property map and to a bare jsonb column
+alike, so `RETURN n` and `RETURN n.p` agree about the same stored value.
+
+It is process-wide and meant to be chosen once at startup, which is also the only moment it is
+unambiguous: a map on the text path is decoded when it is first read, so two rows of one result can
+disagree if the setting changed between touching them.
+
+## Columnar export
+
+```python
+from agensgraph.columnar import to_arrow, to_pandas, to_polars
+
+table = to_arrow(conn.execute_query("MATCH (n:Person) RETURN n.name, n.age"))
+```
+
+Each column is built as a column, with its type declared rather than inferred, which is about an
+order of magnitude faster than assembling one Python value at a time, for Arrow, pandas and polars
+alike.
+
+**A whole vertex becomes a struct** of its identity, its label and its property map, and the map is
+the JSON text taken from the bytes it arrived in, so it is never decoded into a dict:
+
+```python
+table = to_arrow(conn.execute_query("MATCH (n:Person) RETURN n"))
+# n: struct<id: uint64, label: dictionary<values=string, indices=int32, ordered=0>, properties: string>
+```
+
+An edge carries `start` and `end` as the same `uint64` a vertex's `id` is, so a join between them is
+an integer join. A path is a struct of a list of vertices and a list of edges.
+
+`Layout` decides the cases where more than one answer is defensible:
+
+```python
+from agensgraph.columnar import Layout
+
+Layout(elements="columns")            # spread a vertex over n.id, n.label, n.properties
+Layout(identity="text")               # '3.1' rather than the packed integer
+Layout(properties=some_struct_type)   # pull named fields out of the map
+Layout(properties="skip")             # leave the map out
+Layout(labels="text")                 # not dictionary encoded
+Layout(vectors="list")                # not fixed-size
+Layout(sparse="dense")                # expand a sparse vector
+```
+
+**An embedding becomes `FixedSizeList<float32>`** straight from the wire bytes, with no Python float
+in between. Ask for the composite rendering and it exports dramatically faster, in half the memory:
+
+```python
+result = conn.execute_query("MATCH (n:Emb) RETURN n.v AS v", binary_=True)
+table = to_arrow(result)          # v: fixed_size_list<item: float>[384]
+```
+
+**A large result is exported a chunk at a time.** `batches()` and `reader()` take a server-side
+cursor and never hold more than one chunk of Python objects. The first chunk settles the schema and
+every later one is held to it, so the chunks concatenate:
+
+```python
+import pyarrow.dataset
+from agensgraph import columnar
+
+with conn.transaction(), conn.cursor(name="export") as cursor:
+    cursor.execute('SELECT id, v FROM "graph".emb')
+    pyarrow.dataset.write_dataset(columnar.reader(cursor, size=8192), "out", format="parquet")
+```
+
+`columns(records, keys)` is the same transposition without a backend, for a caller who wants plain
+lists. It keeps every column even when two share a name.
+
+## Bulk loading
+
+```python
+conn.load_vertices("Doc", [{"key": "a", "title": "..."}, ...])
+by_key = conn.identity_map("Doc", "key")
+conn.load_edges("Cites", [(by_key["a"], by_key["b"], {"weight": 1})])
+```
+
+`COPY` in binary rather than a statement per row: about thirty times a statement at a time, and
+better than half again on top of the best a single `UNWIND ... CREATE` can do.
+
+No identity is supplied. The label table's `id` column has a default that builds the graph id from
+the label's own id and its sequence, so copying only the property map produces exactly the identities
+a `CREATE` would have. That removes the whole business of generating identities client-side and
+keeping them unique.
+
+Edges need the identities of the two vertices they join, which is what `identity_map` reads, in one
+statement for the whole label. It raises rather than guessing if the key is not unique, or if an
+element does not have it, because silently collapsing two vertices into one would attach every edge
+of both to whichever survived.
+
+A frame goes in directly, without becoming Python objects on the way:
+
+```python
+conn.load_vertex_frame("Person", table)      # each column is a property
+conn.load_edge_frame("KNOWS", edges)         # start and end are packed identities
+```
+
+That is about half again faster than the same table handed to `load_vertices()` as mappings, and no
+more than that, because almost all of a load is the server's own ingest. The client's share is what
+falls, by about eight times.
+
+## A burst of statements
+
+For a batch whose cost is round trips rather than work:
+
+```python
+conn.pipeline_batch([f"CREATE (:Event {{n: {n}}})" for n in range(1000)])
+```
+
+**A failure is attributed to the batch, not to a statement**, and the signature says so. That is not
+caution, it is what the server does: with four statements where only the second is bad, the *first*
+raised and the rest reported no SQLSTATE at all. `BatchFailed` carries the statements that were sent,
+in order, and the server's own error as its cause. Re run them one at a time to find out which.
+
+## Reading the catalogs
+
+```python
+conn.graphs()                    # [Graph(name, schema, labels)]
+conn.labels()                    # [Label(id, name, kind, parent)]
+conn.declared_properties()       # [DeclaredProperty(label, name, type, nullable)]
+conn.indexes()                   # [Index(label, name, unique, definition)]
+conn.constraints()               # [Constraint(label, name, unique, definition)]
+conn.element_counts()            # {'Person': 2, 'KNOWS': 1}
+```
+
+Each takes an optional label to narrow to, and an optional graph to read about instead of the one the
+session is on.
+
+Counting per label reads no property: the label id is part of every element's identity, so the group
+key is a function of the id column alone. Whether the *heap* is read anyway is the planner's to
+decide, and often yes, because against a narrow label it prefers a sequential scan to an index only
+one. An edge can never avoid it, because the engine creates an edge's id index as BRIN, which carries
+no tuple pointers.
+
+Two things about uniqueness are worth knowing, because they are not where you would look. A
+uniqueness constraint in AgensGraph is an **exclusion** constraint, so it is filtered *out* of the
+property index view, and a driver reporting from that view alone would show a graph as having no
+uniqueness constraints when it has them. `constraints()` reads the constraint catalog as well, so it
+finds them.
+
+`declared_properties()` asks the server whether it can promote a property at all before reading the
+catalog that records one, because that catalog does not exist on every server and the version cannot
+tell you: the 2.18 release branch and main both report `2.18-devel`, and only one of them has it.
+
+## Declaring what should exist
+
+Say what the schema should be, and let the driver work out the difference:
+
+```python
+from agensgraph import DesiredIndex, Unique, Check
+
+conn.ensure_indexes([
+    DesiredIndex("person", ["email"], unique=True),
+    DesiredIndex("doc", ["title"], method="gin"),
+])
+conn.ensure_constraints([
+    Unique("person", "email"),
+    Check("person", "age > 0", "person_age_positive"),   # a check needs a name of its own
+])
+```
+
+Both return the statements they ran, take `dry_run=True` to return them without running any, and
+`drop_extra=True` to remove what is there and not asked for. Running the same declaration twice is a
+no-op the second time.
+
+`DesiredIndex` and `Unique` derive a name when you do not give one, from the label and the
+properties. `Check` cannot, since an expression gives nothing to derive from, so its name is
+required.
+
+**Name a label the way the server stores it**, which `conn.labels()` will tell you. Every name here
+is quoted, so it is taken literally: `CREATE VLABEL Person` stores `person`, and asking for
+`DesiredIndex("Person", ...)` then looks for a label that does not exist. Write `"person"`, or create
+the label quoted in the first place so the capital survives. This is the one place the folding rule
+in [Identifiers](#identifiers) reaches out and bites, because everywhere else both sides fold
+together and agree.
+
+The matching is deliberately conservative, because of how the server stores these. A name is derived
+from the columns, truncated, then given a counter on collision, so names are not the key. A
+definition is printed with defaults omitted. A predicate is stored normalised, so `age > 0` comes
+back as something that does not look like what you wrote. Three consequences: name an operator class
+only when it differs from the default, expect a partial index to be compared on its normalised
+predicate, and let anything the reconciler cannot match confidently alone rather than dropping it.
+
+## Embedding vectors
+
+Needs [pgvector](https://github.com/pgvector/pgvector) in the database. It is created per database,
+not per server, so ask the connection rather than the version:
+
+```python
+conn.has_vectors()          # is the extension created here
+conn.register_vectors()     # read vector, halfvec and sparsevec on this connection
+conn.vector_version()       # (0, 8, 6)
+```
+
+Two routes, and both are indexed the same way:
+
+```python
+# a property left in the map, with the cast carrying the dimension
+conn.execute("CREATE PROPERTY INDEX ON movie USING hnsw ((embedding::vector(4)) vector_cosine_ops)")
+
+# or a column of its own, which needs no cast and refuses a wrong-length value on write
+from agensgraph.vector import generated_column
+conn.execute(f"CREATE VLABEL doc ({generated_column('embedding', 1024)})")
+```
+
+A promoted column is the stronger of the two: the dimension lives on the column, so `vector_in`
+enforces it at the moment a value is written rather than at search time.
+
+### Storing and reading
+
+```python
+from agensgraph.vector import Vector
+
+conn.execute("CREATE (:doc {embedding: %s})", (Vector(values),))
+
+(v,) = conn.execute_query("MATCH (n:doc) RETURN n.embedding").records[0]
+len(v)              # free, the dimension is in the first two bytes
+v.values            # array('f'), which numpy and torch take without copying
+v.tolist()          # an ordinary list
+v[0], v[-1], v[0:2], list(v), sum(v), 2.0 in v, v.index(2.0)
+v == [1.0, 2.0]     # True when the numbers match
+```
+
+A `Vector` keeps the bytes the server sent and turns them into numbers only if you look. That is the
+same bargain the driver makes with a property map, and it pays here for the same reason: a vector
+search asks the *server* for the distance, so the components of the vectors it ranked are often never
+read. It is not a `list` (`isinstance(v, list)` is `False`, `json.dumps(v)` raises) but it compares
+equal to one, which is the part that would otherwise go wrong quietly.
+
+**Ask for `binary_=True` when you read vectors.** This is the one place the rendering makes a large
+difference rather than a small one: a vector of 1536 dimensions prints as roughly fifteen kilobytes
+of decimal against six of wire bytes, so the text form costs about three times as much before
+anything is parsed and seven times once the numbers are read.
+
+**Send a `Vector`, not a list and not a string you built.** Every other route formats each number as
+decimal for the server to parse back: a list cast to `vector(1536)` costs about eight times as much,
+a hand built string about two and a half. In bulk the gap is wider, and `COPY` in binary with
+`Vector` loads an order of magnitude faster than `COPY` in text.
+
+Half precision is `halfvec`, and works the same way. Binary quantisation is available in SQL, where
+`bit` is spellable; Cypher has no syntax for that cast, which is worth knowing before you look for
+one.
+
+### Indexing and searching
+
+The index statement and the search statement come from the same function, so they cannot disagree:
+
+```python
+from agensgraph.vector import vector_index, nearest, Distance
+
+conn.execute(vector_index("doc", "embedding", dimensions=1024,
+                          operator_class=Distance.COSINE.operator_class))
+# create property index on doc using hnsw ((embedding::vector(1024)) vector_cosine_ops)
+
+rows = conn.execute_query(
+    nearest("doc", "embedding", dimensions=1024, operator=Distance.COSINE, limit=10),
+    (query_vector,),
+).records
+# match (n:doc) return n order by n.embedding::vector(1024) <=> %s::vector(1024) limit 10
+```
+
+`Distance` is a `StrEnum` whose value *is* the operator, so it goes straight into `operator=`, and
+`.operator_class` gives the class the matching index needs.
+
+That sharing exists because of two ways to lose the index silently:
+
+- **The typmod must match exactly.** Against a `vector(4)` index, a search casting to a bare `vector`
+  or to `vector(3)` sorts a sequential scan and tells you nothing.
+- **An operator class serves one operator.** A `vector_cosine_ops` index answers `<=>` alone, and
+  ordering by `<->` against it scans.
+
+Distances by name, because two of them differ by a single character and mean entirely different
+things: `L2` (`<->`), `INNER_PRODUCT` (`<#>`, negated so that smaller is nearer as it is for the
+others), `COSINE` (`<=>`), `L1` (`<+>`), and for bit strings `HAMMING` (`<~>`) and `JACCARD` (`<%>`).
+`hnsw` and `ivfflat` are both available, and `vector_index` takes `options=` for things like
+`WITH (lists=10)`.
+
+Writing the search by hand is fine too, and on an unpromoted property the cast is required rather
+than optional, since `jsonb <-> vector` is not an operator:
+
+```python
+conn.execute_query(
+    "MATCH (m:movie) RETURN m ORDER BY m.embedding::vector(4) <=> %s::vector(4) LIMIT 4",
+    (query_vector,),
+)
+```
+
+### Sparse vectors
+
+```python
+from agensgraph.vector import SparseVector
+
+v = SparseVector({0: 1.0, 3: 2.0}, 6)   # indices, then how many dimensions
+v.to_dense()                            # when you really want the zeros
+```
+
+It is a value of its own rather than a dense list, and the reason is size: three non zeros in a
+million dimensions is a few dozen bytes on the wire against roughly eight mebibytes as a list of
+floats, and expanding it would discard the entire reason the type exists.
+
+**Indices are zero-based in Python**, everywhere, including `to_dense()`. The wire's text form is one
+based and its binary form is zero-based, which is a genuine trap: two renderings that disagree about
+the base, decoded without accounting for it, give a plausible off-by-one rather than an error. The
+conversion happens in one place, on the text boundary only, and is tested from both directions.
+
+What the server refuses, the constructor refuses: duplicate indices, an index out of range, a
+dimension below one, a non-finite value. An explicit zero is dropped, because the server drops it,
+and mirroring that is what keeps a round trip stable.
+
+A Cypher list cannot be written into a sparse column at all, so the dumper is not a convenience here;
+it is the reasonable way in.
+
+### Tuning a search
+
+```python
+conn.vector_search_options({"hnsw.ef_search": 100})
+```
+
+Seven settings, listed with the type each takes in `agensgraph.vector.SEARCH_OPTIONS`. Applied to the
+transaction by default, so they do not leak into the next caller on a pooled connection; pass
+`local=False` to set them for the session.
+
+## Pooling
 
 ```python
 pool = agensgraph.ConnectionPool("host=localhost dbname=graph", graph="social",
@@ -287,489 +726,190 @@ with pool.connection(deadline=agensgraph.Deadline(5.0)) as conn:
 pool.close()
 ```
 
-It wraps psycopg's pool rather than reimplementing it, and adds four things psycopg has no
-equivalent for. A server this driver cannot read is refused by `open()` before any worker
-starts. `invalidate()` retires every connection now held in one call, so a server restart costs
-one event rather than one failure per connection. `configure` runs once per new connection and
-`setup` once per handout — psycopg has only the first, and a graph or a statement timeout belongs
-to the second. And a `Deadline` threaded through covers both the wait for a connection and the
-statement that runs on it, reaching the server as `statement_timeout`.
+It wraps psycopg's pool rather than reimplementing one, and adds five things psycopg has no
+equivalent for.
 
-`get_stats()` returns psycopg's sixteen counters plus `generation`, `connections_retired` and
-`connections_interrupted`.
+**A server this driver cannot read is refused by `open()`** before any worker starts. That check is
+its own connection, made and closed first, because a refusal raised inside the pool would be counted
+as a connection error and retried for the whole reconnect timeout instead of reported.
 
-A connection whose statement was **interrupted** — cancelled, or a keyboard interrupt — is closed
-rather than lent to somebody else. psycopg does try to leave it clean: it asks the server to cancel
-and then reads back whatever is still coming, and when that finishes the connection really is idle
-and really is reusable. What it cannot promise is that it finished — the read it re-enters is
-bounded by nothing, and because an `asyncio.timeout` works *by* cancelling, no timeout on that
-connection can fire either. So such a connection is replaced, which costs one connection on an
-event that is rare by definition. A statement that merely *failed* keeps its connection: a value
-this driver refused to send never reached the socket, and a server's own refusal leaves the
-connection idle and answering.
+**`invalidate()` retires every connection now held**, in one call, and returns the generation now in
+force. Nothing is closed and nothing waits: a connection in use stays usable until its holder is
+finished, and is closed when it comes back. So a server restart costs one call rather than one
+failure per connection.
 
-`drain()` is the other half of `invalidate()` and does a different job. It closes every connection
-and opens the same number again, for a change a connection carries from the moment it is made — a
-registration on the adapters map, a setting asked for in `configure`, a rotated password behind a
-callable connection string. The generation is untouched, because those connections are not wrong to
-be reused; they are replaced so the replacements are built the new way.
+**`drain()` is the other half and does a different job.** It closes every connection and opens the
+same number again, for a change a connection carries from the moment it is made: a registration on
+the adapters map, a setting asked for in `configure`, a rotated password behind a callable connection
+string. The generation is untouched, because those connections are not wrong to be reused; they are
+replaced so the replacements are built the new way.
+
+**`configure` runs once per new connection and `setup` once per handout.** psycopg has only the
+first, and a graph or a statement timeout belongs to the second.
+
+**A connection whose statement was interrupted is closed rather than lent again.** psycopg does try
+to leave it clean, and when that finishes the connection really is reusable, but it cannot promise it
+finished: the read it re-enters is bounded by nothing, and because an `asyncio` timeout works *by*
+cancelling, no timeout on that connection can fire either. Such a connection is replaced, which costs
+one connection on an event that is rare by definition. A statement that merely *failed* keeps its
+connection, since a value the driver refused never reached the socket and a server's own refusal
+leaves the connection idle and answering.
+
+`get_stats()` returns psycopg's own counters plus `generation`, `connections_retired` and
+`connections_interrupted`; `pop_stats()` is the same with the accumulating ones reset, for reporting
+an interval. `resize()` and `check()` pass through.
 
 For a process that handles one request and exits, or a serverless one that may be frozen between
-requests, `NullConnectionPool` keeps nothing: one connection per caller, closed when they are done.
-Everything else is the same — the graph is selected, the version is checked, `configure` and `setup`
-run, the counters are counted — so moving between the two is a change of class and nothing else.
-A borrow and one statement costs about **eight times** what it costs from a pool that keeps its
+requests, **`NullConnectionPool`** keeps nothing: one connection per caller, closed when they are
+done. Everything else is the same, so moving between the two is a change of class and nothing else. A
+borrow and one statement costs about eight times what it costs from a pool that keeps its
 connections, which is what connecting costs and is the reason not to choose it for a process that
 lives long enough to reuse one.
 
-```python
-pool = agensgraph.NullConnectionPool("host=localhost dbname=graph", graph="social")
-```
+Both pools have an awaiting twin: `AsyncConnectionPool` and `AsyncNullConnectionPool`.
 
-### Pausing the collector
+## Deadlines
 
 ```python
-with agensgraph.paused_collection():
-    records = conn.execute_query("MATCH (n:Person) RETURN n").records
+from agensgraph import Deadline
+
+budget = Deadline(5.0)
+with pool.connection(deadline=budget) as conn:
+    conn.execute_query("MATCH (n) RETURN count(n)")
 ```
 
-Worth about **1.03×** on a read of 200,000 vertices — and that is the point: a row is a struct the
-collector does not track, so a result is almost entirely invisible to it. The same read against rows
-built as ordinary objects is **1.69×**, which is what being untracked saves.
-Reference counting still frees as usual; only the collection of cycles waits.
+One budget, threaded through the wait for a connection *and* the statement that runs on it, so time
+spent waiting is time the statement no longer has. It reaches the server as `statement_timeout`, set
+once per borrow and reset when the connection goes back, so it cannot be inherited by the next
+caller.
 
-`agensgraph.freeze_after_import()` is the other half — call it once at startup and every later
-collection skips the module-level objects that were never going to be collected anyway.
+`statement_timeout` is deliberately set a little inside the budget. Arriving at `COMMIT` with no time
+left manufactures the one failure that cannot be retried safely, so the gap is reserved rather than
+spent.
 
-## Handing a result to something columnar
+It never uses `transaction_timeout` or `idle_in_transaction_session_timeout` as a query deadline,
+because those terminate the *session*. `Expired` is a `TimeoutError`, so a caller that already
+catches one keeps working, and running out of your own budget is classified differently from a pool
+with nothing to give.
 
-Arrow is built a column at a time, from the values as they arrived — not by making a Python list per
-column first:
+## Retrying
+
+`RetryPolicy` decides; it does not drive. You keep the loop, because only you know what is safe to
+run again and whether the transaction had already written:
 
 ```python
-from agensgraph.columnar import to_arrow, to_pandas, to_polars
+import time
+from agensgraph import RetryPolicy
 
-result = conn.execute_query("MATCH (n:Person) RETURN n.name AS name, n.age AS age")
-frame = to_pandas(result)
+policy = RetryPolicy(attempts=3)     # the first try counts, so this is one try and two retries
+previous = []
+
+for number in range(1, policy.attempts + 1):
+    try:
+        result = pool.execute_query("MATCH (n) RETURN count(n)")
+        policy.succeeded()           # pays back into the shared allowance
+        break
+    except Exception as exc:
+        attempt = policy.decide(exc, number=number)   # .retry .delay .recovery .reason
+        if not attempt.retry:
+            raise
+        previous.append(exc)
+        time.sleep(attempt.delay)
+else:
+    raise policy.exhausted(previous[-1], attempts=policy.attempts, previous=previous)
 ```
 
-Installed as needed, and imported only where used: `agensgraph-python[arrow]`, `[pandas]`,
-`[polars]`.
+`decide()` also takes `wrote=True`, which says the transaction had written something, and that is
+what turns a lost connection from "reconnect and try again" into "the outcome is now unknown", and
+`remaining=` from your budget, so a wait that would not leave time for another attempt is not taken.
 
-Each column is built as a column, with its type declared rather than inferred, which is about an
-order of magnitude faster than assembling one Python value at a time — for Arrow, pandas and polars
-alike.
-
-**A whole vertex is a struct** of its identity, its label and its property map — and the map is JSON
-text taken from the bytes it arrived in, so it is never decoded into a dict:
-
-```python
-table = to_arrow(conn.execute_query("MATCH (n:Person) RETURN n"))
-# n: struct<id: uint64, label: dictionary<values=string, indices=int32>, properties: string>
-```
-
-Several times faster than building a dict per row, and it holds less. An edge carries `start` and
-`end` as the same `uint64` a vertex's `id` is, so the join is an integer join. A path is a struct of
-a list of vertices and a list of edges. `Layout` says what to do where more than one answer is
-defensible — `elements="columns"` to spread a vertex over `n.id`, `n.label` and `n.properties`,
-`identity="text"` for `3.1` rather than the packed value, `properties=<a pyarrow struct type>` to
-pull named fields out of the map, `properties="skip"` to leave it out.
-
-**An embedding becomes `FixedSizeList<float32>`** straight from the wire bytes, with no Python float
-in between. Ask for the composite rendering and 20,000 vectors of 384 dimensions export **sixty
-times faster**, in half the memory:
-
-```python
-result = conn.execute_query("MATCH (n:Emb) RETURN n.v AS v", binary_=True)
-table = to_arrow(result)          # v: fixed_size_list<item: float>[384]
-```
-
-**A large result is exported a chunk at a time.** `batches()` and `reader()` take a server-side
-cursor and never hold more than one chunk of Python objects — 88 MB of peak memory for those 20,000
-embeddings, against 168 MB for the whole result at once and 605 MB through lists of floats. The first
-chunk settles the schema and every later one is held to it, so the chunks concatenate:
-
-```python
-with conn.transaction(), conn.cursor(name="export") as cursor:
-    cursor.execute('SELECT id, v FROM "graph".emb')
-    pyarrow.dataset.write_dataset(columnar.reader(cursor, size=8192), "out", format="parquet")
-```
-
-**Loading the other way** goes through binary `COPY`, with the property maps written as JSON a chunk
-at a time and no row ever becoming a Python mapping:
-
-```python
-conn.load_vertex_frame("Person", table)               # each column is a property
-conn.load_edge_frame("KNOWS", edges)                  # start and end are packed identities
-```
-
-1.5× an Arrow table handed to `load_vertices()` as mappings, and no more than that, because almost
-all of a load is the server's own ingest. The client's share is what falls, by about eight times.
-
-## Numbers in a property map
-
-jsonb keeps an arbitrary-precision decimal; Python's float does not. Where they part company,
-measured:
-
-| written | read back |
-|---|---|
-| an integer of any size, `1e400` included | **exactly**, as an `int` |
-| `3.141592653589793238462643383279` | `3.141592653589793` |
-| `1e-400` | `0.0` |
-| `-0.0` | `0.0` — the **server** drops the sign, before the driver sees it |
-
-`1e400` is worth calling out: the server stores it as an exact 401-digit integer, not an infinity.
-
-For the cases where the lost digits matter:
-
-```python
-agensgraph.read_numbers_exactly()      # once, at startup
-```
-
-Every non-integer then reads as a `Decimal` keeping whatever the server holds — `1e-400` included.
-What it costs depends on what the map holds, since only a non-integer takes the slower path: a map
-of integers is unchanged, a mixed one costs twice as much, one of non-integers **4.4×**, and an
-embedding of 1536 floats **5.8×**. An integer is exact either way, however long. It applies to a
-property map and to a bare jsonb column alike, so `RETURN n` and `RETURN n.p` agree about the same
-stored value. Writing a `Decimal` back stores a JSON number, so the round trip returns the
-`Decimal` that was written.
-
-## Sending a burst of statements
-
-For a batch whose cost is round trips rather than work:
-
-```python
-conn.pipeline_batch([f"CREATE (:Event {{n: {n}}})" for n in range(1000)])
-```
-
-**A pipeline reports a failure against the wrong statement.** Measured with four statements of which
-only the second was bad: the *first* raised the error, and the other three raised with no SQLSTATE at
-all. So a failure here raises `BatchFailed`, carrying every statement sent, with the server's error
-as its `__cause__`:
-
-```python
-try:
-    conn.pipeline_batch(statements)
-except agensgraph.BatchFailed as failed:
-    for statement in failed.statements:   # run them one at a time to find the culprit
-        ...
-```
-
-Running them serially is left to you rather than done automatically, because replaying a write would
-apply it twice. psycopg's `conn.pipeline()` remains available for the cases where you want to read
-results back.
-
-## Committing in two phases
-
-Works, with graph writes, unchanged from psycopg — including a write that returned rows, which the
-server plans differently:
-
-```python
-conn.tpc_begin("order-4711")
-conn.execute("CREATE (:Order {id: 4711})")
-conn.tpc_prepare()
-...
-conn.tpc_commit()          # or from any other connection, via tpc_recover()
-```
-
-Two things to know. The connection must not be in autocommit. And `max_prepared_transactions` is
-**0 by default**, so on an untouched server `tpc_prepare()` raises `NotSupportedError` carrying the
-server's own message and the name of the setting to change.
-
-A prepared transaction holds its locks until it is committed or rolled back, so one left behind
-blocks a later `DROP GRAPH`. `tpc_recover()` lists what is waiting — but ask it from another
-connection, since one that already has something prepared cannot run the query.
-
-## Reading a large result
-
-```python
-with conn.transaction():
-    for (person,) in conn.stream("MATCH (n:Person) RETURN n", size=500):
-        ...
-```
-
-The rows stay on the server. `DECLARE ... CURSOR FOR MATCH` is a syntax error, so the statement
-is placed where a subquery goes — which takes only the read-only subset. A statement that writes
-is refused by name before anything is sent; a trailing `LIMIT` or `ORDER BY` is fine, one in the
-middle is not, and the server says so. A transaction is required, and that is also what makes
-abandoning the iterator safe: leaving the transaction closes the cursor with it.
-
-## Loading a lot at once
-
-```python
-conn.load_vertices("Doc", [{"key": "a", "title": "..."}, ...])
-by_key = conn.identity_map("Doc", "key")
-conn.load_edges("Cites", [(by_key["a"], by_key["b"], {"weight": 1})])
-```
-
-Copying rather than a statement per row: **thirty-two times** one statement at a time, and 1.6×
-the best a single `UNWIND ... CREATE` can do. No identity is supplied — the
-column's default produces exactly the identities a `CREATE` would. Edges need the two they join,
-which is what `identity_map` reads, in one statement for the whole label.
-
-## What is in the database
-
-There is no `\d` for a graph, so this is the way:
-
-```python
-conn.graphs()                     # every graph, with its schema and label count
-conn.labels()                     # id, name, kind, and what it inherits
-conn.indexes("Person")            # property indexes
-conn.constraints("Person")        # including uniqueness, which the index view hides
-conn.declared_properties()        # properties with a column of their own
-conn.element_counts()             # per label, reading no property at all
-```
-
-`constraints()` reads the constraint catalog rather than `ag_property_indexes`, because that view
-filters exclusion constraints out and a uniqueness assertion is kept as one — so it would
-otherwise report a graph as having none while it has them.
-
-### Saying what should exist, rather than what to do
-
-Creating an index that is already there is an error, not a no-op. Hand over the list instead and
-get back the statements that made it so — empty when nothing had to change:
-
-```python
-from agensgraph import Check, DesiredIndex, IndexElement, Unique
-
-conn.ensure_indexes([
-    DesiredIndex("Person", ("name",)),
-    DesiredIndex("Person", ("email",), unique=True),
-    DesiredIndex("Person", (IndexElement("surname"), IndexElement("age", descending=True))),
-    DesiredIndex("Person", (IndexElement("tags", "jsonb_path_ops"),), method="gin"),
-    DesiredIndex("Person", ("email",), name="person_active", where="active = true"),
-])
-conn.ensure_constraints([
-    Unique("Person", "email"),
-    Check("Person", "age > 0", "person_age_positive"),
-])
-```
-
-`dry_run=True` returns the statements without running them; `drop_extra=True` also removes what was
-not asked for.
-
-An index is matched by its access method and the elements it keys, read off the definition the
-server printed. A constraint is matched by name. Both follow from how the server stores them:
+**Retryability is six categories with a recovery action, not a boolean**, because a boolean gets
+`26000` catastrophically wrong: reconnecting appears to fix it while hiding a broken reset hook that
+keeps firing.
 
 | | |
 |---|---|
-| a name | derived from the columns, then truncated, then a counter on collision — so names are not the key |
-| a definition | printed with defaults omitted (`ASC` never, `NULLS LAST` only with `DESC`, an operator class only when not the default) |
-| a predicate | stored normalised — `age > 0` prints as `(age) > cypher_to_jsonb(0)` |
+| `SAFE` | retry on the same connection. `40001`, `40P01`. **The common case for a graph write.** |
+| `RECONNECT` | new connection, then retry. Class 08, `57P01`, `57P02`, `57P03`, `25P03` |
+| `BACKPRESSURE` | retry, but wait longer. `53300`, `53200`, `55P03`, `55006` |
+| `RESET_STATE` | clear the statement cache, keep the connection. `26000` |
+| `UNKNOWN` | resolve it, do not guess. `08007`, `40003` |
+| `FATAL` | never retry. `57014`, classes 42, 22, 23 |
 
-Three consequences worth knowing. **Name an operator class only when it differs from the default**,
-since the server omits a default when printing and the two would never compare equal — asking for
-one anyway raises after the first run rather than rebuilding the index for ever. **A partial index
-needs a `name` and is matched by it**, so a change to its predicate is not noticed; change the name
-to force a rebuild. And an index over a nested path, an expression, or with `INCLUDE` columns is not
-describable here — it is never matched and never dropped, so write those as DDL.
+Concurrent graph writes surface as `40001` by design, so a conflict is the *expected* path rather
+than an exotic one, and it is safe to retry.
 
-A `Check` needs a name of its own because the server names an unnamed one `<label>_properties_check`
-and then adds a counter.
+Backoff is full jitter, capped before the jitter is drawn rather than after, which is a distinction
+worth keeping: capping afterwards makes the cap reachable only by chance and the distribution not the
+one the name describes. A backpressure retry doubles the ceiling before capping, so it waits longer
+without breaking the cap.
 
-## Embedding vectors
+**A counter is not a budget.** Four layers each willing to try three times is sixty four attempts
+from one user action, so the allowance is a token bucket shared across the process: a transient
+failure costs more than a rejection does, because a connection failure is usually the whole service
+rather than this one request. When it is exhausted, the message says so, which saves a great deal of
+support time.
 
-Vectors need pgvector, and unlike every other type here their oid comes from the extension rather
-than the server — so it differs between databases and has to be looked up:
+The connection's fate is decided in one place on every exit path, including cancellation, rather than
+delegated to a callback that some paths skip.
 
-```python
-if conn.has_vectors():
-    conn.register_vectors()      # returns ('vector', 'halfvec')
-```
+## Losing a connection mid-commit
 
-**Registering matters more than it sounds.** A vector left in the property map is JSON, so it
-arrives as a list of numbers. Give the property a column of its own and it arrives as that
-column's type — and with no loader for it, as the *string* `'[1,2,3,4]'`. So a driver that reads
-vectors correctly without promotion reads them wrongly with it. Both are asserted in the suite.
-
-**Two ways to hold a searchable vector**, and both are indexed as a *property* index. Leave it in
-the property map and cast it, or give it a column of its own:
+The one failure that cannot be retried blindly is a commit whose acknowledgement never arrived: the
+write may have landed or may not, and doing it again could apply it twice.
 
 ```python
-from agensgraph.vector import Distance, generated_column, nearest, vector_index
+with conn.transaction():
+    xid = conn.transaction_id(assign=True)     # keep this
+    conn.execute_query("CREATE (:Order {id: 1})")
 
-# in the property map -- the cast carries the dimension, in the index and in the search alike
-conn.execute(vector_index("Doc", "v", dimensions=1024))
-result = conn.execute_query(nearest("Doc", "v", dimensions=1024, limit=10), (query_text,))
-
-# or with a column of its own, which needs no cast and refuses a wrong-length value on write
-conn.execute(f"CREATE VLABEL Emb ({generated_column('v', 1024)})")
-conn.execute(vector_index("Emb", "v", operator_class=Distance.L2.operator_class))
-result = conn.execute_query(nearest("Emb", "v", operator=Distance.L2, limit=10), (query_text,))
+# if the connection is lost while committing, ask a different connection what became of it
+outcome = other_conn.resolve_commit(xid)
 ```
 
-**It has to be a property index.** `CREATE PROPERTY INDEX` compiles its expression through the
-Cypher parser, so the index holds the same expression a Cypher query builds. An index written as
-plain SQL over `(properties ->> 'v')::vector(1024)` holds the *SQL* expression instead and is
-**never matched** — measured with sequential scans switched off, where the planner chose a
-penalised sequential scan rather than the index it could not use.
+`CommitOutcome.COMMITTED` means it landed, so do not retry. `ABORTED` means it did not, so retry as
+you would a conflict. `IN_PROGRESS` means back off and ask again. `UNKNOWN` means the server can no
+longer tell, which is not the same as aborted and has to be surfaced rather than guessed either way.
 
-Two more things cost the index silently, both measured, and the second is why `vector_index` and
-`nearest` share one spelling of the cast:
+Stashing the id is nearly free, since any `CREATE` assigns one anyway.
 
-| | plan |
+## Cancellation
+
+The connection is discarded. Always.
+
+That is the majority position among drivers, and the alternatives have a bad record: the two cleverer
+attempts in one widely used client produced a CVE each, one of which could send one request's
+response to a different request. The rule here is to decide the connection's fate synchronously
+first, with no awaits, and only then bound and isolate any cleanup.
+
+`57014` has four separate causes (a client cancel, `statement_timeout`, a recovery conflict, and a
+tie broken toward lock timeout) and its message is localised, so the driver tracks "I cancelled this"
+in its own state and never parses message text. A successful cancel dispatch is not proof either: the
+request matches on process id and key and returns silently on a mismatch, and process ids are reused.
+The only evidence a cancel landed is `57014` on the original connection.
+
+## When the network goes quiet
+
+Keepalive is asked for by default: without it, a connection whose network stops carrying packets
+waits for the kernel, which is two hours and a quarter on Linux.
+
+Each setting is filled in on its own, so naming one does not silently leave the others at the
+system's values. `keepalives=0` turns them all off.
+
+`tcp_user_timeout` is **not** among them, and that is worth saying, because it is the setting usually
+recommended for this. It bounds how long *transmitted* data may go unacknowledged, and a connection
+waiting for a reply has transmitted nothing. Measured against a server whose traffic was dropped:
+
+| | outcome |
 |---|---|
-| the search casts to `vector(1024)`, as the index does | **Index Scan** |
-| the search casts to a bare `vector`, or to `vector(3)` | Sort over Seq Scan |
-| the operator class does not serve the operator asked | Sort over Seq Scan |
+| nothing set | still waiting when the test gave up |
+| **`tcp_user_timeout` alone** | **still waiting when the test gave up** |
+| keepalive, with or without `tcp_user_timeout` | failed within seconds |
 
-`Distance.operator_class` gives the right class for an operator. `hnsw` and `ivfflat` both work;
-pass `options={"lists": 100}` for the `WITH` clause an ivfflat index wants.
+So it is useful *alongside* keepalive and useless instead of it. It is left unset because it also
+applies while sending, where too small a value would end a healthy connection.
 
-### Tuning a search
-
-```python
-conn.vector_search_options({"hnsw.ef_search": 100})     # the transaction, not the session
-```
-
-Seven settings exist, and `agensgraph.vector.SEARCH_OPTIONS` lists them with the type each takes:
-`hnsw.ef_search` (40), `hnsw.iterative_scan` (off), `hnsw.max_scan_tuples` (20000),
-`hnsw.scan_mem_multiplier` (1), `ivfflat.probes` (1), `ivfflat.iterative_scan` (off),
-`ivfflat.max_probes` (32768). A name that is not one of them is refused before it is sent — the
-server accepts an unknown `hnsw.` name without complaint, so a typo would otherwise look applied.
-
-### Binary quantisation
-
-`binary_quantize()` runs in Cypher and returns a bit string. **The cast it needs does not.** Cypher's
-cast grammar takes `::vector(n)` and `::halfvec(n)`, but `::bit(n)` is a syntax error and there is no
-`cast(… as …)` form — so hamming (`<~>`) and jaccard (`<%>`) search needs plain SQL against the
-label's own table. Both halves are asserted in the suite.
-
-### Sparse vectors
-
-`sparsevec` gets a value of its own rather than a list, and the reason is size: three non-zero
-entries in a million dimensions is **36 bytes on the wire against roughly 8 MiB** as a list of
-Python floats. Reading it densely would expand it 230,000-fold and discard the entire reason the
-type exists.
-
-```python
-from agensgraph.vector import SparseVector
-
-v = SparseVector({0: 1.0, 3: 2.0}, 6)   # indices, then how many dimensions
-len(v)            # 2   -- what is stored
-v.dimensions      # 6   -- how long it is
-v.to_dict()       # {0: 1.0, 3: 2.0}
-v.to_dense()      # [1.0, 0.0, 0.0, 2.0, 0.0, 0.0]  -- asked for, never done by default
-SparseVector.from_dense([1, 0, 0, 2, 0, 0]) == v
-```
-
-**Indices count from zero here.** The server's text form counts from one — `{1:9}/3` is the first
-of three entries — while its binary form counts from zero. Two renderings disagreeing about the
-base give an off-by-one rather than an error, so the conversion happens once, at the text boundary,
-and everything in Python is zero-based like the language it's in. `to_dense()[i]` and `indices`
-agree.
-
-Whatever the server would refuse is refused on construction, where you can still do something about
-it: a repeated index, an index outside the dimension, a dimension below one, `NaN`, infinity. An
-explicit zero is dropped, because the server drops it.
-
-A Cypher *list* cannot be written into a sparse column — the server refuses it, where a dense
-column accepts one — so passing the value is the way in, and it works in both a Cypher property
-position and a SQL cast:
-
-```python
-conn.execute("CREATE (:Emb {v: %s})", (v,))
-conn.execute('SELECT id, v <-> %s::sparsevec AS d FROM social."Emb" ORDER BY d LIMIT 5', (v,))
-```
-
-### Dense vectors
-
-A dense vector arrives as a `Vector`, which keeps the bytes the server sent and turns them into
-numbers only if you look. That is the same bargain the driver makes with a property map, and it pays
-here for the same reason: a vector search asks the *server* for the distance, so the components of
-the vectors it ranked are often never read.
-
-```python
-(v,) = conn.execute("SELECT v FROM docs LIMIT 1", binary=True).fetchone()
-
-len(v)              # free -- the dimension is in the first two bytes
-v == [1.0, 2.0]     # True when the numbers match
-v[0], v[-1], v[0:2], list(v), sum(v), 2.0 in v, v.index(2.0)
-v.values            # an array('f') that numpy and torch take without copying
-v.tolist()          # an ordinary list, if you want one
-```
-
-It is not a `list` — `isinstance(v, list)` is `False` and `json.dumps(v)` raises — but it compares
-equal to one, which is the part that would otherwise go wrong quietly.
-
-**Ask for `binary_=True` when you read vectors** — this is the one place the rendering makes a
-large difference rather than a small one. A vector of 1536 dimensions prints as roughly fifteen
-kilobytes of decimal against six of wire bytes, so the text form costs about three times as much
-before anything is parsed and seven times once the numbers are read.
-
-The numbers are read by the same C decoder the property map is read by, since the list a vector
-prints as is also JSON — several times quicker than a call per number. A text that decoder will not
-take, such as a leading `+`, falls back to reading it a number at a time, so both spellings are
-read.
-
-**Send a `Vector`, not a list and not a string you built.** Sending is where the largest saving
-is, because every other route formats each number as decimal for the server to parse back: a list
-cast to `vector(1536)` costs about eight times as much, and a hand-built string about two and a
-half. In bulk the gap is wider still — `COPY` in binary with `Vector` loads an order of magnitude
-faster than `COPY` in text, and more than that against a statement at a time.
-
-```python
-from agensgraph.vector import Vector
-
-conn.execute("INSERT INTO docs VALUES (%b)", (Vector(embedding),))
-
-with conn.cursor().copy("COPY docs (v) FROM STDIN (FORMAT BINARY)") as copy:
-    copy.set_types(["vector"])
-    for embedding in embeddings:
-        copy.write_row([Vector(embedding)])
-```
-
-The same type goes both ways, so a vector read from one place can be sent to another without being
-unpacked at all.
-
-The wire carries 6,148 bytes instead of 17,595, and the value survives exactly.
-
-### Distances by name
-
-All six of pgvector's distance operators, named — two of them differ by one character and mean
-entirely different things:
-
-```python
-from agensgraph.vector import Distance
-
-Distance.L2             # <->   Distance.L1        # <+>
-Distance.COSINE         # <=>   Distance.HAMMING   # <~>  (bit strings)
-Distance.INNER_PRODUCT  # <#>   Distance.JACCARD   # <%>  (bit strings)
-
-Distance.COSINE.operator_class   # 'vector_cosine_ops', for the index
-Distance.HAMMING.is_for_bits     # True
-```
-
-`conn.vector_version()` reports pgvector's version as numbers rather than a bare yes/no, because
-pgvector gates its own features on it — sparse vectors and half precision arrived in 0.7.0,
-iterative index scans in 0.8.0.
-
-Both renderings are asserted to produce identical values on floats drawn from the whole of single
-precision — not just on small whole numbers, which survive every conversion and so prove nothing.
-
-## Being told when the graph changes
-
-A trigger on a label table can announce a change, which makes this the change feed for a graph:
-
-```python
-conn.listen("graph_changed")
-conn.add_notify_handler(lambda notice: print(notice.channel, notice.payload))
-...
-conn.notify("graph_changed", "doc")     # from anywhere
-conn.listening()                        # ['graph_changed']
-conn.unlisten()                         # all of them
-```
-
-The channel is quoted into the statement, because neither `LISTEN` nor `UNLISTEN` takes a parameter
-for it and `LISTEN` cannot be prepared at all. `notify()` goes through `pg_notify`, which is a
-function and does take one, so a channel held in a variable is bound rather than quoted.
-
-There is also `conn.notifications(timeout=…, stop_after=…)` to read them as they arrive. **Prefer the
-handler.** The iterator holds the connection's lock while it is being read, so a caller who stops
-part way leaves the connection unusable until it is collected. Using both at once raises rather than
-delivering each announcement to whichever route happens to be looking.
-
-## Watching it work
+## Observability
 
 ```python
 def log(record):
@@ -779,150 +919,314 @@ agensgraph.add_query_logger(log)
 agensgraph.enable_tracing()      # needs agensgraph-python[otel]
 ```
 
-Every statement is reported, not only the ones `execute_query` sent: `conn.execute`, a cursor a
-caller took for themselves, and the driver's own catalog reads all arrive at the same place. A
-caller asking what the driver sends wants the round trips they did not write. `elapsed` is the
-round trip — sending the statement until the server has answered — and not the reading of the rows
-afterwards.
+**Every statement is reported**, not only the ones `execute_query` sent: `conn.execute`, a cursor you
+took yourself, and the driver's own catalog reads all arrive at the same place, because a caller
+asking what the driver sends wants the round trips they did not write. `elapsed` is the round trip,
+sending the statement until the server has answered, and not the reading of the rows afterwards.
 
-Off costs a boolean test — a statement takes the same time with a logger attached as with none,
-and the reporting adds about a quarter of a per cent to a statement's round trip. A clock is not
-read, and a timer is not even allocated, unless something is going to ask for the number.
-Spans are per statement and never per row, the tracing API is imported only when asked for and the
-SDK never, the record carries an opaque connection number rather than the connection's settings,
-and no parameter value ever reaches a span.
+Off costs a boolean test. A statement takes the same time with a logger attached as with none, and
+the reporting adds about a quarter of a per cent to a statement's round trip. A clock is not read,
+and a timer is not even allocated, unless something is going to ask for the number. Spans are per
+statement and never per row, the tracing API is imported only when asked for and the SDK never, the
+record carries an opaque connection number rather than the connection's settings (which hold the
+password), and no parameter value ever reaches a span.
+
+**Notices are structured**, drained per-statement so they do not leak into the next result:
+
+```python
+agensgraph.observability.add_notice_listener(lambda n: print(n.severity, n.message))
+```
+
+## Errors
+
+They are psycopg's exception classes, raised by psycopg, so `except psycopg.errors.UniqueViolation`
+keeps working and no wrapping layer stands between you and them. The engine mints no SQLSTATE of its
+own, which was checked against its source rather than assumed, so there is nothing to register and
+nothing that reaches into psycopg's global tables for unrelated connections.
+
+Three of the server's refusals cannot be told apart by SQLSTATE, and are translated into named
+classes so you do not have to match on message text:
+
+| | |
+|---|---|
+| `ConfigurationError` | `enable_graph_dml` or `enable_eager` is off. Both arrive as `XX000` |
+| `ReadOnlyGraphWrite` | a graph write in a read-only transaction, which the server reports as `cannot execute ??? ...` |
+| `CapabilityError` | a feature this server does not have, naming the version that does |
+
+Plus the driver's own: `BatchFailed`, `StaleLabelCache`, `ReleasedConnection`, `StaleGeneration`,
+`UnresolvedCommit`, `NoEnclosingTransaction`, `Expired`.
 
 ### What a failure prints as
 
-PostgreSQL puts row data in a failure's DETAIL: a uniqueness failure reads `Key
-(email)=(alice@example.com) already exists`, so a plain `logger.exception` writes into the log a
-value the driver never saw as a parameter. DETAIL and CONTEXT are therefore not part of the message
-by default. What the message loses, `exc.diag.message_detail` and `exc.diag.context` still hold —
-the data stays for a post-mortem and only the rendering is cut, and the exception is still the class
-psycopg raised, so every `except` clause keeps matching.
+PostgreSQL puts row data in a failure's DETAIL. A uniqueness failure reads
+`Key (email)=(alice@example.com) already exists`, so a plain `logger.exception()` writes into the log
+a value the driver never saw as a parameter. **DETAIL and CONTEXT are therefore not part of the
+message by default.** What the message loses, `exc.diag.message_detail` and `exc.diag.context` still
+hold, so the data stays for a post-mortem and only the rendering is cut.
 
 ```python
-agensgraph.show_error_details(True)     # process-wide, so it cannot be forgotten at a call site
+agensgraph.show_error_details(True)   # process-wide, so it cannot be forgotten at a call site
 ```
 
-It cuts DETAIL and CONTEXT and nothing else. A primary message can still echo what was sent —
-`invalid input syntax for type sparsevec: "[1, 0, 0, 2, 0, 0]"` — because that is the server
-quoting the value it was given rather than a value belonging to another row.
+It cuts DETAIL and CONTEXT and nothing else. A primary message can still echo the value it was
+handed, because that is the server quoting its own input rather than a value belonging to another
+row.
 
-## Using it from a generic tool
+`agensgraph.errors.mask_dsn()` is there for a caller who holds a connection string and wants to write
+it somewhere. Nothing in this driver calls it, and that was checked rather than assumed: no message,
+log record or `__repr__` it produces carries one.
+
+## LISTEN and NOTIFY
+
+```python
+conn.listen("changes")
+conn.notify("changes", "payload")
+conn.listening()                       # what this connection is subscribed to
+
+for note in conn.notifications(timeout=5.0):
+    print(note.channel, note.payload)
+```
+
+Channel names are quoted, and announcing goes through `pg_notify` with the name as a parameter, so a
+name that needs quoting behaves the same in both directions.
+
+**Prefer one style or the other**, not both. psycopg changed the semantics of mixing a handler with
+the iterator twice and then made it a warning; pick the handler as primary and treat the iterator as
+the alternative.
+
+## Two-phase commit
+
+psycopg's own methods work unchanged, including for a write that returned rows:
+
+```python
+conn.tpc_begin(conn.xid(0, "gid", "branch"))
+conn.execute_query("CREATE (:Thing)")
+conn.tpc_prepare()
+conn.tpc_commit()
+```
+
+Two things to know. The connection must not be in autocommit. And `max_prepared_transactions` is
+**0 by default**, so on an untouched server `tpc_prepare()` raises `NotSupportedError` naming the
+setting, which is the server telling you what to change.
+
+## Generic tools and SQLAlchemy
 
 The PEP 249 names are on `agensgraph.dbapi`, so anything that drives databases generically drives
-this. A whole SQLAlchemy dialect is **ten lines**:
+this: `connect`, `apilevel`, `threadsafety`, `paramstyle`, the type constructors, and the exception
+hierarchy re exported so `DBAPIError.instance()` keys off the right classes.
+
+`connection.closed` and `connection.broken` are exposed, which is what lets a dialect decide whether
+a connection is dead without matching on error strings.
+
+A whole SQLAlchemy dialect is **ten lines**:
 
 ```python
 from sqlalchemy.dialects.postgresql.psycopg import PGDialect_psycopg
-import agensgraph
 
 class AgensGraphDialect(PGDialect_psycopg):
     driver = "agensgraph"
-    supports_statement_cache = True
 
     @classmethod
     def import_dbapi(cls):
+        import agensgraph.dbapi
         return agensgraph.dbapi
 ```
 
-A vertex still arrives as a `Vertex` through it, and the server version is read off the banner
-(`PostgreSQL 18beta1 (AgensGraph 2.18-devel)`) by the PostgreSQL dialect's own regular expression.
+Version detection is free, because `PostgreSQL 18beta1 (AgensGraph 2.18-devel)` already matches the
+PostgreSQL dialect's own regex. One thing to know if you write Cypher through SQLAlchemy:
+`(:Label)` collides with SQLAlchemy's `:param` syntax, so use `text()` with bound parameters or
+escape the colon.
 
-Two things about `agensgraph.dbapi` are deliberate and worth knowing:
+## Server versions
 
-- **`adapters` is this driver's template, not psycopg's global map.** A tool that derives its own map
-  from it and hands the result back as a connection's context — which SQLAlchemy's psycopg dialect
-  does — would otherwise pass over a map with no graph types in it, and every vertex would arrive as
-  the text it prints as.
-- **`__version__` is psycopg's.** A tool reading it off a database module is asking which of that
-  module's features it may use, and every feature reachable through this one is psycopg's. The
-  driver's own version is `agensgraph.__version__`.
-
-**One collision to write down.** Cypher's `(:Label)` is also SQLAlchemy's named-parameter syntax, so
-`text("MATCH (n:Person) RETURN n")` asks for a value for a parameter called `Person`. Escape the
-colon and Cypher receives the label:
+The driver reads AgensGraph 2.16 and later. It learns which it is talking to from the `agversion`
+parameter the server sends at startup, so the check costs no round trip.
 
 ```python
-conn.execute(text(r"MATCH (n\:Person) RETURN n"))
+caps = conn.capabilities
+caps.version                      # (2, 18)
+caps.reported                     # '2.18-devel'
+caps.has_property_promotion()     # a property stored in a column of its own
+caps.has_gql_clauses()            # LET, NEXT, FINISH, FILTER, FOR, CALL
+caps.has_element_ordering()       # ORDER BY on a vertex or an edge
+caps.has_endpoint_elision()       # visible in a plan
 ```
 
-## When the network goes quiet
+Each takes `check=True` to raise `CapabilityError` naming the required version instead of returning
+`False`.
 
-A connection whose packets stop being delivered waits for the kernel, and on Linux that is **two hours
-and a quarter**. This is the failure that gets reported as "the driver hung". So keepalive is asked for
-unless you decide otherwise:
+**A capability read from the version describes a release, not the build in front of you.** Two
+servers reporting `2.18-devel` were found to differ, one carrying the catalog a promoted property is
+recorded in and one not. Where the answer has to be right rather than free, ask the server:
 
 ```python
-{"keepalives": 1, "keepalives_idle": 30, "keepalives_interval": 10, "keepalives_count": 3}
+conn.can_promote_properties()     # asks the catalog, once per connection, and keeps the answer
 ```
 
-which ends the wait in about a minute. Each is filled in on its own, so naming one does not leave the
-others at the system's values — an interval against the system's idle time of 7200 s would never be
-reached. `keepalives=0` turns all of it off.
+The wire and type layer is identical across every supported release, so binary graph ids, the
+composite decode, write counters, introspection and the commit resolution path need no version gating
+at all. What is 2.18 only is property promotion, the GQL clause set, and ordering by a graph element.
 
-Setting `tcp_user_timeout` does **not** count as having decided, because it does not bound a hung read;
-keepalive is still filled in alongside it.
+## Performance
 
-**`tcp_user_timeout` alone does not do this**, which is worth knowing because it is the setting usually
-recommended for it. It bounds how long *transmitted* data may go unacknowledged, and a connection
-waiting for a reply has transmitted nothing. Measured against a server whose traffic was dropped:
+The design decisions worth knowing, since they shape what is fast:
 
-| | outcome |
+- **A property map is decoded on first touch**, not on arrival. A read that never looks inside a
+  vertex never pays for its map.
+- **Rows are structs the collector does not track.** A large result is close to invisible to it.
+  `agensgraph.paused_collection()` pauses collection around a bulk read anyway, and
+  `agensgraph.freeze_after_import()` moves everything alive at startup out of the collector's way.
+- **Parsing is not the round trip.** Everything above makes turning bytes into Python objects
+  cheaper, and against a database on another machine that is a small share of what a query costs:
+  the round trip dominates, and after it, whether the query uses an index. Measured over a couple of
+  thousand vertices on a local server, skipping the property decode entirely is worth about 1.3
+  times the parse and close to nothing end to end. Expect these to show on large results and on
+  embedding-sized maps, where the parse is the bottleneck, and to be invisible on a query returning
+  twenty rows.
+- **`COPY` for bulk, `stream` for large reads, `Vector` for embeddings.** Each is an order of
+  magnitude over the obvious alternative.
+
+## API reference
+
+Everything exported from `agensgraph`. The submodules `agensgraph.columnar`, `agensgraph.vector`,
+`agensgraph.errors` and `agensgraph.dbapi` carry the rest.
+
+**Connecting**
+
+| | |
 |---|---|
-| nothing set | still waiting when the test gave up |
-| **`tcp_user_timeout=3000` alone** | **still waiting when the test gave up** |
-| `keepalives_idle=1` + `tcp_user_timeout=3000` | failed within seconds |
-| `keepalives_idle=1` alone | failed within seconds |
+| `connect(conninfo, **kwargs)` | open a blocking connection |
+| `Connection` / `AsyncConnection` | the connection classes, both psycopg subclasses |
+| `Capabilities` | what one server can do, built from the version at no round trip |
+| `MINIMUM_VERSION` | `(2, 16)`, the oldest server this driver reads |
 
-So `tcp_user_timeout` is useful *alongside* keepalive — it shortens how long the probing may fail — and
-useless instead of it. It is left unset by default because it also applies while sending, where too
-small a value would end a healthy connection.
+**Pools**
 
-All four rows are asserted in the suite, by dropping packets rather than rejecting them: a rejection
-gives a prompt reset, and a suite that tested only that would cover none of this.
+| | |
+|---|---|
+| `ConnectionPool` / `AsyncConnectionPool` | keeps connections, with generations, drain and deadlines |
+| `NullConnectionPool` / `AsyncNullConnectionPool` | keeps none, for one request per process |
 
-## Failures
+**Values read from the wire**
 
-What kind of error something is comes from psycopg, so a graph failure is caught by the
-same PEP-249 class as any other. What to *do* about it is a separate question the class
-cannot answer, and `agensgraph.errors` answers it:
+| | |
+|---|---|
+| `Vertex`, `Edge`, `Path` | what a graph query returns |
+| `GraphId` | an identity, `labid` and `locid`; `LABID_MAX`, `LOCID_MAX` are their bounds |
+| `Vector`, `SparseVector` | embeddings, lazy and sparse |
+| `Jsonb` | psycopg's wrapper, re-exported for a value you want sent as jsonb explicitly |
 
-```python
-from agensgraph.errors import Retryability, retryability
+**Values you pass in**
 
-recovery = retryability(exc, wrote=True)
-recovery.is_retryable
-recovery.needs_new_connection
-```
+| | |
+|---|---|
+| `Label` | a label or property name to be placed into a statement as an identifier |
+| `Unspecified` | a string sent with no type, which is psycopg's own default behaviour |
+| `Distance` | `L2`, `INNER_PRODUCT`, `COSINE`, `L1`, `HAMMING`, `JACCARD` |
+| `DesiredIndex`, `Unique`, `Check` | what you want to exist, for the reconcilers |
 
-A graph write conflict is reported as `40001`, the same code an ordinary row conflict
-uses, and it is the ordinary outcome of two writers touching one element rather than an
-exotic one. Six recoveries are distinguished, because a boolean cannot tell a lost
-connection from a stale statement cache, and anything unrecognised is treated as fatal.
+**What a statement gives back**
+
+| | |
+|---|---|
+| `Result` | `records`, `keys`, `counts`, `oids` |
+| `GraphWriteCounts` | the five counters, each `None` when it cannot be attributed |
+| `CommitOutcome` | `COMMITTED`, `ABORTED`, `IN_PROGRESS`, `UNKNOWN` |
+
+**What the catalogs give back**
+
+| | |
+|---|---|
+| `Graph` | `name`, `schema`, `labels` |
+| `LabelInfo` | `id`, `name`, `kind`, `parent` |
+| `DeclaredProperty` | `label`, `name`, `type`, `nullable` |
+| `Index`, `Constraint` | `label`, `name`, `unique`, `definition` |
+| `IndexElement` | one property an index is keyed on, with its operator class and order |
+
+**Reliability**
+
+| | |
+|---|---|
+| `Deadline`, `Expired` | one budget across the wait and the statement; `Expired` is a `TimeoutError` |
+| `RetryPolicy` | decides whether and when to try again; you keep the loop |
+| `Retryability`, `retryability(exc)`, `is_retryable(exc)` | the six categories, and how to ask |
+| `TokenBucket` | the process-wide allowance a counter cannot multiply |
+
+**Numbers**
+
+| | |
+|---|---|
+| `read_numbers_exactly(bool)` | read a non-integer as a `Decimal` |
+| `reading_numbers_exactly()` | whether that is currently on |
+
+**Observability**
+
+| | |
+|---|---|
+| `add_query_logger(fn)`, `remove_query_logger(fn)` | every statement, with `QueryRecord` |
+| `enable_tracing(tracer=None)`, `disable_tracing()` | a span per statement |
+| `Notice` | something the server said during a statement |
+| `Notify` | an asynchronous notification, from `notifications()` |
+
+**Errors**
+
+| | |
+|---|---|
+| `BatchFailed` | a pipeline failed as a batch, carrying what was sent |
+| `show_error_details(bool)`, `showing_error_details()` | whether DETAIL and CONTEXT reach the message |
+| `redact_details(exc)` | cut them from one exception |
+| `errors` | the whole hierarchy, plus `translate`, `mask_dsn`, `attach_query` |
+
+**Bulk and memory**
+
+| | |
+|---|---|
+| `paused_collection()` | pause the collector around a bulk read |
+| `freeze_after_import()` | move what is already alive out of its way |
+
+**Submodules**
+
+| | |
+|---|---|
+| `columnar` | `to_arrow`, `to_pandas`, `to_polars`, `batches`, `reader`, `columns`, `Layout` |
+| `vector` | `Vector`, `SparseVector`, `vector_index`, `nearest`, `generated_column`, `Distance`, `SEARCH_OPTIONS` |
+| `dbapi` | the PEP 249 surface |
+| `errors` | the exception hierarchy and the classification function |
 
 ## Development
 
-```sh
-uv sync --group dev
-uv run python -X dev -W error -m pytest      # -X dev is how an unclosed socket is found
-uv run mypy
-uv run ruff check src tests tools
-uv run python tools/async_to_sync.py --check  # the blocking interface is generated
+```console
+uv sync --group dev --all-extras
+uv run python -X dev -W error -m pytest -q          # offline; the live tests skip themselves
+AGENSGRAPH_TEST_DSN="host=localhost dbname=test" uv run python -m pytest -q
 ```
 
-Most of the suite runs against no server. Tests that need a live AgensGraph carry the `server`
-marker and read their connection string from `AGENSGRAPH_TEST_DSN`; without it they are skipped,
-so CI asserts that they were collected rather than trusting a green run.
+The blocking interface is generated from the awaiting one:
 
-The blocking interface is **generated** from the awaiting one by `tools/async_to_sync.py`. Edit
-`connection_async.py` and `pool_async.py`, never `connection.py` or `pool.py`, and run the tool.
-Three separate checks enforce it: that a generated file matches its source, that no awaiting
-module was added without being listed for conversion, and that nothing awaiting survives in a
-generated file.
+```console
+uv run python tools/async_to_sync.py           # regenerate
+uv run python tools/async_to_sync.py --check   # fail if it is out of date
+```
+
+Continuous integration runs the offline suite on Python 3.11 through 3.14, the full suite against
+AgensGraph v2.17, v2.18 and main (each with pgvector built against it), the linter and formatter,
+`mypy --strict`, a resolution at the lowest declared versions, a fuzzer over the text reader, and an
+install of the built wheel and source distribution into clean environments.
+
+Many tests pin engine behaviour the driver works around, deliberately: if a later release fixes one,
+that test fails and names the workaround to drop.
 
 ## Relationship to 1.x
 
-`2.0` is a rewrite and shares no API with the `1.x` releases, which were a type-extension
-module for psycopg2. `1.x` remains available on the `v1.0.2` tag.
+2.0 is a rewrite with no backwards compatibility. 1.x was a psycopg2 type-extension shim of about
+nine hundred lines, and it was incorrect on output the engine legitimately produces: an empty path
+raised, `NULL` elements had no representation, a label containing `{` collapsed a whole path into one
+token, an unanchored graph id match turned `7.9.5` into `(7,9)`, every returned value was unhashable,
+and `len(path)` made a valid single-vertex path falsy.
+
+The distribution name and the import name are unchanged. 1.x remains on a maintenance branch for
+security only, and the psycopg2 line does not migrate.
+
+## License
+
+Apache 2.0.
