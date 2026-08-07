@@ -11,7 +11,7 @@ from __future__ import annotations
 import pytest
 
 import agensgraph
-from agensgraph.cypher import changes_graph_path
+from agensgraph.cypher import changes_graph_path, quote_identifier
 from agensgraph.errors import StaleLabelCache
 
 MOVES = [
@@ -30,8 +30,8 @@ MOVES = [
 STAYS = [
     "select 1",
     "match (n:person) return n",
-    "set role agens",
-    "set session authorization agens",
+    "set role myrole",
+    "set session authorization myrole",
     "discard plans",
     "discard sequences",
     "set statement_timeout = 0",
@@ -61,10 +61,12 @@ class TestTheTableFollowsTheSession:
 
     @pytest.mark.parametrize("statement", STAYS)
     def test_the_table_is_kept(self, agens, statement: str) -> None:  # type: ignore[no-untyped-def]
+        """``myrole`` stands for whoever is connected, since the two role statements name one and
+        no server has a role this suite can assume."""
         agens.execute("create vlabel person")
         agens.refresh_labels()
         held = agens.label_table.graph
-        agens.execute(statement)
+        agens.execute(statement.replace("myrole", quote_identifier(agens.info.user)))
         assert agens.label_table.graph == held
 
     def test_a_failed_statement_changes_nothing(self, agens) -> None:  # type: ignore[no-untyped-def]
