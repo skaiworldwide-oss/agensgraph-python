@@ -34,14 +34,40 @@ pytestmark = pytest.mark.server
 EMBEDDING = [1.0, 2.0, 3.0, 4.0]
 
 
+def needs_vectors(conn) -> None:  # type: ignore[no-untyped-def]
+    if not conn.has_vectors():
+        pytest.skip("the vector extension is not created in this database")
+
+
+def needs_promotion(conn) -> None:  # type: ignore[no-untyped-def]
+    """Skip where a property cannot be given a column of its own.
+
+    Asked of the server rather than of its version, because the version does not answer it: the
+    2.18 release branch and main both report ``2.18-devel`` and only one of them can.
+    """
+    if not conn.can_promote_properties():
+        pytest.skip("this server cannot store a property in a column of its own")
+
+
 @pytest.fixture
 def vectors(agens):  # type: ignore[no-untyped-def]
-    """A graph with both routes set up, or a skip if the extension is not here."""
-    if not agens.has_vectors():
-        pytest.skip("the vector extension is not created in this database")
+    """A graph with both routes set up: a promoted column and a property left in the map."""
+    needs_vectors(agens)
+    needs_promotion(agens)
     found = agens.register_vectors()
     assert "vector" in found
     agens.execute(f"create vlabel emb ({generated_column('v', 4)})")
+    agens.execute("create vlabel loose")
+    agens.refresh_labels()
+    return agens
+
+
+@pytest.fixture
+def loose_vectors(agens):  # type: ignore[no-untyped-def]
+    """The route that needs no promotion: a vector left in the property map and cast."""
+    needs_vectors(agens)
+    found = agens.register_vectors()
+    assert "vector" in found
     agens.execute("create vlabel loose")
     agens.refresh_labels()
     return agens
@@ -193,8 +219,8 @@ class TestPromotionChangesWhatAPropertyReadsAs:
 
     def test_without_registering_it_would_be_a_string(self, agens) -> None:  # type: ignore[no-untyped-def]
         """The failure this guards against: correct without promotion, wrong with it."""
-        if not agens.has_vectors():
-            pytest.skip("the vector extension is not created in this database")
+        needs_vectors(agens)
+        needs_promotion(agens)
         agens.execute(f"create vlabel emb ({generated_column('v', 4)})")
         agens.execute("create (:emb {v: [1,2,3,4]})")
         (value,) = agens.execute_query("match (n:emb) return n.v").records[0]
@@ -375,8 +401,8 @@ class TestIndexing:
 
 class TestRegistering:
     def test_it_reports_what_it_found(self, agens) -> None:  # type: ignore[no-untyped-def]
-        if not agens.has_vectors():
-            pytest.skip("the vector extension is not created in this database")
+        needs_vectors(agens)
+        needs_promotion(agens)
         found = agens.register_vectors()
         assert "vector" in found
         assert set(found) <= set(TYPES)
@@ -392,7 +418,7 @@ class TestTheAwaitingInterface:
         graph = "vector_async"
         conn = await agensgraph.AsyncConnection.connect(dsn, autocommit=True)
         async with conn:
-            if not await conn.has_vectors():
+            if not await conn.can_promote_properties() or not await conn.has_vectors():
                 pytest.skip("the vector extension is not created in this database")
             await conn.execute(f'drop graph if exists "{graph}" cascade')
             await conn.execute(f'create graph "{graph}"')
@@ -524,8 +550,8 @@ class TestTheTwoIndexBases:
 class TestSparseVectorsAgainstAServer:
     @pytest.fixture
     def sparse(self, agens):  # type: ignore[no-untyped-def]
-        if not agens.has_vectors():
-            pytest.skip("the vector extension is not created in this database")
+        needs_vectors(agens)
+        needs_promotion(agens)
         found = agens.register_vectors()
         if "sparsevec" not in found:
             pytest.skip("this pgvector has no sparsevec")
@@ -792,16 +818,16 @@ class TestSendingAVector:
 class TestTheExtensionsVersion:
     def test_it_is_reported_as_numbers(self, agens) -> None:  # type: ignore[no-untyped-def]
         """A version rather than a boolean, because pgvector gates its own features on it."""
-        if not agens.has_vectors():
-            pytest.skip("the vector extension is not created in this database")
+        needs_vectors(agens)
+        needs_promotion(agens)
         version = agens.vector_version()
         assert version is not None
         assert version >= (0, 5), "sparse vectors and half precision arrived in 0.7.0"
         assert all(isinstance(part, int) for part in version)
 
     def test_it_can_be_compared_to_decide_on_a_feature(self, agens) -> None:  # type: ignore[no-untyped-def]
-        if not agens.has_vectors():
-            pytest.skip("the vector extension is not created in this database")
+        needs_vectors(agens)
+        needs_promotion(agens)
         version = agens.vector_version()
         assert version is not None
         iterative_scans = version >= (0, 8)

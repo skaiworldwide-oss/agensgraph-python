@@ -319,7 +319,7 @@ class TestShapesTheServerAcceptsAndMisreads:
         right on both: it refuses the statement before it is sent whatever the server would do.
         """
         with agensgraph.connect(dsn) as conn:
-            promoted = conn.capabilities.has_property_promotion()
+            promoted = conn.can_promote_properties()
         if not promoted:
             with pytest.raises(psycopg.Error):
                 graph.execute("prepare vle as match (a)-[r*1..$1]->(b) return a")
@@ -408,7 +408,7 @@ class TestWhatBindsAsWhat:
         """``size($1)`` is the one entry of that table that is not the same on every server:
         2.18 binds it as text, and before that the parser does not take a parameter there."""
         with agensgraph.connect(dsn) as conn:
-            promoted = conn.capabilities.has_property_promotion()
+            promoted = conn.can_promote_properties()
         if not promoted:
             with pytest.raises(psycopg.Error):
                 graph.execute("prepare s as match (n:person) return size($1)")
@@ -501,8 +501,8 @@ class TestThePromotedSentinelColumn:
 
     @pytest.fixture
     def promoted(self, agens):  # type: ignore[no-untyped-def]
-        if not agens.capabilities.has_property_promotion():
-            pytest.skip("this server has no property promotion")
+        if not agens.can_promote_properties():
+            pytest.skip("this server cannot store a property in a column of its own")
         on = agens.execute_query("show enable_property_promotion").records[0][0]
         assert on == "on", "promotion is off on this server, so the sentinel is never projected"
         agens.execute("create vlabel doc (title text generated, n int generated)")

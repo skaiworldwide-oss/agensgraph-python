@@ -780,6 +780,8 @@ class TestVectorsAgainstAServer:
     def graph(self, agens):  # type: ignore[no-untyped-def]
         if not agens.has_vectors():
             pytest.skip("pgvector is not created in this database")
+        if not agens.can_promote_properties():
+            pytest.skip("this server cannot store a property in a column of its own")
         agens.register_vectors()
         agens.execute("create vlabel emb (v vector(4) generated)")
         agens.execute("create (:emb {v: [1.5, -2.25, 3.0, 4.0]})")
