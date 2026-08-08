@@ -34,6 +34,7 @@ __all__ = [
     "LABELS_QUERY",
     "PROMOTION_CATALOG_QUERY",
     "SERVER_PROGRAM_QUERY",
+    "META_VALID_QUERY",
     "TRIPLES_QUERY",
     "Check",
     "Constraint",
@@ -714,6 +715,21 @@ handful of rows.
 
 The catalog is only as current as the last gather, and ``auto_gather_graphmeta`` is off by default,
 so an empty answer means nobody has gathered rather than that the graph has no edges.
+:data:`META_VALID_QUERY` is how to tell the two apart, and how to tell a current answer from a
+stale one.
+"""
+
+META_VALID_QUERY = """
+select g.graphmeta_valid
+from pg_catalog.ag_graph g
+where g.graphname = %s
+"""
+"""Whether the triple catalog still describes this graph.
+
+``regather_graphmeta()`` sets the flag, and a transaction that wrote to the graph clears it at
+commit (``pgstat_xact.c``, "ag_graph.graphmeta_valid flag must be cleared at commit"). A read
+leaves it alone. So this distinguishes the three states that matter: never gathered, gathered and
+current, gathered and since written to.
 """
 
 GATHER_META = "select pg_catalog.regather_graphmeta()"

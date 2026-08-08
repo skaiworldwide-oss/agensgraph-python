@@ -66,6 +66,7 @@ from .introspect import (
     INDEXES_FOR_LABEL,
     INDEXES_QUERY,
     LABELS_QUERY,
+    META_VALID_QUERY,
     PROMOTION_CATALOG_QUERY,
     SERVER_PROGRAM_QUERY,
     TRIPLES_QUERY,
@@ -827,7 +828,7 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
         description is not a thing that should write.
         """
         name = self._graph_of(graph)
-        if refresh:
+        if refresh and not await self.meta_is_current(graph=name):
             await self._run(GATHER_META)
         labels = await self.labels(graph=name)
         counts = await self.element_counts(graph=name)
@@ -861,8 +862,18 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
             properties=properties,
             triples=triples,
             counts=counts,
-            meta_gathered=bool(triples) or edges == 0,
+            meta_gathered=await self.meta_is_current(graph=name),
         )
+
+    async def meta_is_current(self, *, graph: str | None = None) -> bool:
+        """Whether the triple catalog still describes this graph.
+
+        ``regather_graphmeta()`` sets the flag, a transaction that wrote to the graph clears it
+        at commit, and a read leaves it alone. So this separates a catalog nobody has gathered
+        from one that is current and from one that was gathered and has since been written to.
+        """
+        rows = await self._fetch(META_VALID_QUERY, (self._graph_of(graph),))
+        return bool(rows) and bool(rows[0][0])
 
     async def declared_properties(
         self, label: str | None = None, *, graph: str | None = None
