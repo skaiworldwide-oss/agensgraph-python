@@ -51,6 +51,9 @@ from .pool_async import AsyncConnectionPool as AsyncConnectionPool
 from .pool_async import AsyncNullConnectionPool as AsyncNullConnectionPool
 from .retry import RetryPolicy as RetryPolicy
 from .retry import TokenBucket as TokenBucket
+from .serialize import json_default as json_default
+from .serialize import to_builtins as to_builtins
+from .serialize import to_json as to_json
 from .summary import CommitOutcome as CommitOutcome
 from .summary import GraphWriteCounts as GraphWriteCounts
 from .types import Edge as Edge
@@ -113,6 +116,7 @@ __all__ = [
     "errors",
     "freeze_after_import",
     "is_retryable",
+    "json_default",
     "paused_collection",
     "read_numbers_exactly",
     "reading_numbers_exactly",
@@ -121,6 +125,8 @@ __all__ = [
     "retryability",
     "show_error_details",
     "showing_error_details",
+    "to_builtins",
+    "to_json",
     "vector",
 ]
 

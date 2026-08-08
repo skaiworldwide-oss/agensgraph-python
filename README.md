@@ -82,6 +82,7 @@ pip install "agensgraph-python[otel]"      # spans through opentelemetry-api
 
 **Everything else**
 [Observability](#observability) ·
+[JSON](#handing-a-result-to-something-that-wants-json) ·
 [Untrusted statements](#running-a-statement-you-did-not-write) ·
 [Errors](#errors) ·
 [LISTEN and NOTIFY](#listen-and-notify) ·
@@ -938,6 +939,38 @@ password), and no parameter value ever reaches a span.
 agensgraph.observability.add_notice_listener(lambda n: print(n.severity, n.message))
 ```
 
+## Handing a result to something that wants JSON
+
+```python
+agensgraph.to_json(result.records)      # bytes, and the fast one
+agensgraph.to_builtins(vertex)          # dicts and lists
+json.dumps(vertex, default=agensgraph.json_default)
+```
+
+The shape is the wire's:
+
+```json
+{"id": "3.1", "label": "person", "properties": {"name": "Arthur"}}
+{"id": "4.1", "label": "knows", "start": "3.1", "end": "3.2", "properties": {}}
+{"vertices": [...], "edges": [...]}
+```
+
+An identity is the text the server prints, `"3.1"`, which goes back through `%s::graphid`
+unchanged. The structured `{labid, locid}` was considered and dropped: it invites a reader to
+build an identity out of two numbers, and one built that way has never been near the server.
+
+**`to_json` does not decode a property map nobody read.** It copies the bytes the map arrived in
+straight into the output, which is the same bargain the driver makes everywhere else and it pays
+here most of all: on a result of 1536-dimension embeddings it is **hundreds of times** faster than
+the route through `json.dumps`, which decodes every number into a Python float and writes it out
+again. On small maps it is about twice.
+
+**Do not encode a graph value directly.** `msgspec.json.encode(vertex)` emits the *private* fields,
+so `_id` arrives as a nested `{"labid": 3, "locid": 1}` next to `_raw` and `_props`. There is no
+encoder hook that prevents it, either: a hook runs only for a type the encoder does not already
+know, and a vertex is a `msgspec.Struct`, so it never fires. The conversion has to happen before
+the encoder sees the value, which is what these three do.
+
 ## Running a statement you did not write
 
 Model output, most often. The rule is that the **server** refuses a write rather than the driver,
@@ -1193,6 +1226,9 @@ Everything exported from `agensgraph`. The submodules `agensgraph.columnar`, `ag
 
 | | |
 |---|---|
+| `to_json(value)` | JSON bytes, without decoding a map nobody read |
+| `to_builtins(value)`, `json_default` | the same shape as dicts, and for `json.dumps` |
+| `connection.pipeline_query(statements)` | a burst of reads, every answer read back |
 | `connection.read_only_transaction()` | a transaction the server will not let write |
 | `connection.can_run_server_programs()` | whether this role could run a command on the host |
 | `Deadline`, `Expired` | one budget across the wait and the statement; `Expired` is a `TimeoutError` |
