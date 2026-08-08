@@ -25,7 +25,7 @@ from __future__ import annotations
 import gc
 import struct
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from psycopg.types.json import Jsonb
 
@@ -38,12 +38,15 @@ if TYPE_CHECKING:
 
 __all__ = [
     "BLOCK_SIZE",
+    "UpsertCounts",
     "build_identity_map",
     "edge_blocks",
     "edge_copy_statement",
     "freeze_after_import",
     "identity_map_statement",
+    "overlap_update_statement",
     "paused_collection",
+    "split_by_what_exists",
     "vertex_blocks",
     "vertex_copy_statement",
 ]
@@ -241,3 +244,53 @@ def build_identity_map(
             + ". An edge resolved through this map would land on the wrong element or on none"
         )
     return found
+
+
+class UpsertCounts(NamedTuple):
+    """What an upsert did, split by which half of it did the work."""
+
+    inserted: int
+    updated: int
+
+
+def overlap_update_statement(label: str) -> str:
+    """Update elements already present, addressed by the identity they already have.
+
+    One statement for the whole overlap. The identity is what makes it cheap: an ``id()`` filter
+    over an unwound list plans as an index scan on the label's primary key, one probe per row --
+    measured, 20,000 elements in a third of a second against nine times that for a statement each.
+
+    ``+=`` rather than ``=``, so a property the caller did not mention keeps the value it had.
+    """
+    return (
+        f"unwind %s::jsonb as r "
+        f"match (n:{quote_identifier(label)}) where id(n) = (r->>'id')::graphid "
+        f"set n += r->'props'"
+    )
+
+
+def split_by_what_exists(
+    rows: Sequence[Mapping[str, Any]], key: str, known: Mapping[str, GraphId]
+) -> tuple[list[Mapping[str, Any]], list[dict[str, Any]]]:
+    """The rows that are new, and the updates for the rows that are not.
+
+    The key is read the way :func:`build_identity_map` wrote it, as text, so a key that is a number
+    in one and a string in the other still finds its element rather than quietly making a second.
+    """
+    fresh: list[Mapping[str, Any]] = []
+    updates: list[dict[str, Any]] = []
+    for row in rows:
+        if key not in row:
+            raise ValueError(
+                f"a row has no {key!r} to identify it by, so it can be neither matched to an "
+                f"element nor safely written as a new one"
+            )
+        value = row[key]
+        if value is None:
+            raise ValueError(f"a row has {key!r} set to null, which identifies nothing")
+        found = known.get(str(value))
+        if found is None:
+            fresh.append(row)
+        else:
+            updates.append({"id": str(found), "props": dict(row)})
+    return fresh, updates

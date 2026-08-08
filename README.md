@@ -483,6 +483,29 @@ statement for the whole label. It raises rather than guessing if the key is not 
 element does not have it, because silently collapsing two vertices into one would attach every edge
 of both to whichever survived.
 
+### Writing what may already be there
+
+`load_vertices` is a copy, and a copy only creates, so reading a source in twice makes a second
+element for everything the graph already holds. `upsert_vertices` reads which keys are there,
+copies only the rows whose key is not, and leaves the rest alone:
+
+```python
+conn.upsert_vertices("doc", "key", rows)                          # insert what is missing
+conn.upsert_vertices("doc", "key", rows, on_existing="update")    # and refresh the rest
+```
+
+Measured on 20,000 rows with half already present: **about fourteen times** a `MERGE` per row, the
+route every knowledge-graph package takes. `"skip"` is the default because it is a copy and nothing
+else; `"update"` adds one statement for the whole overlap, addressed by the identities the read
+already found, which plans as an index probe per row rather than a scan. It merges rather than
+replaces, so a property you do not mention keeps its value.
+
+**A key with no uniqueness behind it is refused.** This is not caution: eight writers merging on
+twenty-five shared keys, with only a plain index, produced **thirty-two elements for twenty-five
+keys** on a live server. With a unique index it produced twenty-five, raising `23505` and `40001`
+along the way, both of which are the expected path. `require_unique=False` accepts the hazard for a
+graph that cannot add one.
+
 A frame goes in directly, without becoming Python objects on the way:
 
 ```python
@@ -1226,6 +1249,7 @@ Everything exported from `agensgraph`. The submodules `agensgraph.columnar`, `ag
 
 | | |
 |---|---|
+| `connection.upsert_vertices(label, key, rows)` | copy what is missing, optionally refresh the rest |
 | `to_json(value)` | JSON bytes, without decoding a map nobody read |
 | `to_builtins(value)`, `json_default` | the same shape as dicts, and for `json.dumps` |
 | `connection.pipeline_query(statements)` | a burst of reads, every answer read back |

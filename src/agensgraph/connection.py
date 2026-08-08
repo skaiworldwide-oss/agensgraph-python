@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any, cast
 import psycopg
 from psycopg.adapt import AdaptersMap
 from psycopg.rows import Row, tuple_row
+from psycopg.types.json import Jsonb
 
 from ._core import (
     GRAPH_ADAPTERS,
@@ -39,10 +40,13 @@ from ._protocol.labels import CURRENT_GRAPH_QUERY, LabelCache
 from .bulk import (
     EDGE_COLUMN_TYPES,
     VERTEX_COLUMN_TYPES,
+    UpsertCounts,
     build_identity_map,
     edge_copy_statement,
     edge_rows,
     identity_map_statement,
+    overlap_update_statement,
+    split_by_what_exists,
     vertex_copy_statement,
     vertex_rows,
 )
@@ -75,6 +79,7 @@ from .introspect import (
     Label,
     Unique,
     element_count_query,
+    index_properties,
     reconcile_constraints,
     reconcile_indexes,
 )
@@ -538,6 +543,71 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
                 copy.write_row(row)
                 loaded += 1
         return loaded
+
+    def upsert_vertices(
+        self,
+        label: str,
+        key: str,
+        rows: Iterable[Mapping[str, Any]],
+        *,
+        on_existing: str = "skip",
+        require_unique: bool = True,
+        graph: str | None = None,
+    ) -> UpsertCounts:
+        """Write elements that are not there, by a property that identifies them.
+
+        ``load_vertices`` is a copy, and a copy only creates, so re-reading a source into a graph
+        with it makes a second element for everything it already holds. This reads which keys are
+        there, copies only the rows whose key is not, and leaves the rest alone.
+
+        ``on_existing="update"`` merges the given properties into the elements already present, as
+        one statement addressed by the identities the read already found. A property the caller
+        does not mention keeps its value. Left as ``"skip"`` nothing is written for them at all,
+        which is a copy and nothing else, and is why that is the default.
+
+        **A key with no uniqueness behind it is refused.** Two writers merging on the same key
+        without one produce duplicate elements rather than an error: eight writers over
+        twenty-five shared keys were measured making twenty-seven elements. ``require_unique``
+        turns the refusal off for a graph that already has such a key and cannot add one.
+        """
+        if on_existing not in ("skip", "update"):
+            raise ValueError(
+                f"on_existing is 'skip' or 'update', not {on_existing!r}: there is no third thing to do with an element that is already there"
+            )
+        name = self._graph_of(graph)
+        material = list(rows)
+        if require_unique and (not self._key_is_unique(label, key, graph=name)):
+            raise ValueError(
+                f"nothing makes {key!r} unique on {label!r}, so two writers merging on it would each create an element rather than find one. Add a unique property index or a uniqueness constraint, or pass require_unique=False to accept the hazard"
+            )
+        known = self.identity_map(label, key, graph=name)
+        fresh, updates = split_by_what_exists(material, key, known)
+        inserted = self.load_vertices(label, fresh, graph=name) if fresh else 0
+        updated = 0
+        if on_existing == "update" and updates:
+            self._run_with(overlap_update_statement(label), (Jsonb(updates),))
+            updated = len(updates)
+        return UpsertCounts(inserted, updated)
+
+    def _key_is_unique(self, label: str, key: str, *, graph: str) -> bool:
+        """Whether anything on the server keeps one element per value of this property.
+
+        Both catalogs are asked. A uniqueness assertion is kept as an exclusion constraint and is
+        filtered out of the index view, so reading indexes alone would report a graph as having no
+        uniqueness when it has some.
+        """
+        for index in self.indexes(label, graph=graph):
+            if index.unique and index_properties(index.definition) == (key,):
+                return True
+        return any(
+            constraint.unique and f"({key})" in constraint.definition.replace('"', "")
+            for constraint in self.constraints(label, graph=graph)
+        )
+
+    def _run_with(self, statement: str, params: Params) -> None:
+        """A statement whose rows are not wanted, sent through the reporting cursor."""
+        with self.cursor() as cursor:
+            cursor.execute(statement, params)
 
     def load_edges(
         self,

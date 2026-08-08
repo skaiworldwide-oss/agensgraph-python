@@ -11,10 +11,9 @@ import json
 import msgspec
 import pytest
 
-import agensgraph
 from agensgraph import GraphId, json_default, to_builtins, to_json
 from agensgraph.types import Edge, Path, Vertex
-from agensgraph.vector import SparseVector, Vector
+from agensgraph.vector import SparseVector, Vector, generated_column
 
 VERTEX = Vertex(GraphId(3, 1), "person", b'{"a": 1, "b": "x"}')
 OTHER = Vertex(GraphId(3, 2), "person", b'{"a": 2}')
@@ -181,12 +180,21 @@ class TestAgainstAServer:
         ).records[0]
         assert again.id == vertex.id
 
-    def test_a_vector_read_from_the_server_serializes(self, agens) -> None:  # type: ignore[no-untyped-def]
+    def test_a_vector_column_read_from_the_server_serializes(self, agens) -> None:  # type: ignore[no-untyped-def]
+        """Read from a column of its own, which is the shape that comes back as a vector.
+
+        The same numbers left in the property map are not one: they read back as a list where the
+        server can promote a property and as the text they print as where it cannot, so what a
+        column gives is the case worth pinning here.
+        """
         if not agens.has_vectors():
             pytest.skip("the vector extension is not created in this database")
+        if not agens.can_promote_properties():
+            pytest.skip("this server cannot store a property in a column of its own")
         agens.register_vectors()
-        agens.execute("create vlabel emb")
+        agens.execute(f"create vlabel emb ({generated_column('v', 3)})")
         agens.execute("create (:emb {v: %s})", (Vector([1.0, 2.0, 3.0]),))
         agens.refresh_labels()
         (value,) = agens.execute_query("match (n:emb) return n.v").records[0]
-        assert json.loads(to_json(agensgraph.Vector(value)))[:3] == [1.0, 2.0, 3.0]
+        assert isinstance(value, Vector)
+        assert json.loads(to_json(value)) == [1.0, 2.0, 3.0]
