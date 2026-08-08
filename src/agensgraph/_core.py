@@ -145,6 +145,12 @@ class GraphMixin:
     pgconn: PGconn
 
     _agens_capabilities: Capabilities | None = None
+    _agens_can_run_programs: bool | None = None
+    """Whether this role could run a command on the server's host through ``COPY``.
+
+    Asked once and kept, since a role does not gain the privilege while a connection is open.
+    """
+
     _agens_can_promote: bool | None = None
     """Whether this server has the catalog a promoted property is recorded in.
 

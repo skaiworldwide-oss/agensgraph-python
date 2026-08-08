@@ -82,6 +82,7 @@ pip install "agensgraph-python[otel]"      # spans through opentelemetry-api
 
 **Everything else**
 [Observability](#observability) ·
+[Untrusted statements](#running-a-statement-you-did-not-write) ·
 [Errors](#errors) ·
 [LISTEN and NOTIFY](#listen-and-notify) ·
 [Two-phase commit](#two-phase-commit) ·
@@ -937,6 +938,46 @@ password), and no parameter value ever reaches a span.
 agensgraph.observability.add_notice_listener(lambda n: print(n.severity, n.message))
 ```
 
+## Running a statement you did not write
+
+Model output, most often. The rule is that the **server** refuses a write rather than the driver,
+because a driver that reads the text to decide has to recognise every way of writing, and does not:
+this is PostgreSQL underneath, so `INSERT`, `TRUNCATE` and `DROP` are all available and none of them
+is Cypher.
+
+```python
+with conn.read_only_transaction():
+    result = conn.execute_query(whatever_the_model_said)
+```
+
+Measured inside that transaction: every Cypher write, `INSERT`, `TRUNCATE`, `DROP` and `CREATE
+VLABEL` are refused with `25006`, and a plain read runs. The transaction characteristic is
+psycopg's own `connection.read_only`, which is the thing to set for a whole session; what this adds
+is the check below.
+
+**What a read-only transaction does not stop, and it is worth knowing.** `COPY ... TO PROGRAM` runs
+a command on the server's host and is allowed, because it takes rows *out* of the database rather
+than putting any in, so there is no write to refuse. Reading the statement does not stop it either:
+a second statement after a semicolon, and a leading comment, both get one past. What stops it is
+not holding the privilege, so that is what is asked about:
+
+```python
+conn.can_run_server_programs()      # asked once per connection, and kept
+```
+
+A role that holds it is refused the transaction, with a message saying what to change, rather than
+left to find out. Pass `allow_server_programs=True` to accept it. **Connect as a role that is
+neither a superuser nor a member of `pg_execute_server_program`**, and the boundary holds:
+
+| | refused by |
+|---|---|
+| a Cypher write, `INSERT`, `TRUNCATE`, `DROP`, DDL | the transaction, `25006` |
+| `COPY ... TO PROGRAM`, including one hidden behind another statement | the privilege, `42501` |
+| a plain read | nothing, it runs |
+
+`cypher.check_can_wrap()` is a reasonable hint to show a user early, and it already beats a
+write-detecting regex on `RETURN n.set`. It is not a boundary and is not used as one.
+
 ## Errors
 
 They are psycopg's exception classes, raised by psycopg, so `except psycopg.errors.UniqueViolation`
@@ -1152,6 +1193,8 @@ Everything exported from `agensgraph`. The submodules `agensgraph.columnar`, `ag
 
 | | |
 |---|---|
+| `connection.read_only_transaction()` | a transaction the server will not let write |
+| `connection.can_run_server_programs()` | whether this role could run a command on the host |
 | `Deadline`, `Expired` | one budget across the wait and the statement; `Expired` is a `TimeoutError` |
 | `RetryPolicy` | decides whether and when to try again; you keep the loop |
 | `Retryability`, `retryability(exc)`, `is_retryable(exc)` | the six categories, and how to ask |

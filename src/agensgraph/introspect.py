@@ -33,6 +33,7 @@ __all__ = [
     "INDEXES_QUERY",
     "LABELS_QUERY",
     "PROMOTION_CATALOG_QUERY",
+    "SERVER_PROGRAM_QUERY",
     "Check",
     "Constraint",
     "DeclaredProperty",
@@ -117,6 +118,22 @@ Asked of the catalog rather than worked out from the version, because the versio
 it: the 2.18 release branch and main both report ``2.18-devel`` and only one of them has the
 catalog. A server that cannot promote a property has nowhere to record one, so the presence of the
 catalog is the feature.
+"""
+
+SERVER_PROGRAM_QUERY = """
+select rolsuper or pg_has_role(current_user, 'pg_execute_server_program', 'usage')
+from pg_roles where rolname = current_user
+"""
+"""Whether this role could run a command on the server's host.
+
+``COPY ... TO PROGRAM`` does that, and a read-only transaction does not stop it: it moves rows out
+of the database rather than into it, so it is not a write for the server to refuse. Measured inside
+a read-only transaction, every other write was refused with ``25006`` and this one ran.
+
+Asked of the role rather than looked for in the statement, because looking for it in the statement
+does not work: a second statement after a semicolon, or a leading comment, gets a copy past any
+reading of the text, and all three were demonstrated. Whether the copy can run at all is a
+privilege, and a privilege is a thing the server can be asked about once.
 """
 
 DECLARED_PROPERTIES_QUERY = _DECLARED_PROPERTIES.format(label="")
