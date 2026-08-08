@@ -20,6 +20,7 @@ they already know.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, cast
 
 import psycopg
@@ -53,7 +54,7 @@ from .cypher import (
     needs_a_reading_first,
     wrap_for_cursor,
 )
-from .errors import BatchFailed, NoEnclosingTransaction, redact_details
+from .errors import BatchFailed, ConfigurationError, NoEnclosingTransaction
 from .introspect import (
     CONSTRAINTS_FOR_LABEL,
     CONSTRAINTS_QUERY,
@@ -64,6 +65,7 @@ from .introspect import (
     INDEXES_QUERY,
     LABELS_QUERY,
     PROMOTION_CATALOG_QUERY,
+    SERVER_PROGRAM_QUERY,
     Check,
     Constraint,
     DeclaredProperty,
@@ -89,7 +91,7 @@ from .summary import (
 from .vector import search_option_statements
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Iterator, Mapping, Sequence
+    from collections.abc import Generator, Iterable, Iterator, Mapping, Sequence
     from typing import Self
 
     from psycopg.abc import Params, Query, QueryNoTemplate
@@ -135,8 +137,9 @@ class Cursor(psycopg.Cursor[Row]):
                 cast("QueryNoTemplate", query), params, prepare=prepare, binary=binary
             )
         except psycopg.Error as exc:
-            conn._report_query(text, timer, rows=0, error=redact_details(exc))
-            raise
+            failure = conn._translated(exc)
+            conn._report_query(text, timer, rows=0, error=failure)
+            raise failure from None
         except BaseException as exc:
             if not isinstance(exc, Exception):
                 conn._agens_cancelled = True
@@ -156,8 +159,9 @@ class Cursor(psycopg.Cursor[Row]):
         try:
             super().executemany(query, params_seq, returning=returning)
         except psycopg.Error as exc:
-            conn._report_query(text, timer, rows=0, error=redact_details(exc))
-            raise
+            failure = conn._translated(exc)
+            conn._report_query(text, timer, rows=0, error=failure)
+            raise failure from None
         except BaseException as exc:
             if not isinstance(exc, Exception):
                 conn._agens_cancelled = True
@@ -330,16 +334,57 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
                 before: Sequence[int] | None = None
                 if counts_ and needs_a_reading_first(text):
                     before = self._counters()
-                try:
-                    cursor.execute(query, params, prepare=prepare_)
-                except psycopg.Error as exc:
-                    raise self._translated(exc) from None
+                cursor.execute(query, params, prepare=prepare_)
                 described = cursor.description
                 records = cursor.fetchall() if described is not None else []
                 keys = [column.name for column in described or ()]
                 oids = tuple(int(column.type_code) for column in described or ())
         after = self._counters() if counts_ else None
         return Result(records, keys, self._counts_for(text, before, after), oids)
+
+    def can_run_server_programs(self) -> bool:
+        """Whether this role could run a command on the server's host through ``COPY``.
+
+        Asked once per connection and kept. See :meth:`read_only_transaction`, which is the
+        reason it is worth knowing.
+        """
+        held = self._agens_can_run_programs
+        if held is None:
+            rows = self._fetch(SERVER_PROGRAM_QUERY, ())
+            held = bool(rows[0][0])
+            self._agens_can_run_programs = held
+        return held
+
+    @contextmanager
+    def read_only_transaction(self, *, allow_server_programs: bool = False) -> Generator[None]:
+        """A transaction the server will not let write, for a statement you did not write.
+
+        Model output, most often. The refusal is the server's, so a write is refused however the
+        statement is spelled and the driver holds no opinion about what writing looks like. That
+        is the whole argument for it over reading the text: a reading has to recognise every way
+        of writing and misses, and it is PostgreSQL underneath, so ``INSERT``, ``TRUNCATE`` and
+        ``DROP`` are all available and none of them is Cypher. Measured, each of those is refused
+        with ``25006``, as is every Cypher write, and a plain read runs.
+
+        The transaction characteristic is psycopg's ``connection.read_only``, and that is the
+        thing to set for a whole session. What this adds is the check below, and the reason it is
+        a separate name rather than an override.
+
+        **What a read-only transaction does not stop.** ``COPY ... TO PROGRAM`` runs a command on
+        the server's host, and it is allowed: it takes rows out of the database rather than
+        putting any in, so it is not a write to refuse. Reading the text does not stop it either
+        -- a second statement after a semicolon, and a leading comment, both get one past, and
+        both were demonstrated. What stops it is not holding the privilege, so that is what is
+        asked about, once, and a role holding it is refused here rather than left to find out.
+        Pass ``allow_server_programs`` to accept it anyway.
+        """
+        if not allow_server_programs and self.can_run_server_programs():
+            raise ConfigurationError(
+                "this role may run a command on the server's host, through COPY ... TO PROGRAM, which a read-only transaction does not stop -- so a read-only transaction is not a boundary for a statement this role did not write. Connect as a role that is not a superuser and does not hold pg_execute_server_program, or pass allow_server_programs=True to accept it."
+            )
+        with self.transaction():
+            self._run("set transaction read only")
+            yield
 
     def transaction_id(self, *, assign: bool = False) -> int | None:
         """The id of the transaction now open, so its fate can be asked about if it is lost.
