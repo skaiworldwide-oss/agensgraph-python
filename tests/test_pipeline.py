@@ -95,6 +95,72 @@ class TestTheBatchHelper:
         assert blamed == [1]
 
 
+class TestReadingTheAnswersBack:
+    """What the batch helper cannot do, and why a read can.
+
+    A pipeline blames the wrong statement, which is why writes are sent without reading anything
+    back. A read has the same problem and a way out of it: run them again one at a time. That is
+    only safe because reading twice changes nothing.
+    """
+
+    @pytest.fixture
+    def loaded(self, agens):  # type: ignore[no-untyped-def]
+        agens.execute("create vlabel person")
+        agens.load_vertices("person", [{"k": i, "name": f"n{i}"} for i in range(200)])
+        agens.execute("create property index on person (k)")
+        return agens
+
+    def test_every_answer_comes_back_in_the_order_it_was_asked(self, loaded) -> None:  # type: ignore[no-untyped-def]
+        asked = [("match (n:person) where n.k = %s return n.name", (i,)) for i in range(50)]
+        results = loaded.pipeline_query(asked)
+        assert [result.records for result in results] == [
+            loaded.execute_query(statement, params).records for statement, params in asked
+        ]
+
+    def test_the_columns_are_described_as_they_are_by_the_other_route(self, loaded) -> None:  # type: ignore[no-untyped-def]
+        """Read inside the pipeline these are empty, because nothing has answered yet."""
+        (result,) = loaded.pipeline_query(["match (n:person) return n.name limit 1"])
+        assert result.keys == ["name"]
+        assert result.oids
+
+    def test_a_statement_returning_nothing_is_still_a_result(self, loaded) -> None:  # type: ignore[no-untyped-def]
+        (result,) = loaded.pipeline_query(["match (n:person) where n.k = 99999 return n"])
+        assert result.records == []
+
+    def test_a_failure_names_the_statement_that_caused_it(self, loaded) -> None:  # type: ignore[no-untyped-def]
+        """Which the batch helper cannot do, because it may not run a write a second time."""
+        good = "match (n:person) where n.k = 1 return n.name"
+        with pytest.raises(agensgraph.errors.Error) as caught:
+            loaded.pipeline_query([good, "match (n:person) return n.nope::int", good])
+        assert not isinstance(caught.value, agensgraph.errors.BatchFailed)
+        assert caught.value.sqlstate == "42601"
+
+    def test_a_list_longer_than_one_chunk_is_still_one_list(self, loaded) -> None:  # type: ignore[no-untyped-def]
+        asked = ["match (n:person) where n.k = 1 return n.name"] * 40
+        assert len(loaded.pipeline_query(asked, chunk=7)) == 40
+
+    def test_an_empty_list_asks_nothing(self, loaded) -> None:  # type: ignore[no-untyped-def]
+        assert loaded.pipeline_query([]) == []
+
+    def test_it_beats_asking_one_at_a_time(self, loaded) -> None:  # type: ignore[no-untyped-def]
+        """Not a benchmark -- a floor, so a change that makes it slower than the plain route
+        fails rather than merely disappoints. Interleaved, because measuring one and then the
+        other measures the order as much as the routes."""
+        import time
+
+        asked = [("match (n:person) where n.k = %s return n.name", (i,)) for i in range(200)]
+        singly = pipelined = 0.0
+        for _ in range(3):
+            started = time.monotonic()
+            for statement, params in asked:
+                loaded.execute_query(statement, params)
+            singly += time.monotonic() - started
+            started = time.monotonic()
+            loaded.pipeline_query(asked)
+            pipelined += time.monotonic() - started
+        assert pipelined < singly
+
+
 class TestTheAwaitingInterface:
     @pytest_asyncio.fixture
     async def conn(self, dsn: str):  # type: ignore[no-untyped-def]
@@ -122,3 +188,11 @@ class TestTheAwaitingInterface:
         with pytest.raises(agensgraph.errors.BatchFailed) as caught:
             await conn.pipeline_batch(["create (:doc {n: 1})", "create (:doc {n: 1/0})"])
         assert len(caught.value.statements) == 2
+
+    @pytest.mark.asyncio
+    async def test_answers_come_back_here_too(self, conn) -> None:  # type: ignore[no-untyped-def]
+        await conn.pipeline_batch([f"create (:doc {{n: {n}}})" for n in range(5)])
+        results = await conn.pipeline_query(
+            [("match (n:doc) where n.n = %s return n.n", (n,)) for n in range(5)]
+        )
+        assert [result.records for result in results] == [[(n,)] for n in range(5)]

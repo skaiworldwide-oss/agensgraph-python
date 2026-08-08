@@ -86,6 +86,7 @@ from .summary import (
     TRANSACTION_ID_QUERY,
     TRANSACTION_STATUS_QUERY,
     CommitOutcome,
+    GraphWriteCounts,
     read_outcome,
 )
 from .vector import search_option_statements
@@ -366,9 +367,8 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
         ``DROP`` are all available and none of them is Cypher. Measured, each of those is refused
         with ``25006``, as is every Cypher write, and a plain read runs.
 
-        The transaction characteristic is psycopg's ``connection.read_only``, and that is the
-        thing to set for a whole session. What this adds is the check below, and the reason it is
-        a separate name rather than an override.
+        The transaction characteristic is psycopg's ``connection.read_only``, which is what to
+        set for a whole session. What this adds is the check below.
 
         **What a read-only transaction does not stop.** ``COPY ... TO PROGRAM`` runs a command on
         the server's host, and it is allowed: it takes rows out of the database rather than
@@ -726,6 +726,62 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
             )
             failure.statements = tuple((statement for statement, _ in sent))
             raise failure from exc
+
+    def pipeline_query(
+        self,
+        statements: Sequence[tuple[str, Params | None]] | Sequence[str],
+        *,
+        chunk: int = 100,
+    ) -> list[Result]:
+        """Send many reads without waiting for each in turn, and read every answer back.
+
+        A result per statement, in the order they were given. For a burst of reads whose cost is
+        round trips rather than work: an ancestor walk, a degree per node, a batch of lookups by
+        id. Measured on 300 indexed reads, three times the same statements run one after another.
+
+        **For reads.** :meth:`pipeline_batch` reads nothing back because a pipeline attributes a
+        failure to the wrong statement, and replaying a write to find the real one would apply it
+        twice. A read has neither problem, which is what makes this possible: if the batch fails,
+        the statements are run again one at a time, so the failure is raised by the statement that
+        actually caused it and the results are still correct. A write among them would be applied
+        twice by that second pass, so do not put one here.
+
+        Each statement gets a cursor, and cursors are made ``chunk`` at a time so that a long list
+        does not allocate one for every statement at once.
+        """
+        sent = [(item, None) if isinstance(item, str) else item for item in statements]
+        results: list[Result] = []
+        for start in range(0, len(sent), chunk):
+            batch = sent[start : start + chunk]
+            try:
+                results.extend(self._pipelined(batch))
+            except psycopg.Error:
+                for statement, params in batch:
+                    results.append(self.execute_query(statement, params))
+        return results
+
+    def _pipelined(self, batch: Sequence[tuple[str, Params | None]]) -> list[Result]:
+        """One pipeline's worth, every cursor read back in the order it was filled.
+
+        The reading follows the pipeline rather than sitting inside it. While it is open the
+        statements have been sent and not answered, so a cursor describes no columns and reading
+        one gives an empty result rather than the rows.
+        """
+        cursors = []
+        with self.pipeline():
+            for statement, params in batch:
+                cursor = self.cursor()
+                cursor.execute(statement, params)
+                cursors.append(cursor)
+        gathered = []
+        for cursor in cursors:
+            described = cursor.description
+            records = cursor.fetchall() if described is not None else []
+            keys = [column.name for column in described or ()]
+            oids = tuple(int(column.type_code) for column in described or ())
+            gathered.append(Result(records, keys, GraphWriteCounts.unknown(), oids))
+            cursor.close()
+        return gathered
 
     def vector_search_options(
         self, options: Mapping[str, object], *, local: bool = True
