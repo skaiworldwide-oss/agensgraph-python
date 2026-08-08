@@ -61,22 +61,29 @@ from .introspect import (
     CONSTRAINTS_QUERY,
     DECLARED_PROPERTIES_FOR_LABEL,
     DECLARED_PROPERTIES_QUERY,
+    GATHER_META,
     GRAPHS_QUERY,
     INDEXES_FOR_LABEL,
     INDEXES_QUERY,
     LABELS_QUERY,
     PROMOTION_CATALOG_QUERY,
     SERVER_PROGRAM_QUERY,
+    TRIPLES_QUERY,
     Check,
     Constraint,
     DeclaredProperty,
     DesiredIndex,
     Graph,
+    GraphDescription,
     Index,
     Label,
+    PropertyShape,
+    Triple,
     Unique,
+    describe_kind,
     element_count_query,
     index_properties,
+    property_sample_query,
     reconcile_constraints,
     reconcile_indexes,
 )
@@ -793,6 +800,69 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
             held = bool(rows[0][0])
             self._agens_can_promote = held
         return held
+
+    async def describe(
+        self, *, sample: int = 100, refresh: bool = False, graph: str | None = None
+    ) -> GraphDescription:
+        """What is in a graph: its labels, what they hold, and what joins what.
+
+        For a prompt, or a schema browser, or anything else that has to say what a graph looks
+        like without reading it. Nothing here scans the graph. The labels and their counts come
+        from the catalogs, the triples from the one the server keeps for its own planner, and the
+        properties from a bounded sample of each label -- ``sample`` rows, not all of them, because
+        the shape of a label does not need every row to establish and reading every row of a label
+        full of embeddings to learn that one key holds an array is minutes rather than milliseconds.
+
+        Where a property has a column of its own its type is read from the catalog instead, which
+        is exact rather than sampled. On a server that cannot promote a property there is nothing
+        to read, and everything is sampled.
+
+        **Nothing is installed.** Three of the packages this replaces create a plpgsql function in
+        the caller's database to name a JSON type; ``jsonb_typeof`` is built in, and the one thing
+        it does not do -- telling a whole number from a fractional one -- is done here.
+
+        The triple catalog is filled by a gather, and ``auto_gather_graphmeta`` is off by default,
+        so on a server where nobody has gathered there are no triples and ``meta_gathered`` is
+        false. ``refresh`` gathers first. It is not the default because it is a write, and a
+        description is not a thing that should write.
+        """
+        name = self._graph_of(graph)
+        if refresh:
+            await self._run(GATHER_META)
+        labels = await self.labels(graph=name)
+        counts = await self.element_counts(graph=name)
+        triples = tuple(
+            Triple(start, edge, end, seen)
+            for start, edge, end, seen in await self._fetch(TRIPLES_QUERY, (name,))
+        )
+        declared: dict[str, dict[str, str]] = {}
+        if await self.can_promote_properties():
+            for each in await self.declared_properties(graph=name):
+                declared.setdefault(each.label, {})[each.name] = each.type
+        wanted = [label.name for label in labels if not label.is_builtin]
+        sampled = await self.pipeline_query(
+            [(property_sample_query(name, label), (sample,)) for label in wanted]
+        )
+        properties: dict[str, tuple[PropertyShape, ...]] = {}
+        for label, result in zip(wanted, sampled, strict=True):
+            found = {
+                key: PropertyShape(key, describe_kind(kind, fractional), False)
+                for key, kind, fractional, _ in result.records
+            }
+            for key, kind in declared.get(label, {}).items():
+                found[key] = PropertyShape(key, kind, True)
+            properties[label] = tuple(found[key] for key in sorted(found))
+        # No triples and no edges agree with each other; no triples where edges exist means the
+        # catalog has not been gathered, which is a different thing to report.
+        edges = sum(counts.get(label.name, 0) for label in labels if label.is_edge)
+        return GraphDescription(
+            graph=name,
+            labels=tuple(labels),
+            properties=properties,
+            triples=triples,
+            counts=counts,
+            meta_gathered=bool(triples) or edges == 0,
+        )
 
     async def declared_properties(
         self, label: str | None = None, *, graph: str | None = None

@@ -64,6 +64,7 @@ pip install "agensgraph-python[otel]"      # spans through opentelemetry-api
 
 **Schema**
 [Reading the catalogs](#reading-the-catalogs) ·
+[Describing a graph](#describing-a-graph) ·
 [Declaring what should exist](#declaring-what-should-exist)
 
 **Vectors**
@@ -559,6 +560,43 @@ finds them.
 `declared_properties()` asks the server whether it can promote a property at all before reading the
 catalog that records one, because that catalog does not exist on every server and the version cannot
 tell you: the 2.18 release branch and main both report `2.18-devel`, and only one of them has it.
+
+## Describing a graph
+
+For a prompt, a schema browser, or anything that has to say what a graph looks like:
+
+```python
+description = conn.describe()
+
+description.labels        # name, kind, and what each inherits
+description.properties    # {label: (PropertyShape(name, kind, declared), ...)}
+description.triples       # (Triple(start, edge, end, edge_count), ...)
+description.counts        # {label: how many}
+description.meta_gathered # whether the triple catalog has ever been filled
+```
+
+**Nothing here scans the graph.** Labels, counts and triples come from catalogs; only the property
+names look at rows, and at `sample=100` of them per label rather than all. Measured against the
+three full scans this replaces, on 60,000 vertices and 120,000 edges: **55 times**, and the gap
+widens with the graph, because the scans grow and this does not.
+
+**It installs nothing.** Three of the integrations it replaces create a plpgsql `typeof(jsonb)` in
+your database. `jsonb_typeof` is built in, and the one thing it does not do, telling a whole number
+from a fractional one, is done in Python. The tests assert `pg_proc` and `pg_class` are the same
+size afterwards.
+
+Where a property has a column of its own its type is read from the catalog and `declared` is true,
+which is exact; everything else is what the sample held. A label whose name has a space is found,
+and so are edge properties and label inheritance, all three of which a reading of the text loses.
+
+The triple catalog is filled by a gather, and `auto_gather_graphmeta` is **off** by default, so on
+a server where nobody has gathered there are no triples and `meta_gathered` is false. That is
+reported rather than guessed at: no triples and no edges agree with each other, and no triples with
+edges present does not.
+
+```python
+conn.describe(refresh=True)     # gather first, which is a write
+```
 
 ## Declaring what should exist
 
@@ -1249,6 +1287,8 @@ Everything exported from `agensgraph`. The submodules `agensgraph.columnar`, `ag
 
 | | |
 |---|---|
+| `connection.describe()` | labels, properties, triples and counts, without a scan |
+| `GraphDescription`, `Triple`, `PropertyShape` | what it returns |
 | `connection.upsert_vertices(label, key, rows)` | copy what is missing, optionally refresh the rest |
 | `to_json(value)` | JSON bytes, without decoding a map nobody read |
 | `to_builtins(value)`, `json_default` | the same shape as dicts, and for `json.dumps` |

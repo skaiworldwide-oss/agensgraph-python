@@ -34,22 +34,28 @@ __all__ = [
     "LABELS_QUERY",
     "PROMOTION_CATALOG_QUERY",
     "SERVER_PROGRAM_QUERY",
+    "TRIPLES_QUERY",
     "Check",
     "Constraint",
     "DeclaredProperty",
     "DesiredIndex",
     "Graph",
+    "GraphDescription",
     "Index",
     "IndexElement",
     "Label",
+    "PropertyShape",
+    "Triple",
     "Unique",
     "constraint_name",
+    "describe_kind",
     "element_count_query",
     "index_elements",
     "index_is_partial",
     "index_method",
     "index_properties",
     "parse_index_element",
+    "property_sample_query",
     "reconcile_constraints",
     "reconcile_indexes",
 ]
@@ -691,3 +697,101 @@ def reconcile_constraints(
             if (label, name) not in wanted:
                 statements.append(drop_constraint_statement(label, name))
     return statements
+
+
+TRIPLES_QUERY = """
+select start::text, edge::text, "end"::text, edgecount
+from pg_catalog.ag_graphmeta_view
+where graphname = %s
+order by edgecount desc, start, edge, "end"
+"""
+"""Which labels an edge label joins, and how many edges of it there are.
+
+Read from the catalog the server keeps for the planner, so it costs an indexed read of a small
+table rather than a pass over every edge. The alternative every integration writes is
+``MATCH (a)-[r]->(b)`` with a ``DISTINCT`` over the labels, which reads the whole graph to return a
+handful of rows.
+
+The catalog is only as current as the last gather, and ``auto_gather_graphmeta`` is off by default,
+so an empty answer means nobody has gathered rather than that the graph has no edges.
+"""
+
+GATHER_META = "select pg_catalog.regather_graphmeta()"
+"""Fill in the catalog :data:`TRIPLES_QUERY` reads.
+
+A write, and not a cheap one on a large graph, which is why nothing calls it without being asked.
+"""
+
+
+def property_sample_query(graph: str, label: str) -> str:
+    """What keys a label's elements carry, and what kind of value each holds.
+
+    Over a bounded sample rather than the whole label: the shape of a label is not a thing that
+    needs every row to establish, and reading every row of a label full of embeddings to find out
+    that one of its keys holds an array is the difference between milliseconds and minutes.
+
+    ``jsonb_typeof`` is built in. Three of the surveyed packages install a plpgsql function that
+    calls it and narrows ``number`` to integer or float; that narrowing is done here instead, so
+    nothing is created in the caller's database.
+    """
+    table = f"{quote_identifier(graph)}.{quote_identifier(label)}"
+    return (
+        f"select key, jsonb_typeof(value) as kind, "
+        f"count(*) filter (where jsonb_typeof(value) = 'number' "
+        f"and value::text like '%%.%%') as fractional, count(*) as seen "
+        f"from (select properties from {table} limit %s) sampled, "
+        f"jsonb_each(sampled.properties) "
+        f"group by key, kind order by key, kind"
+    )
+
+
+class Triple(NamedTuple):
+    """An edge label, and the labels it was found joining.
+
+    The count is not called ``count`` because a named tuple is a tuple, and a field of that name
+    would take the place of the method every tuple has.
+    """
+
+    start: str
+    edge: str
+    end: str
+    edge_count: int
+
+
+class PropertyShape(NamedTuple):
+    """A property of a label, and what was found in it.
+
+    ``declared`` says the property has a column of its own, which makes ``kind`` exact. Otherwise
+    it was read from a sample and describes what that sample held.
+    """
+
+    name: str
+    kind: str
+    declared: bool
+
+
+class GraphDescription(NamedTuple):
+    """What is in a graph, in the shape a prompt or a schema browser wants.
+
+    ``meta_gathered`` is false when the catalog behind :attr:`triples` has never been filled, which
+    is its state on a new server. The triples are empty in that case rather than wrong, and asking
+    for them again with ``refresh`` is what fills it.
+    """
+
+    graph: str
+    labels: tuple[Label, ...]
+    properties: dict[str, tuple[PropertyShape, ...]]
+    triples: tuple[Triple, ...]
+    counts: dict[str, int]
+    meta_gathered: bool
+
+
+def describe_kind(kind: str, fractional: int) -> str:
+    """The name for a JSON type, with a number split by whether any was not whole.
+
+    A caller writing a prompt wants to know an integer from a float, and JSON does not distinguish
+    them: both are ``number``.
+    """
+    if kind != "number":
+        return kind
+    return "float" if fractional else "integer"
