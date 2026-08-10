@@ -32,9 +32,10 @@ __all__ = [
     "GRAPHS_QUERY",
     "INDEXES_QUERY",
     "LABELS_QUERY",
+    "META_FLAG_QUERY",
+    "META_VALID_QUERY",
     "PROMOTION_CATALOG_QUERY",
     "SERVER_PROGRAM_QUERY",
-    "META_VALID_QUERY",
     "TRIPLES_QUERY",
     "Check",
     "Constraint",
@@ -723,6 +724,19 @@ META_VALID_QUERY = """
 select g.graphmeta_valid
 from pg_catalog.ag_graph g
 where g.graphname = %s
+"""
+
+META_FLAG_QUERY = """
+select count(*) > 0
+from pg_catalog.pg_attribute
+where attrelid = 'pg_catalog.ag_graph'::regclass and attname = 'graphmeta_valid'
+"""
+"""Whether this server records that the triple catalog is current.
+
+The flag arrived with 2.18. Asked of the catalog rather than of the version, for the same reason
+:data:`PROMOTION_CATALOG_QUERY` is: a development build may report a version whose columns it does
+not have. Where there is no flag, whether a gather has happened cannot be established, and the
+question has to be answered from what the catalog holds instead.
 """
 """Whether the triple catalog still describes this graph.
 

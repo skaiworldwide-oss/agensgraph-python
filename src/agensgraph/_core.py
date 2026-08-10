@@ -145,6 +145,12 @@ class GraphMixin:
     pgconn: PGconn
 
     _agens_capabilities: Capabilities | None = None
+    _agens_has_meta_flag: bool | None = None
+    """Whether this server records that a graph's triple catalog is current.
+
+    Asked once and kept, since a server does not grow a catalog column while a connection is open.
+    """
+
     _agens_can_run_programs: bool | None = None
     """Whether this role could run a command on the server's host through ``COPY``.
 

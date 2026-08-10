@@ -42,6 +42,8 @@ from .bulk import (
     edge_copy_statement,
     edge_rows,
     identity_map_statement,
+    key_spellings,
+    keyed_identity_query,
     overlap_update_statement,
     split_by_what_exists,
     vertex_copy_statement,
@@ -66,6 +68,7 @@ from .introspect import (
     INDEXES_FOR_LABEL,
     INDEXES_QUERY,
     LABELS_QUERY,
+    META_FLAG_QUERY,
     META_VALID_QUERY,
     PROMOTION_CATALOG_QUERY,
     SERVER_PROGRAM_QUERY,
@@ -639,13 +642,19 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
             )
         name = self._graph_of(graph)
         material = list(rows)
-        if require_unique and not await self._key_is_unique(label, key, graph=name):
+        indexed = await self._key_is_unique(label, key, graph=name)
+        if require_unique and not indexed:
             raise ValueError(
                 f"nothing makes {key!r} unique on {label!r}, so two writers merging on it would "
                 f"each create an element rather than find one. Add a unique property index or a "
                 f"uniqueness constraint, or pass require_unique=False to accept the hazard"
             )
-        known = await self.identity_map(label, key, graph=name)
+        if indexed:
+            known = await self._identity_of(label, key, material, graph=name)
+        else:
+            # Nothing to look a key up by, so a lookup would read the label once per key. The
+            # whole map at once is the cheaper of the two.
+            known = await self.identity_map(label, key, graph=name)
         fresh, updates = split_by_what_exists(material, key, known)
         inserted = await self.load_vertices(label, fresh, graph=name) if fresh else 0
         updated = 0
@@ -653,6 +662,38 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
             await self._run_with(overlap_update_statement(label), (Jsonb(updates),))
             updated = len(updates)
         return UpsertCounts(inserted, updated)
+
+    async def _identity_of(
+        self, label: str, key: str, rows: Sequence[Mapping[str, Any]], *, graph: str
+    ) -> dict[str, GraphId]:
+        """The identities of the keys in these rows, asked for by name.
+
+        Reading the whole label instead costs the same whatever the batch, and it costs the
+        property map of every element: one column holds them all, so extracting one key
+        reassembles the lot. On 30,000 elements each carrying a 1536-dimension embedding that is
+        90,000 buffers and a second, per call, against a few hundred buffers here.
+
+        Every key is asked for in both of its spellings, so the answer is the same one the whole
+        label would have given -- see :func:`~agensgraph.bulk.key_spellings`.
+        """
+        asked = [
+            form for row in rows if row.get(key) is not None for form in key_spellings(row[key])
+        ]
+        if not asked:
+            return {}
+        # The planner is not able to choose this. It costs a sequential scan from the heap's page
+        # count, and a label whose maps are large has few heap pages and an enormous TOAST table
+        # that the cost model does not see: measured, it took the scan at every batch size, from
+        # ten keys to twice the label, and was between 2 and 1800 times slower for it. Turning the
+        # scan off is a preference rather than a prohibition, so a label with nothing to look a key
+        # up by still answers.
+        previous = (await self._fetch("show enable_seqscan", ()))[0][0]
+        await self._run("set enable_seqscan = off")
+        try:
+            rows_found = await self._fetch(keyed_identity_query(label, key), (Jsonb(asked),))
+        finally:
+            await self._run(f"set enable_seqscan = {'on' if previous == 'on' else 'off'}")
+        return build_identity_map(rows_found, label=label, key=key)
 
     async def _key_is_unique(self, label: str, key: str, *, graph: str) -> bool:
         """Whether anything on the server keeps one element per value of this property.
@@ -871,9 +912,30 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
         ``regather_graphmeta()`` sets the flag, a transaction that wrote to the graph clears it
         at commit, and a read leaves it alone. So this separates a catalog nobody has gathered
         from one that is current and from one that was gathered and has since been written to.
+
+        The flag arrived with 2.18. Before it, those three cannot be told apart, and the answer
+        comes from what the catalog holds: triples for a graph that has edges is as much as can be
+        established, and a graph with no edges has nothing to gather.
         """
-        rows = await self._fetch(META_VALID_QUERY, (self._graph_of(graph),))
-        return bool(rows) and bool(rows[0][0])
+        name = self._graph_of(graph)
+        if await self._has_meta_flag():
+            rows = await self._fetch(META_VALID_QUERY, (name,))
+            return bool(rows) and bool(rows[0][0])
+        triples = await self._fetch(TRIPLES_QUERY, (name,))
+        if triples:
+            return True
+        counts = await self.element_counts(graph=name)
+        labels = await self.labels(graph=name)
+        return sum(counts.get(label.name, 0) for label in labels if label.is_edge) == 0
+
+    async def _has_meta_flag(self) -> bool:
+        """Whether this server records whether the triple catalog is current. Asked once."""
+        held = self._agens_has_meta_flag
+        if held is None:
+            rows = await self._fetch(META_FLAG_QUERY, ())
+            held = bool(rows[0][0])
+            self._agens_has_meta_flag = held
+        return held
 
     async def declared_properties(
         self, label: str | None = None, *, graph: str | None = None
