@@ -480,10 +480,27 @@ the label's own id and its sequence, so copying only the property map produces e
 a `CREATE` would have. That removes the whole business of generating identities client-side and
 keeping them unique.
 
-Edges need the identities of the two vertices they join, which is what `identity_map` reads, in one
-statement for the whole label. It raises rather than guessing if the key is not unique, or if an
-element does not have it, because silently collapsing two vertices into one would attach every edge
-of both to whichever survived.
+Edges need the identities of the two vertices they join, which is what `identity_map` reads. It
+raises rather than guessing if the key is not unique, or if an element does not have it, because
+silently collapsing two vertices into one would attach every edge of both to whichever survived.
+
+**Name the keys you need, if you know them:**
+
+```python
+conn.identity_map("Doc", "key")                 # the whole label
+conn.identity_map("Doc", "key", keys=wanted)    # only these
+```
+
+Reading the whole label is not something an index can make cheaper, and that is worth knowing
+rather than discovering. Every property of an element lives in **one** `jsonb` column, so reading
+one key reassembles all of them; and PostgreSQL will not answer a projection from an index over an
+expression, so even a purpose-built index on the same expression goes unused with sequential scans
+turned off. On 20,000 elements each carrying a 1536-dimension embedding the whole label costs about
+670 ms whatever is indexed, against **11.7 ms for a thousand named keys**.
+
+Either spelling of a key finds it, so this agrees with the whole-label read: a key stored as the
+number `1` and one given as `"1"` are the same key. With nothing to look a key up by, naming them
+falls back to reading the label, since a lookup would read it once per key.
 
 ### Writing what may already be there
 

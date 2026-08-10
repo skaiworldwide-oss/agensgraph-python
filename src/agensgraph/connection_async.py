@@ -36,6 +36,7 @@ from ._core import (
 from ._protocol.labels import CURRENT_GRAPH_QUERY, LabelCache
 from .bulk import (
     EDGE_COLUMN_TYPES,
+    PROMOTED_KEY_TYPES,
     VERTEX_COLUMN_TYPES,
     UpsertCounts,
     build_identity_map,
@@ -45,6 +46,7 @@ from .bulk import (
     key_spellings,
     keyed_identity_query,
     overlap_update_statement,
+    promoted_identity_map_statement,
     split_by_what_exists,
     vertex_copy_statement,
     vertex_rows,
@@ -649,12 +651,12 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
                 f"each create an element rather than find one. Add a unique property index or a "
                 f"uniqueness constraint, or pass require_unique=False to accept the hazard"
             )
-        if indexed:
-            known = await self._identity_of(label, key, material, graph=name)
-        else:
-            # Nothing to look a key up by, so a lookup would read the label once per key. The
-            # whole map at once is the cheaper of the two.
-            known = await self.identity_map(label, key, graph=name)
+        # Named keys, so the read follows the batch rather than the label. Without something to
+        # look a key up by this falls back to the whole label, since a lookup would read it once
+        # per key.
+        known = await self.identity_map(
+            label, key, keys=[row.get(key) for row in material], graph=name
+        )
         fresh, updates = split_by_what_exists(material, key, known)
         inserted = await self.load_vertices(label, fresh, graph=name) if fresh else 0
         updated = 0
@@ -662,38 +664,6 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
             await self._run_with(overlap_update_statement(label), (Jsonb(updates),))
             updated = len(updates)
         return UpsertCounts(inserted, updated)
-
-    async def _identity_of(
-        self, label: str, key: str, rows: Sequence[Mapping[str, Any]], *, graph: str
-    ) -> dict[str, GraphId]:
-        """The identities of the keys in these rows, asked for by name.
-
-        The alternative, reading the whole label's map, costs the same whatever the batch is, and
-        costs the property map of every element with it: one column holds them all, so extracting
-        one key reassembles the lot. On 30,000 elements each carrying a 1536-dimension embedding
-        that is 90,000 buffers and a second, per call, against a few hundred buffers here.
-
-        Every key is asked for in both of its spellings, so the answer is the same one the whole
-        label would have given -- see :func:`~agensgraph.bulk.key_spellings`.
-        """
-        asked = [
-            form for row in rows if row.get(key) is not None for form in key_spellings(row[key])
-        ]
-        if not asked:
-            return {}
-        # The planner is not able to choose this. It costs a sequential scan from the heap's page
-        # count, and a label whose maps are large has few heap pages and an enormous TOAST table
-        # that the cost model does not see. So it takes the scan at every batch size, from ten keys
-        # to twice the label, and is between 2 and 1800 times slower for it. Turning the scan off is
-        # a preference rather than a prohibition, so a label with nothing to look a key up by still
-        # answers.
-        previous = (await self._fetch("show enable_seqscan", ()))[0][0]
-        await self._run("set enable_seqscan = off")
-        try:
-            rows_found = await self._fetch(keyed_identity_query(label, key), (Jsonb(asked),))
-        finally:
-            await self._run(f"set enable_seqscan = {'on' if previous == 'on' else 'off'}")
-        return build_identity_map(rows_found, label=label, key=key)
 
     async def _key_is_unique(self, label: str, key: str, *, graph: str) -> bool:
         """Whether anything on the server keeps one element per value of this property.
@@ -795,20 +765,84 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
             return max(cursor.rowcount, 0)
 
     async def identity_map(
-        self, label: str, key: str, *, graph: str | None = None
+        self,
+        label: str,
+        key: str,
+        *,
+        keys: Iterable[Any] | None = None,
+        graph: str | None = None,
     ) -> dict[str, GraphId]:
         """What the server called each element of a label, keyed by one of its properties.
 
-        One statement for the whole label. The key is read as text on both sides, because a key
-        that is a number in one place and a string in the other would otherwise match nothing.
+        The key is read as text on both sides, because a key that is a number in one place and a
+        string in the other would otherwise match nothing.
 
         The key has to identify an element, and it is refused if it does not. A map is what
         :meth:`load_edges` resolves an endpoint through, so an element sharing its key with
         another, or holding no key at all, is not a smaller map -- it is edges attached to the
         wrong vertex, or to none.
+
+        **Name the keys you need, if you know them.** With ``keys`` given, only those are looked
+        up, and the cost follows how many you asked for. Without it the whole label is read, and
+        that is not a thing an index can make cheaper: every property of an element lives in one
+        column, so reading one key reassembles all of them, and PostgreSQL will not answer a
+        projection from an index over an expression -- verified, a purpose-built index on the same
+        expression is not used even with sequential scans turned off. On 20,000 elements each
+        carrying a 1536-dimension embedding the whole label costs 631 milliseconds and 60,000
+        buffers, whatever is indexed.
+
+        Two things make it cheap anyway. A key with a column of its own is read from the column,
+        which touches no property map: 3 milliseconds for the same 20,000. And ``keys`` turns the
+        read into one index lookup per key.
         """
         name = self._graph_of(graph)
-        rows = await self._fetch(identity_map_statement(name, label), (key,))
+        if keys is not None and await self._key_is_unique(label, key, graph=name):
+            return await self._identity_of_keys(label, key, keys, graph=name)
+        column = await self._promoted_key_column(label, key, graph=name)
+        if column is not None:
+            rows = await self._fetch(promoted_identity_map_statement(name, label, key), ())
+        else:
+            rows = await self._fetch(identity_map_statement(name, label), (key,))
+        return build_identity_map(rows, label=label, key=key)
+
+    async def _promoted_key_column(self, label: str, key: str, *, graph: str) -> str | None:
+        """The type of this key's own column, where it has one whose text reading matches the map.
+
+        A promoted key sits beside the property map rather than inside it, so reading it detoasts
+        nothing. Only a type that reads back as the map would is used: a boolean gives Python's
+        ``True`` where the map gives ``true``, and a key that changed its spelling would find a
+        different element.
+        """
+        if not await self.can_promote_properties():
+            return None
+        for declared in await self.declared_properties(label, graph=graph):
+            if declared.name == key:
+                return declared.type if declared.type in PROMOTED_KEY_TYPES else None
+        return None
+
+    async def _identity_of_keys(
+        self, label: str, key: str, values: Iterable[Any], *, graph: str
+    ) -> dict[str, GraphId]:
+        """The identities of the keys named, asked for one index lookup at a time.
+
+        Every key is asked for in both of its spellings, so the answer is the one the whole label
+        would have given -- see :func:`~agensgraph.bulk.key_spellings`.
+        """
+        asked = [form for value in values if value is not None for form in key_spellings(value)]
+        if not asked:
+            return {}
+        # The planner is not able to choose this. It costs a sequential scan from the heap's page
+        # count, and a label whose maps are large has few heap pages and an enormous TOAST table
+        # that the cost model does not see. So it takes the scan at every batch size, from ten keys
+        # to twice the label, and is between 2 and 1800 times slower for it. Turning the scan off is
+        # a preference rather than a prohibition, so a label with nothing to look a key up by still
+        # answers.
+        previous = (await self._fetch("show enable_seqscan", ()))[0][0]
+        await self._run("set enable_seqscan = off")
+        try:
+            rows = await self._fetch(keyed_identity_query(label, key), (Jsonb(asked),))
+        finally:
+            await self._run(f"set enable_seqscan = {'on' if previous == 'on' else 'off'}")
         return build_identity_map(rows, label=label, key=key)
 
     # -- reading what is in the database -----------------------------------------------

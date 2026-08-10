@@ -152,6 +152,124 @@ class TestLoadingEdges:
         assert len(path) == 5
 
 
+class TestNamingTheKeysWanted:
+    """The whole label is not a thing an index can make cheaper.
+
+    Every property of an element lives in one column, so reading one key reassembles all of them,
+    and PostgreSQL will not answer a projection from an index over an expression -- a purpose-built
+    index on the same expression is not used even with sequential scans turned off. So the way to
+    make it cheap is to ask for fewer keys, or to give the key a column of its own.
+    """
+
+    @pytest.fixture
+    def keyed(self, agens):  # type: ignore[no-untyped-def]
+        agens.execute("create vlabel doc")
+        agens.execute("create unique property index on doc (k)")
+        agens.refresh_labels()
+        agens.load_vertices("doc", [{"k": f"k{i}", "pad": "x" * 200} for i in range(500)])
+        return agens
+
+    def test_naming_them_gives_the_same_identities(self, keyed) -> None:  # type: ignore[no-untyped-def]
+        whole = keyed.identity_map("doc", "k")
+        named = keyed.identity_map("doc", "k", keys=[f"k{i}" for i in range(50)])
+        assert len(named) == 50
+        assert all(whole[key] == identity for key, identity in named.items())
+
+    def test_a_key_that_is_not_there_is_simply_absent(self, keyed) -> None:  # type: ignore[no-untyped-def]
+        named = keyed.identity_map("doc", "k", keys=["k1", "nope"])
+        assert set(named) == {"k1"}
+
+    def test_naming_none_of_them_reads_nothing(self, keyed) -> None:  # type: ignore[no-untyped-def]
+        assert keyed.identity_map("doc", "k", keys=[]) == {}
+
+    def test_either_spelling_of_a_key_finds_it(self, keyed) -> None:  # type: ignore[no-untyped-def]
+        """The whole-label read compares text on both sides, so the named read has to as well."""
+        keyed.execute("create vlabel numbered")
+        keyed.execute("create unique property index on numbered (k)")
+        keyed.refresh_labels()
+        keyed.execute("create (:numbered {k: 5})")
+        assert set(keyed.identity_map("numbered", "k", keys=[5])) == {"5"}
+        assert set(keyed.identity_map("numbered", "k", keys=["5"])) == {"5"}
+
+    def test_with_nothing_to_look_a_key_up_by_the_label_is_read(self, agens) -> None:  # type: ignore[no-untyped-def]
+        """A lookup would read the label once per key, so the whole map is the cheaper of the two."""
+        agens.execute("create vlabel plain")
+        agens.refresh_labels()
+        agens.load_vertices("plain", [{"k": f"k{i}"} for i in range(10)])
+        named = agens.identity_map("plain", "k", keys=["k1"])
+        assert set(named) == {f"k{i}" for i in range(10)}, "the whole label came back"
+
+    def test_naming_them_beats_reading_the_label(self, keyed) -> None:  # type: ignore[no-untyped-def]
+        """Not a benchmark -- a floor. The whole read costs the same whatever is asked for."""
+        import time
+
+        keyed.load_vertices("doc", [{"k": f"m{i}", "pad": "x" * 400} for i in range(4000)])
+        wanted = [f"k{i}" for i in range(20)]
+        started = time.monotonic()
+        keyed.identity_map("doc", "k", keys=wanted)
+        named = time.monotonic() - started
+        started = time.monotonic()
+        keyed.identity_map("doc", "k")
+        whole = time.monotonic() - started
+        assert named < whole
+
+
+class TestAKeyWithAColumnOfItsOwn:
+    """A promoted key sits beside the property map rather than inside it, so reading it detoasts
+    nothing. The map it produces has to be the same one the map route gives."""
+
+    def test_the_column_is_read_rather_than_the_map(self, agens) -> None:  # type: ignore[no-untyped-def]
+        if not agens.can_promote_properties():
+            pytest.skip("this server cannot store a property in a column of its own")
+        agens.execute("create vlabel doc (k text generated)")
+        agens.refresh_labels()
+        agens.load_vertices("doc", [{"k": f"k{i}"} for i in range(20)])
+        sent: list[str] = []
+
+        def record(record_of) -> None:  # type: ignore[no-untyped-def]
+            sent.append(record_of.statement)
+
+        agensgraph.add_query_logger(record)
+        try:
+            found = agens.identity_map("doc", "k")
+        finally:
+            agensgraph.remove_query_logger(record)
+        assert len(found) == 20
+        assert not [text for text in sent if "properties ->>" in text], "the map was read"
+
+    def test_it_agrees_with_the_map_route(self, agens) -> None:  # type: ignore[no-untyped-def]
+        if not agens.can_promote_properties():
+            pytest.skip("this server cannot store a property in a column of its own")
+        agens.execute("create vlabel promoted (k text generated)")
+        agens.execute("create vlabel plain")
+        agens.refresh_labels()
+        rows = [{"k": f"k{i}"} for i in range(20)]
+        agens.load_vertices("promoted", rows)
+        agens.load_vertices("plain", rows)
+        assert set(agens.identity_map("promoted", "k")) == set(agens.identity_map("plain", "k"))
+
+    def test_a_boolean_column_is_not_read_that_way(self, agens) -> None:  # type: ignore[no-untyped-def]
+        """It reads back as Python's ``True`` where the map gives ``true``, so the key would
+        change spelling and find a different element."""
+        if not agens.can_promote_properties():
+            pytest.skip("this server cannot store a property in a column of its own")
+        agens.execute("create vlabel flagged (k boolean generated)")
+        agens.refresh_labels()
+        agens.execute("create (:flagged {k: true})")
+        sent: list[str] = []
+
+        def record(record_of) -> None:  # type: ignore[no-untyped-def]
+            sent.append(record_of.statement)
+
+        agensgraph.add_query_logger(record)
+        try:
+            found = agens.identity_map("flagged", "k")
+        finally:
+            agensgraph.remove_query_logger(record)
+        assert set(found) == {"true"}, "the spelling the map gives"
+        assert any("properties ->>" in text for text in sent)
+
+
 class TestItIsWorthDoing:
     def test_it_beats_a_statement_per_row(self, loaded) -> None:  # type: ignore[no-untyped-def]
         """Not a benchmark -- a floor, so a regression that makes it slower than the alternative

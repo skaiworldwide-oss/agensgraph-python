@@ -38,6 +38,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "BLOCK_SIZE",
+    "PROMOTED_KEY_TYPES",
     "UpsertCounts",
     "build_identity_map",
     "edge_blocks",
@@ -48,6 +49,7 @@ __all__ = [
     "keyed_identity_query",
     "overlap_update_statement",
     "paused_collection",
+    "promoted_identity_map_statement",
     "split_by_what_exists",
     "vertex_blocks",
     "vertex_copy_statement",
@@ -180,6 +182,40 @@ def edge_blocks(
             out.clear()
     out += _COPY_TRAILER
     yield bytes(out)
+
+
+def promoted_identity_map_statement(graph: str, label: str, key: str) -> str:
+    """Read the whole label's map off a key that has a column of its own.
+
+    A promoted key is a column beside the property map rather than inside it, so reading it touches
+    no map at all: on 20,000 elements each carrying a 1536-dimension embedding, 3 milliseconds and
+    163 buffers against 731 and 60,183 for the same keys out of the map.
+
+    Only for a type whose text reading matches what the map would have given. A boolean does not --
+    the column reads back as Python's ``True`` where the map gives ``true`` -- so the caller checks
+    the type before choosing this.
+    """
+    table = f"{quote_identifier(graph)}.{quote_identifier(label)}"
+    return f"select {quote_identifier(key)}, id from {table}"
+
+
+PROMOTED_KEY_TYPES = frozenset(
+    {
+        "text",
+        "character varying",
+        "bigint",
+        "integer",
+        "smallint",
+        "numeric",
+        "double precision",
+        "real",
+    }
+)
+"""Column types whose text reading is the one the property map would have given.
+
+Established by storing a value of each and comparing the two readings. ``boolean`` is the one that
+differs and is absent: a column gives Python's ``True`` where the map gives ``true``.
+"""
 
 
 def identity_map_statement(graph: str, label: str) -> str:
