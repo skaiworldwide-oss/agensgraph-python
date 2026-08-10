@@ -60,6 +60,7 @@ pip install "agensgraph-python[otel]"      # spans through opentelemetry-api
 **Writing**
 [What a write changed](#what-a-write-changed) ·
 [Bulk loading](#bulk-loading) ·
+[A key of its own](#give-an-ingest-key-a-column-of-its-own) ·
 [A burst of statements](#a-burst-of-statements)
 
 **Schema**
@@ -506,6 +507,42 @@ twenty-five shared keys, with only a plain index, produced **thirty-two elements
 keys** on a live server. With a unique index it produced twenty-five, raising `23505` and `40001`
 along the way, both of which are the expected path. `require_unique=False` accepts the hazard for a
 graph that cannot add one.
+
+The keys are looked up by name rather than read out of the label, so the cost follows the batch and
+not the graph. Both spellings of each key are asked for, because a key stored as the number `1` and
+one given as `"1"` are the same key here, and a lookup by property alone would treat them as two.
+
+### Give an ingest key a column of its own
+
+**If a label is written to more than once, declare its key as a promoted column.** This matters more
+than anything the driver does, and it is a schema decision rather than a driver setting:
+
+```python
+conn.execute("CREATE VLABEL doc (key text generated)")
+conn.execute("CREATE UNIQUE PROPERTY INDEX ON doc (key)")
+```
+
+All of a label's properties live in **one** `jsonb` column, so reading any single key reassembles
+the whole map. On a label whose elements carry a 1536-dimension embedding that is expensive out of
+proportion to the key: the heap is small and the TOAST table is enormous, and the planner cannot see
+the second one at all, so it will happily choose to scan.
+
+A promoted key is a separate column, so reading it never touches the map. Measured on 20,000
+elements each carrying a 1536-dimension embedding, reading every key:
+
+| | |
+|---|---|
+| from the property map | 731 ms, 60,183 buffers |
+| from a promoted column | **3 ms, 163 buffers** |
+
+It is also the only form that reaches an `Index Only Scan`. An index over a property in the map
+holds it as `jsonb` and the planner will not answer a projection from such an index, so even a
+perfectly matched index still visits the heap and still reassembles the map.
+
+Two things to know before promoting one. Adding the column to a label that already has elements
+rewrites the table, which reads every map once. And a whole-element read (`RETURN n`, or writing
+the element) still goes through the map by design, so promotion helps reads of *that key*, not
+everything.
 
 A frame goes in directly, without becoming Python objects on the way:
 
