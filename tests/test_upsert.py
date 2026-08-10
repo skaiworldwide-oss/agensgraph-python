@@ -135,6 +135,81 @@ class TestTheHazardTheUniqueKeyIsFor:
         assert made >= distinct, "which is the point: more elements than keys"
 
 
+class TestTheKeysAreAskedForByName:
+    """The identities come from a lookup, not from reading the label.
+
+    A property map is one column, so extracting one key from it reassembles the whole map. Reading
+    the label to find out which keys exist therefore costs the maps of every element whatever the
+    batch is, so a caller feeding a stream in batches would pay a full read for each of them.
+    """
+
+    def test_the_label_is_not_read_to_find_the_keys(self, docs) -> None:  # type: ignore[no-untyped-def]
+        """Asserted by what the driver sends, since the cost is invisible from the result."""
+        docs.upsert_vertices("doc", "k", [{"k": i} for i in range(20)])
+        sent: list[str] = []
+
+        def record(statement) -> None:  # type: ignore[no-untyped-def]
+            sent.append(statement.statement)
+
+        agensgraph.add_query_logger(record)
+        try:
+            docs.upsert_vertices("doc", "k", [{"k": 1}])
+        finally:
+            agensgraph.remove_query_logger(record)
+        read_whole_label = [text for text in sent if "properties ->>" in text]
+        assert not read_whole_label, f"the whole label was read: {read_whole_label}"
+        assert any("unwind" in text and "id(n)" in text for text in sent)
+
+    def test_a_key_stored_as_a_number_is_found_when_given_as_a_string(self, docs) -> None:  # type: ignore[no-untyped-def]
+        """The two routes have to agree, and the full read compares text on both sides.
+
+        This is the shape that breaks a naive lookup: load once from a source whose keys are
+        numbers, again from one whose keys are strings, and every key misses. Since a miss means
+        insert, every element would be written a second time -- and the unique index does not catch
+        it, because the index holds the property as jsonb, where the number ``7`` and the string
+        ``"7"`` are different values and so occupy different entries.
+        """
+        docs.upsert_vertices("doc", "k", [{"k": i} for i in range(30)])
+        again = docs.upsert_vertices("doc", "k", [{"k": str(i)} for i in range(30)])
+        assert again == (0, 0)
+        assert count(docs) == 30
+
+    def test_and_the_other_way_round(self, docs) -> None:  # type: ignore[no-untyped-def]
+        docs.upsert_vertices("doc", "k", [{"k": str(i)} for i in range(30)])
+        again = docs.upsert_vertices("doc", "k", [{"k": i} for i in range(30)])
+        assert again == (0, 0)
+        assert count(docs) == 30
+
+    def test_a_label_holding_both_spellings_is_still_ambiguous(self, docs) -> None:  # type: ignore[no-untyped-def]
+        """Two elements answer to one text key, so neither is the one to attach anything to."""
+        docs.execute("create (:doc {k: 7})")
+        docs.execute("create (:doc {k: '7'})")
+        with pytest.raises(ValueError, match="does not identify"):
+            docs.upsert_vertices("doc", "k", [{"k": 7}])
+
+    def test_a_key_that_is_not_there_is_written(self, docs) -> None:  # type: ignore[no-untyped-def]
+        docs.upsert_vertices("doc", "k", [{"k": "aa"}])
+        assert docs.upsert_vertices("doc", "k", [{"k": "aa"}, {"k": "bb"}]) == (1, 0)
+        assert count(docs) == 2
+
+    def test_a_label_with_nothing_to_look_a_key_up_by_reads_the_label(self, agens) -> None:  # type: ignore[no-untyped-def]
+        """A lookup with no index would read the label once per key, which is worse."""
+        agens.execute("create vlabel plain")
+        agens.refresh_labels()
+        agens.upsert_vertices("plain", "k", [{"k": 1}], require_unique=False)
+        sent: list[str] = []
+
+        def record(statement) -> None:  # type: ignore[no-untyped-def]
+            sent.append(statement.statement)
+
+        agensgraph.add_query_logger(record)
+        try:
+            agens.upsert_vertices("plain", "k", [{"k": 1}], require_unique=False)
+        finally:
+            agensgraph.remove_query_logger(record)
+        assert any("properties ->>" in text for text in sent)
+
+
 class TestItIsWorthDoing:
     def test_it_beats_a_merge_per_row(self, docs, agens) -> None:  # type: ignore[no-untyped-def]
         """Not a benchmark -- a floor, so a regression that makes it slower than the alternative
@@ -154,6 +229,25 @@ class TestItIsWorthDoing:
             docs.execute("merge (n:doc {k: %s}) set n.v = %s", (row["k"], row["v"]))
         one_at_a_time = time.monotonic() - started
         assert upserting < one_at_a_time
+
+    def test_the_cost_does_not_follow_the_label(self, docs) -> None:  # type: ignore[no-untyped-def]
+        """Not a benchmark -- a floor. Reading the label to find the keys costs the same whatever
+        the batch is, so ten small batches would cost ten reads of it. Asking by name does not."""
+        import time
+
+        docs.upsert_vertices("doc", "k", [{"k": i, "pad": "x" * 400} for i in range(4000)])
+        one = [{"k": 1}]
+        started = time.monotonic()
+        for _ in range(10):
+            docs.upsert_vertices("doc", "k", one)
+        ten_small = time.monotonic() - started
+
+        started = time.monotonic()
+        docs.identity_map("doc", "k")
+        one_full_read = time.monotonic() - started
+        assert ten_small < one_full_read * 10, (
+            "ten batches should not cost ten reads of the whole label"
+        )
 
 
 class TestTheAwaitingInterface:

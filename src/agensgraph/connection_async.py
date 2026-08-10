@@ -668,10 +668,10 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
     ) -> dict[str, GraphId]:
         """The identities of the keys in these rows, asked for by name.
 
-        Reading the whole label instead costs the same whatever the batch, and it costs the
-        property map of every element: one column holds them all, so extracting one key
-        reassembles the lot. On 30,000 elements each carrying a 1536-dimension embedding that is
-        90,000 buffers and a second, per call, against a few hundred buffers here.
+        The alternative, reading the whole label's map, costs the same whatever the batch is, and
+        costs the property map of every element with it: one column holds them all, so extracting
+        one key reassembles the lot. On 30,000 elements each carrying a 1536-dimension embedding
+        that is 90,000 buffers and a second, per call, against a few hundred buffers here.
 
         Every key is asked for in both of its spellings, so the answer is the same one the whole
         label would have given -- see :func:`~agensgraph.bulk.key_spellings`.
@@ -683,10 +683,10 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
             return {}
         # The planner is not able to choose this. It costs a sequential scan from the heap's page
         # count, and a label whose maps are large has few heap pages and an enormous TOAST table
-        # that the cost model does not see: measured, it took the scan at every batch size, from
-        # ten keys to twice the label, and was between 2 and 1800 times slower for it. Turning the
-        # scan off is a preference rather than a prohibition, so a label with nothing to look a key
-        # up by still answers.
+        # that the cost model does not see. So it takes the scan at every batch size, from ten keys
+        # to twice the label, and is between 2 and 1800 times slower for it. Turning the scan off is
+        # a preference rather than a prohibition, so a label with nothing to look a key up by still
+        # answers.
         previous = (await self._fetch("show enable_seqscan", ()))[0][0]
         await self._run("set enable_seqscan = off")
         try:

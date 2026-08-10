@@ -44,6 +44,8 @@ __all__ = [
     "edge_copy_statement",
     "freeze_after_import",
     "identity_map_statement",
+    "key_spellings",
+    "keyed_identity_query",
     "overlap_update_statement",
     "paused_collection",
     "split_by_what_exists",
@@ -294,3 +296,53 @@ def split_by_what_exists(
         else:
             updates.append({"id": str(found), "props": dict(row)})
     return fresh, updates
+
+
+def key_spellings(value: Any) -> list[Any]:
+    """Every JSON form of a key that the text reading of a property would match.
+
+    The full read compares text on both sides: the server extracts the property with ``->>``,
+    which renders a number and a string alike, and the caller's value goes through ``str``. So a
+    key stored as the number ``1`` and one given as ``"1"`` are the same key.
+
+    A lookup by property compares JSON to JSON, where they are not. Asking for both forms is what
+    keeps the two routes agreeing, and it costs one more index probe per key rather than a pass
+    over the label.
+    """
+    text = str(value)
+    forms: list[Any] = [text]
+    number = _as_number(text)
+    if number is not None:
+        forms.append(number)
+    return forms
+
+
+def _as_number(text: str) -> int | float | None:
+    """The number this text stands for, if a number renders back to exactly this text."""
+    try:
+        whole = int(text)
+    except ValueError:
+        pass
+    else:
+        return whole if str(whole) == text else None
+    try:
+        fractional = float(text)
+    except ValueError:
+        return None
+    return fractional if str(fractional) == text else None
+
+
+def keyed_identity_query(label: str, key: str) -> str:
+    """Read the identity of named elements, without reading a property of any of them.
+
+    ``k`` comes back rather than the stored property, and that is the point: a property map is one
+    column, so reading any key out of it reassembles the whole map, TOAST and all. Handing back the
+    key that was asked for needs the index and the identity, and touches no map at all. On a label
+    of 30,000 elements each carrying a 1536-dimension embedding, that is the difference between
+    90,000 buffers and a few hundred.
+    """
+    return (
+        f"unwind %s::jsonb as k "
+        f"match (n:{quote_identifier(label)} {{{quote_identifier(key)}: k}}) "
+        f"return k, id(n)"
+    )

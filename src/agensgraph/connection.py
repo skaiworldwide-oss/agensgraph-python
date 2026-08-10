@@ -609,10 +609,10 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
     ) -> dict[str, GraphId]:
         """The identities of the keys in these rows, asked for by name.
 
-        Reading the whole label instead costs the same whatever the batch, and it costs the
-        property map of every element: one column holds them all, so extracting one key
-        reassembles the lot. On 30,000 elements each carrying a 1536-dimension embedding that is
-        90,000 buffers and a second, per call, against a few hundred buffers here.
+        The alternative, reading the whole label's map, costs the same whatever the batch is, and
+        costs the property map of every element with it: one column holds them all, so extracting
+        one key reassembles the lot. On 30,000 elements each carrying a 1536-dimension embedding
+        that is 90,000 buffers and a second, per call, against a few hundred buffers here.
 
         Every key is asked for in both of its spellings, so the answer is the same one the whole
         label would have given -- see :func:`~agensgraph.bulk.key_spellings`.
