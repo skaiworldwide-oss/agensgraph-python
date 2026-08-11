@@ -928,9 +928,6 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
             for key, kind in declared.get(label, {}).items():
                 found[key] = PropertyShape(key, kind, True)
             properties[label] = tuple(found[key] for key in sorted(found))
-        # No triples and no edges agree with each other; no triples where edges exist means the
-        # catalog has not been gathered, which is a different thing to report.
-        edges = sum(counts.get(label.name, 0) for label in labels if label.is_edge)
         return GraphDescription(
             graph=name,
             labels=tuple(labels),

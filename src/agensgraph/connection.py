@@ -856,7 +856,6 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
             for key, kind in declared.get(label, {}).items():
                 found[key] = PropertyShape(key, kind, True)
             properties[label] = tuple(found[key] for key in sorted(found))
-        edges = sum(counts.get(label.name, 0) for label in labels if label.is_edge)
         return GraphDescription(
             graph=name,
             labels=tuple(labels),
