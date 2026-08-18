@@ -7,6 +7,7 @@ helper says so rather than passing the misattribution on.
 
 from __future__ import annotations
 
+import psycopg
 import pytest
 import pytest_asyncio
 
@@ -159,6 +160,48 @@ class TestReadingTheAnswersBack:
             loaded.pipeline_query(asked)
             pipelined += time.monotonic() - started
         assert pipelined < singly
+
+
+class TestTheFallbackInsideATransaction:
+    """The fallback re-runs the statements singly, and that cannot happen in an aborted one.
+
+    A pipeline blames the wrong statement, so the right one is found by asking again. Inside a
+    transaction the failure has aborted it, so every one of those answers was `25P02` and the real
+    error was lost -- and `describe()` goes through here, so it was reachable without asking for a
+    pipeline at all. The batch runs inside a savepoint now, which the failure rolls back.
+    """
+
+    GOOD = "match (n:doc) return n.n limit 1"
+    BAD = "match (n:doc) return n.nonexistent_function_zzz(1)"
+
+    @pytest.mark.parametrize("autocommit", [True, False])
+    def test_the_statement_that_failed_is_the_one_reported(
+        self, agens, autocommit: bool
+    ) -> None:  # type: ignore[no-untyped-def]
+        agens.execute("create vlabel doc")
+        agens.execute("create (:doc {n: 1})")
+        agens.autocommit = autocommit
+        with pytest.raises(psycopg.Error) as caught:
+            agens.pipeline_query([self.GOOD, self.BAD, self.GOOD])
+        assert caught.value.sqlstate == "42601", "not 25P02 from a transaction it had aborted"
+
+    def test_and_the_transaction_is_usable_again_after_a_rollback(self, agens) -> None:  # type: ignore[no-untyped-def]
+        agens.execute("create vlabel doc")
+        agens.execute("create (:doc {n: 1})")
+        agens.autocommit = False
+        with pytest.raises(psycopg.Error):
+            agens.pipeline_query([self.GOOD, self.BAD])
+        agens.rollback()
+        assert len(agens.pipeline_query([self.GOOD] * 5)) == 5
+
+    @pytest.mark.parametrize("autocommit", [True, False])
+    def test_a_batch_with_nothing_wrong_is_unaffected(self, agens, autocommit: bool) -> None:  # type: ignore[no-untyped-def]
+        agens.execute("create vlabel doc")
+        agens.execute("create (:doc {n: 1})")
+        agens.autocommit = autocommit
+        results = agens.pipeline_query([self.GOOD] * 300)
+        assert len(results) == 300
+        assert results[0].records == [(1,)]
 
 
 class TestTheAwaitingInterface:

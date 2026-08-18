@@ -45,6 +45,7 @@ __all__ = [
     "GraphMixin",
     "Result",
     "Statement",
+    "savepoint_name",
     "stream_name",
 ]
 
@@ -100,6 +101,7 @@ connection that is busy sending, where too small a value would end a healthy one
 
 
 _stream_numbers = count(1)
+_savepoint_numbers = count(1)
 
 
 def stream_name() -> str:
@@ -109,6 +111,15 @@ def stream_name() -> str:
     which takes down the stream that was already reading, not only the one that failed.
     """
     return f"agens_stream_{next(_stream_numbers)}"
+
+
+def savepoint_name() -> str:
+    """A name no other savepoint this driver takes is using.
+
+    Generated rather than fixed so that one taken inside another, which a caller nesting these
+    would produce, releases the one it took and not the one around it.
+    """
+    return f"agens_batch_{next(_savepoint_numbers)}"
 
 
 def with_keepalives(kwargs: dict[str, Any], conninfo: str = "") -> dict[str, Any]:

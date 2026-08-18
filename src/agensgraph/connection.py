@@ -33,6 +33,7 @@ from ._core import (
     GRAPH_ADAPTERS,
     GraphMixin,
     Result,
+    savepoint_name,
     statement_text,
     stream_name,
     with_keepalives,
@@ -1018,26 +1019,53 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
         results: list[Result] = []
         for start in range(0, len(sent), chunk):
             batch = sent[start : start + chunk]
+            mark = savepoint_name() if self._can_hold_a_savepoint() else None
             try:
-                results.extend(self._pipelined(batch))
+                results.extend(self._pipelined(batch, savepoint=mark))
             except psycopg.Error:
+                if mark is not None:
+                    self._run(f"rollback to savepoint {mark}")
+                    self._run(f"release savepoint {mark}")
                 for statement, params in batch:
                     results.append(self.execute_query(statement, params))
         return results
 
-    def _pipelined(self, batch: Sequence[tuple[str, Params | None]]) -> list[Result]:
+    def _can_hold_a_savepoint(self) -> bool:
+        """Whether a savepoint can be taken here at all.
+
+        A transaction the server has already aborted takes no savepoint -- asking for one is
+        itself refused -- and a connection in autocommit with nothing open needs none, since a
+        failure there aborts nothing to undo. Both are left to fail and be asked again, which for
+        the aborted one reports the abort, correctly, as the reason.
+        """
+        status = self.pgconn.transaction_status
+        if status == TransactionStatus.IDLE:
+            return not self.autocommit
+        return status == TransactionStatus.INTRANS
+
+    def _pipelined(
+        self, batch: Sequence[tuple[str, Params | None]], *, savepoint: str | None = None
+    ) -> list[Result]:
         """One pipeline's worth, every cursor read back in the order it was filled.
 
         The reading follows the pipeline rather than sitting inside it. While it is open the
         statements have been sent and not answered, so a cursor describes no columns and reading
         one gives an empty result rather than the rows.
+
+        A *savepoint* is taken and released here rather than around this, so that both go in the
+        pipeline with the batch and neither costs a round trip of its own. A failure leaves the
+        release unrun, which is what leaves the savepoint there to roll back to.
         """
         cursors = []
         with self.pipeline():
+            if savepoint is not None:
+                self._run(f"savepoint {savepoint}")
             for statement, params in batch:
                 cursor = self.cursor()
                 cursor.execute(statement, params)
                 cursors.append(cursor)
+            if savepoint is not None:
+                self._run(f"release savepoint {savepoint}")
         gathered = []
         for cursor in cursors:
             described = cursor.description
