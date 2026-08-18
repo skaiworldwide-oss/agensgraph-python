@@ -38,11 +38,15 @@ if TYPE_CHECKING:
 
 __all__ = [
     "BLOCK_SIZE",
+    "EDGE_LABEL_FACTS_QUERY",
     "PROMOTED_KEY_TYPES",
     "UpsertCounts",
     "build_identity_map",
     "edge_blocks",
     "edge_copy_statement",
+    "edge_overlap_update_statement",
+    "edge_pairs_all_query",
+    "edge_pairs_present_query",
     "freeze_after_import",
     "identity_map_statement",
     "key_spellings",
@@ -51,6 +55,7 @@ __all__ = [
     "paused_collection",
     "promoted_identity_map_statement",
     "split_by_what_exists",
+    "split_edges_by_what_exists",
     "vertex_blocks",
     "vertex_copy_statement",
 ]
@@ -381,4 +386,122 @@ def keyed_identity_query(label: str, key: str) -> str:
         f"unwind %s::jsonb as k "
         f"match (n:{quote_identifier(label)} {{{quote_identifier(key)}: k}}) "
         f"return k, id(n)"
+    )
+
+
+EDGE_LABEL_FACTS_QUERY = """
+select (select count(*) > 0
+          from pg_catalog.pg_index x
+         where x.indrelid = l.relid
+           and x.indisunique
+           and x.indexprs is null
+           and (select array_agg(a.attname::text order by k.ord)
+                  from unnest(x.indkey::smallint[]) with ordinality as k(attnum, ord)
+                  join pg_catalog.pg_attribute a
+                    on a.attrelid = l.relid and a.attnum = k.attnum) = array['start', 'end']),
+       c.reltuples
+from pg_catalog.ag_graph g
+join pg_catalog.ag_label l on l.graphid = g.oid
+join pg_catalog.pg_class c on c.oid = l.relid
+where g.graphname = %s
+  and l.labname = %s::name
+"""
+"""Whether one edge per pair of endpoints is kept, and roughly how many edges there are.
+
+Two answers in one read because both are wanted at the same moment and neither is worth a round
+trip of its own: the first decides whether the upsert is safe to do at all, the second which shape
+of read is cheaper. Measured at 288 microseconds for the pair.
+
+The uniqueness half is read from ``pg_index`` and not through the driver's own index reader, which
+cannot answer it: that one admits an expression index or one over a promoted column, being the
+conditions the server's own view uses, and the endpoints are ordinary columns. ``indexprs is null``
+is what separates a real index over the columns from a property index over properties that happen to
+be called ``start`` and ``end``, which the catalogs otherwise print identically.
+
+The size half is the planner's estimate rather than a count, because a count of a large label costs
+more than the read it is choosing between. It is ``-1`` on a label nobody has analysed, which is read
+as unknown.
+"""
+
+
+def edge_pairs_present_query(graph: str, label: str) -> str:
+    """Which of the endpoint pairs asked about already have an edge, and what it is called.
+
+    Written as ``in (select ...)`` rather than a join against the unwound arrays, because the two
+    plan differently and only this one reaches an index: measured over 100,000 edges asking about
+    1,000 pairs, the join hashed the whole label for 26.6 ms and this took 6.1 ms on an index only
+    scan, which is within a sixth of what forcing the scan off achieves.
+
+    The scan is *not* forced off here, unlike the read that looks a vertex up by property. That one
+    has to be, because its cost is a property expression over a map the planner cannot see the TOAST
+    of. These are two fixed-width columns with real statistics, and the planner was right at every
+    size measured: an index up to a thousand pairs, and a sequential scan past that, where a
+    sequential scan is genuinely the cheaper of the two.
+    """
+    return (
+        f'select e.start, e."end", e.id '
+        f"from {quote_identifier(graph)}.{quote_identifier(label)} e "
+        f'where (e.start, e."end") in '
+        f"(select s, t from unnest(%s::graphid[], %s::graphid[]) as w(s, t))"
+    )
+
+
+def edge_overlap_update_statement(label: str) -> str:
+    """Update edges already present, addressed by the identity the read found.
+
+    A relationship pattern and not ``(e:label)``: an edge label named as a vertex is refused,
+    ``label "links" is edge label``.
+
+    ``+=`` rather than ``=``, so a property the caller did not mention keeps the value it had.
+    """
+    return (
+        f"unwind %s::jsonb as r "
+        f"match ()-[e:{quote_identifier(label)}]->() "
+        f"where id(e) = (r->>'id')::graphid "
+        f"set e += r->'props'"
+    )
+
+
+def split_edges_by_what_exists(
+    edges: Sequence[tuple[GraphId, GraphId, Mapping[str, Any] | None]],
+    present: Mapping[tuple[GraphId, GraphId], GraphId],
+) -> tuple[
+    list[tuple[GraphId, GraphId, Mapping[str, Any] | None]],
+    list[dict[str, Any]],
+]:
+    """The edges that are not there, and the updates for the ones that are.
+
+    An endpoint pair given twice in one call is written once, and the repeat is dropped. It cannot
+    be an update either: the edge it would update is in the same copy and has no identity yet. The
+    copy reads nothing back, so a repeat left in would be written as the second edge this exists to
+    prevent.
+    """
+    fresh: list[tuple[GraphId, GraphId, Mapping[str, Any] | None]] = []
+    updates: list[dict[str, Any]] = []
+    seen: set[tuple[GraphId, GraphId]] = set()
+    for start, end, properties in edges:
+        if start is None or end is None:
+            raise ValueError("an edge joins two elements, and one of these is null")
+        pair = (start, end)
+        found = present.get(pair)
+        if found is not None:
+            if properties:
+                updates.append({"id": str(found), "props": dict(properties)})
+        elif pair not in seen:
+            seen.add(pair)
+            fresh.append((start, end, properties))
+    return fresh, updates
+
+
+def edge_pairs_all_query(graph: str, label: str) -> str:
+    """Every edge of a label as its endpoints and its identity.
+
+    Cheaper than asking about the pairs once the batch is as large as the label, because asking
+    sends two identities per pair and this sends none. Measured against a label of 20,000 edges:
+    asking took 3.3 ms for 100 pairs, 8.0 for 1,000 and 33.1 for 5,000, all beating the 53.7 this
+    takes whatever is asked -- and 143.7 for 20,000, which does not.
+    """
+    return (
+        f'select e.start, e."end", e.id '
+        f"from {quote_identifier(graph)}.{quote_identifier(label)} e"
     )

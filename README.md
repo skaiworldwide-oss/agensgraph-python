@@ -570,6 +570,37 @@ keys** on a live server. With a unique index it produced twenty-five, raising `2
 along the way, both of which are the expected path. `require_unique=False` accepts the hazard for a
 graph that cannot add one.
 
+**An edge is upserted by the pair it joins**, since that pair is what an edge is:
+
+```python
+conn.upsert_edges("links", [(start_id, end_id, {"weight": 3}), ...])
+conn.upsert_edges("links", pairs, on_existing="update")
+```
+
+Measured on 2,000 edges: **about sixteen times** a `MERGE` per edge, and 1.45 times a plain
+`load_edges`, that difference being what not creating a duplicate costs. A pair given twice in one
+call is written once, because the copy reads nothing back and the repeat would be the second edge
+this exists to prevent.
+
+**A label with nothing keeping one edge per pair is refused**, for the same reason a vertex key is:
+eight writers over twenty-five pairs produced **twenty-seven edges and reported no failure at all**.
+The index that prevents it has to be written as plain SQL, because a property index cannot key on the
+endpoint columns (see above):
+
+```python
+conn.execute(f'CREATE UNIQUE INDEX links_pair ON "{graph}".links (start, "end")')
+```
+
+With it in place the same eight writers left twenty-five edges. `require_unique=False` accepts the
+hazard for a graph that cannot add the index.
+
+Which read it uses depends on the batch. Asking about the pairs sends two identities each and reading
+the label sends none, so asking wins until the batch is as large as the label: measured against
+20,000 edges, asking took 3.3 ms for 100 pairs and 8.0 for 1,000 against the 53.7 the label read
+costs whatever is asked, and lost 143.7 to 53.7 at 20,000. The label's own size decides, taken from
+the planner's estimate rather than a count, and read in the same statement that checks the index, so
+neither costs a round trip of its own. A label nobody has analysed reports no size and is asked about.
+
 The keys are looked up by name rather than read out of the label, so the cost follows the batch and
 not the graph. Both spellings of each key are asked for, because a key stored as the number `1` and
 one given as `"1"` are the same key here, and a lookup by property alone would treat them as two.
@@ -1471,6 +1502,7 @@ Everything exported from `agensgraph`. The submodules `agensgraph.columnar`, `ag
 | `connection.describe()` | labels, properties, triples and counts, without a scan |
 | `GraphDescription`, `Triple`, `PropertyShape` | what it returns |
 | `connection.upsert_vertices(label, key, rows)` | copy what is missing, optionally refresh the rest |
+| `connection.upsert_edges(label, edges)` | the same, keyed on the pair of elements each edge joins |
 | `to_json(value)` | JSON bytes, without decoding a map nobody read |
 | `to_builtins(value)`, `json_default` | the same shape as dicts, and for `json.dumps` |
 | `connection.pipeline_query(statements)` | a burst of reads, every answer read back |

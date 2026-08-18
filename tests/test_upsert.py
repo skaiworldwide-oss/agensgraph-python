@@ -279,3 +279,151 @@ class TestTheAwaitingInterface:
         assert written == (0, 20)
         result = await conn.execute_query("match (n:doc) where n.v = 1 return count(*)")
         assert result.records[0][0] == 20
+
+
+@pytest.fixture
+def joined(agens):  # type: ignore[no-untyped-def]
+    """A graph with elements to join and an edge label, and the identities to join them by."""
+    agens.execute("create vlabel p")
+    agens.execute("create elabel links")
+    agens.refresh_labels()
+    agens.load_vertices("p", [{"n": i} for i in range(60)])
+    ids = [
+        row[0] for row in agens.execute("match (n:p) return id(n) order by id(n)").fetchall()
+    ]
+    return agens, ids
+
+
+def edges_of(conn) -> int:  # type: ignore[no-untyped-def]
+    (found,) = conn.execute("match ()-[r:links]->() return count(*)").fetchone()
+    return int(found)
+
+
+def keyed(conn) -> None:  # type: ignore[no-untyped-def]
+    """The index that keeps one edge per pair, which a property index cannot express."""
+    graph = conn.label_table.graph
+    conn.execute(f'create unique index links_pair on "{graph}".links (start, "end")')
+
+
+class TestUpsertingEdges:
+    """An edge is identified by the pair it joins, so that is what it is written by."""
+
+    def test_the_second_run_writes_nothing(self, joined) -> None:  # type: ignore[no-untyped-def]
+        """Which is the whole point: a copy alone makes a second edge for every one already there."""
+        conn, ids = joined
+        keyed(conn)
+        pairs = [(ids[i], ids[i + 1], {"w": i}) for i in range(25)]
+        assert conn.upsert_edges("links", pairs) == (25, 0)
+        assert conn.upsert_edges("links", pairs) == (0, 0)
+        assert edges_of(conn) == 25
+
+    def test_a_copy_alone_would_have_doubled_them(self, joined) -> None:  # type: ignore[no-untyped-def]
+        conn, ids = joined
+        pairs = [(ids[i], ids[i + 1], None) for i in range(25)]
+        conn.load_edges("links", pairs)
+        conn.load_edges("links", pairs)
+        assert edges_of(conn) == 50
+
+    def test_updating_keeps_what_it_was_not_told_about(self, joined) -> None:  # type: ignore[no-untyped-def]
+        conn, ids = joined
+        keyed(conn)
+        conn.upsert_edges("links", [(ids[0], ids[1], {"w": 1})])
+        conn.execute("match ()-[e:links]->() set e.kept = 'yes'")
+        counts = conn.upsert_edges("links", [(ids[0], ids[1], {"w": 99})], on_existing="update")
+        assert counts == (0, 1)
+        (weight, kept) = conn.execute("match ()-[e:links]->() return e.w, e.kept").fetchone()
+        assert (weight, kept) == (99, "yes")
+
+    def test_a_pair_given_twice_in_one_call_is_written_once(self, joined) -> None:  # type: ignore[no-untyped-def]
+        """The copy reads nothing back, so a repeat left in would be the duplicate this prevents."""
+        conn, ids = joined
+        keyed(conn)
+        counts = conn.upsert_edges(
+            "links",
+            [(ids[0], ids[1], None), (ids[0], ids[1], None), (ids[2], ids[3], None)],
+        )
+        assert counts.inserted == 2
+        assert edges_of(conn) == 2
+
+    @pytest.mark.parametrize("on_existing", ["replace", "merge", ""])
+    def test_there_is_no_third_thing_to_do(self, joined, on_existing: str) -> None:  # type: ignore[no-untyped-def]
+        conn, ids = joined
+        with pytest.raises(ValueError, match="no third thing"):
+            conn.upsert_edges("links", [(ids[0], ids[1], None)], on_existing=on_existing)
+
+
+class TestTheHazardTheEndpointIndexIsFor:
+    def test_a_label_with_nothing_keeping_one_edge_per_pair_is_refused(self, joined) -> None:  # type: ignore[no-untyped-def]
+        conn, ids = joined
+        with pytest.raises(ValueError, match="edge per pair of endpoints"):
+            conn.upsert_edges("links", [(ids[0], ids[1], None)])
+
+    def test_the_refusal_names_the_statement_that_fixes_it(self, joined) -> None:  # type: ignore[no-untyped-def]
+        conn, ids = joined
+        with pytest.raises(ValueError) as caught:
+            conn.upsert_edges("links", [(ids[0], ids[1], None)])
+        assert "create unique index" in str(caught.value)
+        assert '(start, "end")' in str(caught.value)
+
+    def test_the_hazard_can_be_accepted(self, joined) -> None:  # type: ignore[no-untyped-def]
+        conn, ids = joined
+        counts = conn.upsert_edges("links", [(ids[0], ids[1], None)], require_unique=False)
+        assert counts.inserted == 1
+
+    def test_eight_writers_on_one_set_of_pairs_leave_one_edge_each(self, joined, dsn) -> None:  # type: ignore[no-untyped-def]
+        """Measured without the index: twenty-seven edges for twenty-five pairs, and no failure."""
+        conn, ids = joined
+        keyed(conn)
+        graph = conn.label_table.graph
+        pairs = [(ids[i], ids[i + 1], {"w": i}) for i in range(25)]
+        failures: list[str] = []
+
+        def writer() -> None:
+            other = agensgraph.Connection.connect(dsn, autocommit=True)
+            with other:
+                other.graph(graph)
+                with contextlib.suppress(psycopg.Error):
+                    other.upsert_edges("links", pairs)
+
+        threads = [threading.Thread(target=writer) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        assert edges_of(conn) == 25, f"one edge per pair, failures seen: {failures}"
+
+
+class TestWhichReadItChooses:
+    """Asking about the pairs costs two identities each; reading the label costs none."""
+
+    def test_the_two_shapes_agree(self, joined) -> None:  # type: ignore[no-untyped-def]
+        conn, ids = joined
+        keyed(conn)
+        pairs = [(ids[i], ids[i + 1], None) for i in range(25)]
+        conn.upsert_edges("links", pairs)
+        graph = conn.label_table.graph
+        asked = conn._edges_present("links", pairs, graph=graph, estimate=-1.0)
+        whole = conn._edges_present("links", pairs, graph=graph, estimate=25.0)
+        assert asked == whole
+        assert len(asked) == 25
+
+    def test_a_label_nobody_has_analysed_reports_no_size(self, joined) -> None:  # type: ignore[no-untyped-def]
+        conn, _ids = joined
+        keyed(conn)
+        _, estimate = conn._edge_label_facts("links", graph=conn.label_table.graph)
+        assert estimate == -1.0, "which is read as not knowing, and asks about the pairs"
+
+    def test_and_reports_one_once_it_has(self, joined) -> None:  # type: ignore[no-untyped-def]
+        conn, ids = joined
+        keyed(conn)
+        conn.upsert_edges("links", [(ids[i], ids[i + 1], None) for i in range(25)])
+        graph = conn.label_table.graph
+        conn.execute(f'analyze "{graph}".links')
+        keyed_now, estimate = conn._edge_label_facts("links", graph=graph)
+        assert keyed_now is True
+        assert estimate == 25.0
+
+    def test_a_label_that_is_not_there_says_so(self, joined) -> None:  # type: ignore[no-untyped-def]
+        conn, _ = joined
+        with pytest.raises(ValueError, match="not a label"):
+            conn._edge_label_facts("nosuchlabel", graph=conn.label_table.graph)

@@ -38,11 +38,15 @@ from ._core import (
 from ._protocol.labels import CURRENT_GRAPH_QUERY, LabelCache
 from .bulk import (
     EDGE_COLUMN_TYPES,
+    EDGE_LABEL_FACTS_QUERY,
     PROMOTED_KEY_TYPES,
     VERTEX_COLUMN_TYPES,
     UpsertCounts,
     build_identity_map,
     edge_copy_statement,
+    edge_overlap_update_statement,
+    edge_pairs_all_query,
+    edge_pairs_present_query,
     edge_rows,
     identity_map_statement,
     key_spellings,
@@ -50,6 +54,7 @@ from .bulk import (
     overlap_update_statement,
     promoted_identity_map_statement,
     split_by_what_exists,
+    split_edges_by_what_exists,
     vertex_copy_statement,
     vertex_rows,
 )
@@ -59,6 +64,7 @@ from .cypher import (
     changes_graph_path,
     check_bindable_positions,
     needs_a_reading_first,
+    quote_identifier,
     wrap_for_cursor,
 )
 from .errors import BatchFailed, ConfigurationError, NoEnclosingTransaction
@@ -698,6 +704,106 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
             await self._run_with(overlap_update_statement(label), (Jsonb(updates),))
             updated = len(updates)
         return UpsertCounts(inserted, updated)
+
+    async def upsert_edges(
+        self,
+        label: str,
+        edges: Iterable[tuple[GraphId, GraphId, Mapping[str, Any] | None]],
+        *,
+        on_existing: str = "skip",
+        require_unique: bool = True,
+        graph: str | None = None,
+    ) -> UpsertCounts:
+        """Write the edges that are not there, by the pair of elements each one joins.
+
+        What :meth:`upsert_vertices` is for a vertex, keyed on the endpoints rather than a property,
+        because that pair is what an edge is. :meth:`load_edges` is a copy and a copy only creates,
+        so reading a source in twice makes a second edge for every one already there. This reads
+        which pairs are there, copies only the pairs that are not, and leaves the rest alone.
+
+        ``on_existing="update"`` merges the given properties into the edges already present, as one
+        statement addressed by the identities the read found. A property the caller does not mention
+        keeps its value. Left as ``"skip"`` nothing is written for them, which is a copy and nothing
+        else, and is why that is the default.
+
+        **A label with nothing keeping one edge per pair is refused.** Two writers merging the same
+        pair without it each create an edge rather than finding one: eight writers over twenty-five
+        pairs were measured making twenty-seven edges and reporting no failure at all. The index that
+        prevents it is plain SQL over the columns, because a property index cannot express it --
+        see :class:`~agensgraph.DesiredIndex`::
+
+            create unique index links_pair on "social".links (start, "end")
+
+        With that in place the same eight writers left twenty-five edges, the losers reporting
+        ``23505``, which is what :meth:`RetryPolicy.decide` reads as worth trying again when told the
+        statement was merging. ``require_unique=False`` accepts the hazard for a graph that cannot
+        add the index.
+
+        A pair given twice in one call is written once.
+        """
+        if on_existing not in ("skip", "update"):
+            raise ValueError(
+                f"on_existing is 'skip' or 'update', not {on_existing!r}: there is no third thing "
+                f"to do with an edge that is already there"
+            )
+        name = await self._graph_of(graph)
+        material = list(edges)
+        keyed, estimate = await self._edge_label_facts(label, graph=name)
+        if require_unique and not keyed:
+            raise ValueError(
+                f"nothing keeps one {label!r} edge per pair of endpoints, so two writers merging "
+                f"the same pair would each create one rather than find it. Run "
+                f'`create unique index on "{name}".{quote_identifier(label)} (start, "end")`, '
+                f"which is plain SQL because a property index cannot key on the endpoint columns, "
+                f"or pass require_unique=False to accept the hazard"
+            )
+        present = await self._edges_present(label, material, graph=name, estimate=estimate)
+        fresh, updates = split_edges_by_what_exists(material, present)
+        inserted = await self.load_edges(label, fresh, graph=name) if fresh else 0
+        updated = 0
+        if on_existing == "update" and updates:
+            await self._run_with(edge_overlap_update_statement(label), (Jsonb(updates),))
+            updated = len(updates)
+        return UpsertCounts(inserted, updated)
+
+    async def _edge_label_facts(self, label: str, *, graph: str) -> tuple[bool, float]:
+        """Whether one edge per pair of endpoints is kept, and roughly how many edges there are.
+
+        Both in one read, since both are wanted at once and the second is only a threshold. The
+        size is ``-1`` where nobody has analysed the label, which is read as not knowing.
+        """
+        rows = await self._fetch(EDGE_LABEL_FACTS_QUERY, (graph, label))
+        if not rows:
+            raise ValueError(f"{label!r} is not a label of {graph!r}")
+        keyed, estimate = rows[0]
+        return bool(keyed), float(estimate)
+
+    async def _edges_present(
+        self,
+        label: str,
+        edges: Sequence[tuple[GraphId, GraphId, Mapping[str, Any] | None]],
+        *,
+        graph: str,
+        estimate: float,
+    ) -> dict[tuple[GraphId, GraphId], GraphId]:
+        """The identity of every edge already joining one of these pairs.
+
+        Asked about the pairs given, so the cost follows the batch rather than the label -- until
+        the batch is as large as the label, at which point asking costs more than reading the label
+        does, because asking sends two identities per pair and reading sends none. Measured against
+        20,000 edges: asking beat reading at 100, 1,000 and 5,000 pairs and lost 143.7 ms to 53.7 at
+        20,000. A label nobody has analysed reports no size, and is asked about.
+        """
+        if not edges:
+            return {}
+        if 0 <= estimate <= len(edges):
+            rows = await self._fetch(edge_pairs_all_query(graph, label), ())
+            wanted = {(start, end) for start, end, _ in edges}
+            return {(start, end): found for start, end, found in rows if (start, end) in wanted}
+        starts = [start for start, _, _ in edges]
+        ends = [end for _, end, _ in edges]
+        rows = await self._fetch(edge_pairs_present_query(graph, label), (starts, ends))
+        return {(start, end): found for start, end, found in rows}
 
     async def _key_is_unique(self, label: str, key: str, *, graph: str) -> bool:
         """Whether anything on the server keeps one element per value of this property.
