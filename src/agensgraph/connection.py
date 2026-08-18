@@ -403,7 +403,20 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
         commit, and one thing a read-only transaction does allow is ``SET``. Committing keeps a
         setting for the rest of the session, which on a pooled connection is somebody else's
         statement: measured, ``set search_path`` inside this block was read back by the next
-        borrower of the same connection. Rolling back undoes it and costs nothing.
+        borrower of the same connection. Rolling back undoes it.
+
+        **What that costs, since it is not nothing.** psycopg gives up its prepared statements on
+        any rollback, so a connection that uses this block keeps none: measured, one prepared name
+        before a block and none after, and a ``DEALLOCATE ALL`` round trip whenever any statement
+        was prepared. A statement that differs every call -- which is what arrives from somewhere
+        else, and what this block is for -- loses nothing by that, and the cost stayed inside the
+        noise across two runs. A statement repeated on the same connection pays about a quarter
+        more, because it is parsed again every time. Nested inside another transaction the block
+        also costs one round trip more than committing, since releasing a savepoint is one
+        statement and rolling back to it is two.
+
+        A caller that wants both should keep its own repeated statements on a different connection
+        from the ones it did not write.
         """
         if not allow_server_programs and self.can_run_server_programs():
             raise ConfigurationError(
