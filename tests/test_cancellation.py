@@ -281,3 +281,87 @@ class TestAConnectionThatSawACancel:
             assert pool.interrupted == 0
         finally:
             await pool.close()
+
+
+class TestAskingTheServerToStop:
+    """`cancel_safe` is how a running statement is stopped, and it is a different thing from a
+    task being cancelled: one ends the statement cleanly and the other leaves it unfinished.
+    """
+
+    SLOW = "select pg_sleep(20)"
+
+    async def backend_state(self, watcher, pid: int) -> str:  # type: ignore[no-untyped-def]
+        cursor = await watcher.execute(
+            "select state from pg_stat_activity where pid = %s", (pid,)
+        )
+        rows = await cursor.fetchall()
+        return str(rows[0][0]) if rows else "gone"
+
+    @pytest.mark.asyncio
+    async def test_it_stops_the_backend_and_the_caller_is_told(self, dsn: str) -> None:
+        """`57014` on the statement's own caller is the only evidence a cancel landed."""
+        watcher = await agensgraph.AsyncConnection.connect(dsn, autocommit=True)
+        conn = await agensgraph.AsyncConnection.connect(dsn, autocommit=True)
+        async with watcher, conn:
+            cursor = await conn.execute("select pg_backend_pid()")
+            (pid,) = await cursor.fetchone()
+            running = asyncio.create_task(conn.execute(self.SLOW))
+            await asyncio.sleep(0.5)
+            assert await self.backend_state(watcher, pid) == "active"
+            await conn.cancel_safe(timeout=5.0)
+            with pytest.raises(psycopg.Error) as caught:
+                await running
+            assert caught.value.sqlstate == "57014"
+            assert await self.backend_state(watcher, pid) == "idle"
+
+    @pytest.mark.asyncio
+    async def test_the_connection_is_left_usable(self, dsn: str) -> None:
+        """Which is why it is kept rather than replaced: nothing about it is unknown."""
+        conn = await agensgraph.AsyncConnection.connect(dsn, autocommit=True)
+        async with conn:
+            running = asyncio.create_task(conn.execute(self.SLOW))
+            await asyncio.sleep(0.5)
+            await conn.cancel_safe(timeout=5.0)
+            with pytest.raises(psycopg.Error):
+                await running
+            assert not conn.closed
+            assert not conn.broken
+            cursor = await conn.execute("select 42")
+            assert await cursor.fetchone() == (42,)
+
+    @pytest.mark.asyncio
+    async def test_a_pool_hands_that_one_back_and_replaces_the_interrupted_one(
+        self, dsn: str
+    ) -> None:
+        """The two cases differ, so the pool is asserted to treat them differently."""
+        pool = agensgraph.AsyncConnectionPool(dsn, min_size=1, max_size=1)
+        await pool.open(wait=True)
+        try:
+            async with pool.connection() as conn:
+                cursor = await conn.execute("select pg_backend_pid()")
+                (cancelled_on,) = await cursor.fetchone()
+                running = asyncio.create_task(conn.execute(self.SLOW))
+                await asyncio.sleep(0.5)
+                await conn.cancel_safe(timeout=5.0)
+                with pytest.raises(psycopg.Error):
+                    await running
+            async with pool.connection() as conn:
+                cursor = await conn.execute("select pg_backend_pid()")
+                (after_cancel,) = await cursor.fetchone()
+            assert after_cancel == cancelled_on, "cleanly cancelled, so nothing to replace"
+
+            async with pool.connection() as conn:
+                cursor = await conn.execute("select pg_backend_pid()")
+                (interrupted_on,) = await cursor.fetchone()
+                running = asyncio.create_task(conn.execute(self.SLOW))
+                await asyncio.sleep(0.5)
+                running.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await running
+                assert conn._agens_cancelled
+            async with pool.connection() as conn:
+                cursor = await conn.execute("select pg_backend_pid()")
+                (after_interrupt,) = await cursor.fetchone()
+            assert after_interrupt != interrupted_on, "interrupted, so its state is unknown"
+        finally:
+            await pool.close()

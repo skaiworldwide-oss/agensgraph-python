@@ -1122,12 +1122,34 @@ Stashing the id is nearly free, since any `CREATE` assigns one anyway.
 
 ## Cancellation
 
-The connection is discarded. Always.
+**To stop a statement that is still running, ask the server to stop it:**
 
-That is the majority position among drivers, and the alternatives have a bad record: the two cleverer
-attempts in one widely used client produced a CVE each, one of which could send one request's
-response to a different request. The rule here is to decide the connection's fate synchronously
-first, with no awaits, and only then bound and isolate any cleanup.
+```python
+await conn.cancel_safe(timeout=5.0)     # psycopg's, and it is the one to use
+```
+
+The statement's own caller then receives `57014`, which is the only evidence the cancel landed. It
+uses libpq 17's cancel connection where there is one and falls back to the older request otherwise.
+Measured against `pg_sleep(20)`: the call returned in under 10 ms and the backend went from `active`
+to `idle`.
+
+**A connection interrupted mid-statement is discarded; one cancelled cleanly is kept.** Those are
+different things and the difference is worth a sentence. A task cancelled while awaiting a statement
+leaves a connection whose state nobody can describe, and psycopg's own recovery re-enters a wait
+bounded by nothing, so such a connection is replaced rather than reasoned about. A `cancel_safe` that
+ends in `57014` is not that: the statement finished, the protocol is in step, and the connection is
+idle. Measured through a pool of one, the first is handed a new backend and the second is handed the
+same one back.
+
+Discarding the interrupted one is the majority position among drivers, and the alternatives have a
+bad record: the two cleverer attempts in one widely used client produced a CVE each, one of which
+could send one request's response to a different request. The rule here is to decide the
+connection's fate synchronously first, with no awaits, and only then bound and isolate any cleanup.
+
+**Abandoning a task is not cancelling it.** A statement whose task is never awaited and never
+cancelled goes on running: measured, the backend stayed `active` until it was terminated by hand.
+Nothing in a driver can see that, since from here it is a statement that has not answered yet.
+Cancel the task or call `cancel_safe`; do not simply stop waiting.
 
 `57014` has four separate causes (a client cancel, `statement_timeout`, a recovery conflict, and a
 tie broken toward lock timeout) and its message is localised, so the driver tracks "I cancelled this"
