@@ -62,6 +62,8 @@ __all__ = [
     "Triple",
     "Unique",
     "constraint_name",
+    "create_constraint_statement",
+    "create_index_statement",
     "create_label_statement",
     "describe_kind",
     "element_count_query",
@@ -611,7 +613,18 @@ def constraint_name(desired: Unique | Check) -> str:
     return f"{desired.label}_{desired.property}_unique"[:MAX_IDENTIFIER]
 
 
-def create_index_statement(desired: DesiredIndex) -> str:
+def create_index_statement(desired: DesiredIndex, *, if_not_exists: bool = False) -> str:
+    """The statement that makes an index.
+
+    ``if_not_exists`` is for a caller with no connection to reconcile against, writing a script
+    somebody may run twice. It needs a name, because the grammar's arm for it takes one and the
+    unnamed spelling is a syntax error. A name is also what the server skips on, so an unnamed
+    index would not be idempotent for having asked: three runs of the same unnamed statement leave
+    ``d_k_idx``, ``d_k_idx1`` and ``d_k_idx2``, where three runs of the named form leave one index.
+
+    A caller that does have a connection wants :meth:`Connection.ensure_indexes` instead, which
+    reads what is there and emits only what is missing, whatever the indexes are called.
+    """
     if not desired.properties:
         raise ValueError(f"an index covers at least one property, got none for {desired.label}")
     if desired.where is not None and not desired.name:
@@ -619,6 +632,13 @@ def create_index_statement(desired: DesiredIndex) -> str:
             f"a partial index on {desired.label} needs a name, because its predicate is stored "
             f"normalised and so cannot be compared against the one written here"
         )
+    if if_not_exists and not desired.name:
+        raise ValueError(
+            f"an index on {desired.label} asked for with if_not_exists needs a name, because the "
+            f"server takes one there and the unnamed spelling is a syntax error -- and an unnamed "
+            f"index is made again under a name of the server's choosing rather than skipped"
+        )
+    exists_clause = "if not exists " if if_not_exists else ""
     unique = "unique " if desired.unique else ""
     name = f"{quote_identifier(desired.name)} " if desired.name else ""
     # An access method is named by an identifier, and the server takes it quoted.
@@ -630,8 +650,8 @@ def create_index_statement(desired: DesiredIndex) -> str:
     keys = ", ".join(element.rendered() for element in desired.elements)
     where = f" where {desired.where}" if desired.where is not None else ""
     return (
-        f"create {unique}property index {name}on {quote_identifier(desired.label)} "
-        f"{method}({keys}){where}"
+        f"create {unique}property index {exists_clause}{name}"
+        f"on {quote_identifier(desired.label)} {method}({keys}){where}"
     )
 
 
@@ -640,6 +660,13 @@ def drop_index_statement(name: str) -> str:
 
 
 def create_constraint_statement(desired: Unique | Check) -> str:
+    """The statement that makes a constraint.
+
+    There is no ``if not exists`` for one -- the grammar has no arm for it, and a second run
+    reports that the relation behind the name already exists. So a script of these is written to
+    be run once, and a caller that wants to run it twice wants
+    :meth:`Connection.ensure_constraints`, which reads what is there first.
+    """
     name = quote_identifier(constraint_name(desired))
     label = quote_identifier(desired.label)
     if isinstance(desired, Unique):

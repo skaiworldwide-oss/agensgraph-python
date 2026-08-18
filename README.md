@@ -1372,6 +1372,7 @@ Everything exported from `agensgraph`. The submodules `agensgraph.columnar`, `ag
 | | |
 |---|---|
 | `connection.ensure_labels(desired)` | make the labels asked for; never drops one |
+| `create_index_statement`, `create_constraint_statement`, `create_label_statement` | the DDL, for a caller with no connection |
 | `connection.describe()` | labels, properties, triples and counts, without a scan |
 | `GraphDescription`, `Triple`, `PropertyShape` | what it returns |
 | `connection.upsert_vertices(label, key, rows)` | copy what is missing, optionally refresh the rest |

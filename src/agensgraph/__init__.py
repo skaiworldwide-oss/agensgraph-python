@@ -41,6 +41,9 @@ from .introspect import Label as LabelInfo
 from .introspect import PropertyShape as PropertyShape
 from .introspect import Triple as Triple
 from .introspect import Unique as Unique
+from .introspect import create_constraint_statement as create_constraint_statement
+from .introspect import create_index_statement as create_index_statement
+from .introspect import create_label_statement as create_label_statement
 from .numbers import read_numbers_exactly as read_numbers_exactly
 from .numbers import reading_numbers_exactly as reading_numbers_exactly
 from .observability import Notice as Notice
@@ -118,6 +121,9 @@ __all__ = [
     "add_query_logger",
     "columnar",
     "connect",
+    "create_constraint_statement",
+    "create_index_statement",
+    "create_label_statement",
     "dbapi",
     "disable_tracing",
     "enable_tracing",

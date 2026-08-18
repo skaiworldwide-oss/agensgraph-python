@@ -22,6 +22,7 @@ import pytest
 import pytest_asyncio
 
 import agensgraph
+from agensgraph.cypher import quote_identifier
 from agensgraph.introspect import (
     Check,
     Constraint,
@@ -707,3 +708,79 @@ class TestDeclaringLabelsAgainstTheServer:
         for thread in threads:
             thread.join()
         assert "42P07" not in failures, "the label was declared, so no writer had to make it"
+
+
+class TestWritingDdlWithNoConnection:
+    """A caller with no connection cannot reconcile, so it writes the statements out instead."""
+
+    def test_the_builders_are_reachable_from_the_top_level(self) -> None:
+        assert agensgraph.create_index_statement is create_index_statement
+        assert agensgraph.create_constraint_statement is create_constraint_statement
+
+    def test_if_not_exists_makes_an_index_script_re_runnable(self) -> None:
+        statement = create_index_statement(
+            DesiredIndex("Memory", ("name",), unique=True, name="memory_name"),
+            if_not_exists=True,
+        )
+        assert statement == (
+            'create unique property index if not exists memory_name on "Memory" (name)'
+        )
+
+    def test_and_needs_a_name_because_the_server_takes_one_there(self) -> None:
+        with pytest.raises(ValueError, match="needs a name"):
+            create_index_statement(DesiredIndex("Memory", ("name",)), if_not_exists=True)
+
+    @pytest.mark.parametrize(
+        ("label", "prop"),
+        [
+            ("X {}) DETACH DELETE n //", "k"),
+            ("Zap; CREATE TABLE t(i int); --", "k"),
+            ("Memory", "a) ; drop table t; --"),
+            ("iPhone", "Name"),
+        ],
+    )
+    def test_a_hostile_name_becomes_one_quoted_identifier(self, label: str, prop: str) -> None:
+        """The statements go to somebody else to run, so the quoting has to hold here."""
+        statement = create_index_statement(DesiredIndex(label, (prop,)))
+        assert statement.count(quote_identifier(label)) == 1
+        assert quote_identifier(prop) in statement
+
+
+@pytest.mark.server
+class TestTheGeneratedDdlAgainstTheServer:
+    def test_the_index_script_can_be_run_twice(self, agens) -> None:  # type: ignore[no-untyped-def]
+        agens.execute("create vlabel doc")
+        statement = create_index_statement(
+            DesiredIndex("doc", ("name",), name="doc_name_once"), if_not_exists=True
+        )
+        agens.execute(statement)
+        agens.execute(statement)
+        assert [i.name for i in agens.indexes("doc")] == ["doc_name_once"]
+
+    def test_the_unnamed_statement_is_what_is_not_re_runnable(self, agens) -> None:  # type: ignore[no-untyped-def]
+        """Which is what the name is for: the server skips on it and picks one when not given."""
+        agens.execute("create vlabel doc")
+        statement = create_index_statement(DesiredIndex("doc", ("name",)))
+        for _ in range(3):
+            agens.execute(statement)
+        assert sorted(i.name for i in agens.indexes("doc")) == [
+            "doc_name_idx",
+            "doc_name_idx1",
+            "doc_name_idx2",
+        ]
+
+    def test_asking_for_it_unnamed_is_a_syntax_error(self, agens) -> None:  # type: ignore[no-untyped-def]
+        """Which is why the builder refuses to write one rather than leaving it to the server."""
+        agens.execute("create vlabel doc")
+        with pytest.raises(agensgraph.errors.Error) as caught:
+            agens.execute("create property index if not exists on doc (name)")
+        assert caught.value.sqlstate == "42601"
+
+    def test_a_constraint_script_cannot_be_run_twice(self, agens) -> None:  # type: ignore[no-untyped-def]
+        """Which is why the docstring says so: the grammar has no `if not exists` for one."""
+        agens.execute("create vlabel doc")
+        statement = create_constraint_statement(Unique("doc", "sku"))
+        agens.execute(statement)
+        with pytest.raises(agensgraph.errors.Error) as caught:
+            agens.execute(statement)
+        assert caught.value.sqlstate == "42P07"
