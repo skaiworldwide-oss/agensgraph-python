@@ -871,11 +871,27 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
         # to twice the label, and is between 2 and 1800 times slower for it. Turning the scan off is
         # a preference rather than a prohibition, so a label with nothing to look a key up by still
         # answers.
-        previous = (await self._fetch("show enable_seqscan", ()))[0][0]
-        await self._run("set enable_seqscan = off")
+        #
+        # Reading the setting, turning it off and asking all go in one pipeline. They have to happen
+        # in that order and do, since a pipeline keeps the order it was filled in; what is not
+        # needed is a round trip each, and the reading of the old value is only wanted afterwards.
+        # Restoring it is the one that has to wait, because it must not be undone by a failure.
+        previous = "on"
+        async with self.pipeline():
+            before = self.cursor(row_factory=tuple_row)
+            await before.execute("show enable_seqscan")
+            await self._run("set enable_seqscan = off")
+            asking = self.cursor(row_factory=tuple_row)
+            await asking.execute(keyed_identity_query(label, key), (Jsonb(asked),))
         try:
-            rows = await self._fetch(keyed_identity_query(label, key), (Jsonb(asked),))
+            read = await before.fetchall()
+            previous = read[0][0] if read else previous
+            rows = await asking.fetchall()
         finally:
+            await before.close()
+            await asking.close()
+            # Back to what it was and not to the default, so a caller who had turned the scan off
+            # for its own reasons still has it off afterwards.
             await self._run(f"set enable_seqscan = {'on' if previous == 'on' else 'off'}")
         return build_identity_map(rows, label=label, key=key)
 
