@@ -164,6 +164,49 @@ class TestTheBoundaryHoldsForAnOrdinaryRole:
         assert refused["smuggled"] == "42501", "including one hidden behind another statement"
 
 
+class TestItLeavesTheSessionAsItFoundIt:
+    """A read-only transaction allows ``SET``, and a setting outlives the transaction that
+    committed it. On a pooled connection the rest of that session belongs to somebody else.
+    """
+
+    def test_a_setting_made_inside_does_not_reach_the_next_borrower(self, dsn: str) -> None:
+        # One connection, so the next borrower is provably the same one.
+        pool = agensgraph.ConnectionPool(dsn, min_size=1, max_size=1)
+        pool.open(wait=True)
+        try:
+            with pool.connection() as conn:
+                conn.set_autocommit(False)
+                with conn.read_only_transaction(allow_server_programs=True):
+                    conn.execute("set search_path = 'left_behind'")
+            with pool.connection() as conn:
+                (search_path,) = conn.execute("show search_path").fetchone()
+        finally:
+            pool.close()
+        assert "left_behind" not in search_path
+
+    def test_a_read_inside_still_answers(self, agens) -> None:  # type: ignore[no-untyped-def]
+        """Rolling back at the end does not take back rows already read."""
+        agens.execute("create vlabel thing")
+        agens.execute("create (:thing {a: 1})")
+        agens.autocommit = False
+        with agens.read_only_transaction(allow_server_programs=True):
+            (row,) = agens.execute_query("match (n:thing) return n.a").records
+        assert row[0] == 1
+
+    def test_it_rolls_back_itself_and_not_the_transaction_around_it(self, agens) -> None:  # type: ignore[no-untyped-def]
+        """Nested, the block is a savepoint, so what it undoes is its own work."""
+        agens.execute("create vlabel thing")
+        agens.autocommit = False
+        with agens.transaction():
+            agens.execute("create (:thing {a: 1})")
+            with agens.read_only_transaction(allow_server_programs=True):
+                agens.execute("set search_path = 'inner_only'")
+            (search_path,) = agens.execute("show search_path").fetchone()
+            assert "inner_only" not in search_path, "the inner block undid its own setting"
+            (count,) = agens.execute("match (n:thing) return count(*)").fetchone()
+        assert count == 1, "and left the write in the transaction around it alone"
+
+
 @pytest.fixture
 def reaching(agens, dsn):  # type: ignore[no-untyped-def]
     """A connection as a role that can *reach* the privilege without holding it.

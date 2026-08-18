@@ -395,14 +395,21 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
         both were demonstrated. What stops it is not holding the privilege, so that is what is
         asked about, once, and a role holding it is refused here rather than left to find out.
         Pass ``allow_server_programs`` to accept it anyway.
+
+        **It ends by rolling back**, because a transaction that could not write has nothing to
+        commit, and one thing a read-only transaction does allow is ``SET``. Committing keeps a
+        setting for the rest of the session, which on a pooled connection is somebody else's
+        statement: measured, ``set search_path`` inside this block was read back by the next
+        borrower of the same connection. Rolling back undoes it and costs nothing.
         """
         if not allow_server_programs and self.can_run_server_programs():
             raise ConfigurationError(
                 "this role may run a command on the server's host, through COPY ... TO PROGRAM, which a read-only transaction does not stop -- so a read-only transaction is not a boundary for a statement this role did not write. Connect as a role that is not a superuser and does not hold pg_execute_server_program, or pass allow_server_programs=True to accept it."
             )
-        with self.transaction():
+        with self.transaction() as block:
             self._run("set transaction read only")
             yield
+            raise psycopg.Rollback(block)
 
     def transaction_id(self, *, assign: bool = False) -> int | None:
         """The id of the transaction now open, so its fate can be asked about if it is lost.
