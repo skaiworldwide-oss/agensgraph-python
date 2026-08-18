@@ -13,7 +13,7 @@ which is a mistake that has shipped, makes the cap reachable only by chance and 
 distribution not the one the name describes.
 
 *How often* to try again is a budget, not a counter. A counter is per call site, and four
-layers each willing to try three times is sixty-four attempts from one action. A token bucket
+layers each willing to try three times is eighty-one attempts from one action. A token bucket
 is per process: a failed attempt costs tokens, a success returns a fraction of one, and while
 the bucket is low nothing retries at all. The asymmetry is the tuning surface. A transient
 failure costs more than a rejection, because a rejection is one request being turned away
@@ -130,7 +130,7 @@ SHARED_ALLOWANCE = TokenBucket()
 """The allowance every policy draws on unless it is given one of its own.
 
 One per process, because the multiplication it exists to bound happens *between* layers: four
-of them each willing to try three times is sixty-four attempts from one action, and four
+of them each willing to try three times is eighty-one attempts from one action, and four
 separate allowances would each say yes to their own three.
 """
 

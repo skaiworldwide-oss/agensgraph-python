@@ -194,8 +194,10 @@ member.
 
 **A property map is decoded when you first read it**, not when the row arrives. A query that ranks
 or counts vertices without looking inside them never pays for the map at all, and what that is worth
-grows with the map: parsing a vertex whose properties are never touched is about 1.4 times cheaper
-on a map of three keys, 2.8 times on a map of sixty, and 3.5 times on a 1536-dimension embedding.
+grows with the map: reading five thousand vertices whose properties are never touched is about 1.2
+times cheaper on a map of three keys, 1.5 times on a map of sixty, and 1.6 times on a 1536-dimension
+embedding. Those are medians over eleven interleaved passes; the map has to be worth something before
+skipping it is, which is why the narrow map barely moves.
 
 It also means the map is decoded under whatever
 [number setting](#numbers-in-a-property-map) is in force at the moment you touch it, rather than at
@@ -331,12 +333,26 @@ parsing: every element repeats its column oids, its lengths and a tuple id the t
 writes, so a vertex is about a fifth more bytes and an edge several times more. In exchange the
 driver reads lengths instead of measuring where each value ends.
 
-How much it pays depends on the shape. Over a few thousand rows it reads edges about 1.45 times
-faster, paths about 1.3, and whole vertices only about 1.15, since a vertex is mostly its property
-map and both renderings hand that to the same decoder. It stops paying on a short result, where the
-round trip costs more than either parse: at a few hundred rows, whole vertices are about 0.8 times,
-which is to say slower. [Embeddings](#embedding-vectors) are the clearest case for it, because a
-vector's text is decimal and its binary is the numbers themselves.
+How much it pays depends on the shape, and only one shape pays enough to be worth quoting a number
+for. Over five thousand rows, measured interleaved across fifteen passes and reported as the range
+rather than a single figure, because the range is the useful part:
+
+| shape | slowest pass | median | fastest pass |
+|---|---|---|---|
+| edges | 1.12 | **1.29** | 1.38 |
+| paths | 0.85 | 1.02 | 1.09 |
+| whole vertices | 0.82 | 1.17 | 1.66 |
+
+**So ask for it on edges, and measure before believing anything about the other two.** Edges gain
+because an edge is mostly the four fixed-width fields the binary form states the lengths of. A path
+and a vertex are mostly a property map, and both renderings hand that to the same decoder, so what
+is left to win is small enough that run-to-run variation swamps it: the vertex figure moved by a
+factor of two across passes of the same measurement on one machine, and an independent run on
+another reported a median below 1. A number quoted to two digits for either would be noise
+presented as a measurement.
+
+[Embeddings](#embedding-vectors) are the one clear case, because a vector's text is decimal and its
+binary is the numbers themselves.
 
 When in doubt, leave it off and turn it on for the one query that is slow.
 
@@ -417,9 +433,10 @@ from agensgraph.columnar import to_arrow, to_pandas, to_polars
 table = to_arrow(conn.execute_query("MATCH (n:Person) RETURN n.name, n.age"))
 ```
 
-Each column is built as a column, with its type declared rather than inferred, which is about an
-order of magnitude faster than assembling one Python value at a time, for Arrow, pandas and polars
-alike.
+Each column is built as a column, with its type declared rather than inferred, which measured about
+3.3 times faster than `pyarrow.Table.from_pylist` over the same rows turned into dicts, building the
+identical schema. That is the comparison worth making: one that stringifies the values instead is
+not building the same table and can come out either way.
 
 **A whole vertex becomes a struct** of its identity, its label and its property map, and the map is
 the JSON text taken from the bytes it arrived in, so it is never decoded into a dict:
@@ -785,10 +802,21 @@ difference rather than a small one: a vector of 1536 dimensions prints as roughl
 of decimal against six of wire bytes, so the text form costs about three times as much before
 anything is parsed and seven times once the numbers are read.
 
-**Send a `Vector`, not a list and not a string you built.** Every other route formats each number as
-decimal for the server to parse back: a list cast to `vector(1536)` costs about eight times as much,
-a hand built string about two and a half. In bulk the gap is wider, and `COPY` in binary with
-`Vector` loads an order of magnitude faster than `COPY` in text.
+**Send a `Vector` rather than a list.** A list is formatted a number at a time as decimal for the
+server to parse back, and measured over eight hundred writes of a 1536-dimension vector into a
+promoted column it costs 2.3 times the `Vector` route. A string you formatted yourself costs about the
+same as a `Vector`, having already paid the formatting once, but it is still the worse choice, because
+nothing checks its dimension or its numbers until the server does.
+
+The `::vector(n)` cast belongs on the reading side, in the search and in the index expression above.
+There is no reason to write one into a property: the column's own type settles what a promoted
+property is, and a property left in the map is jsonb whatever you cast on the way in.
+
+**In bulk it is the other way round.** `load_vertices` writes a property map as JSON and a `Vector` is
+deliberately not JSON encodable, so passing one raises `Encoding objects of type Vector is
+unsupported`. Bulk-load vectors as plain lists, and give the property a column of its own to get them
+back as `Vector`: measured, a list loaded through `load_vertices` into a `vector(1536) generated`
+column reads back as a `Vector`.
 
 Half precision is `halfvec`, and works the same way. Binary quantisation is available in SQL, where
 `bit` is spellable; Cypher has no syntax for that cast, which is worth knowing before you look for
@@ -1084,8 +1112,10 @@ took yourself, and the driver's own catalog reads all arrive at the same place, 
 asking what the driver sends wants the round trips they did not write. `elapsed` is the round trip,
 sending the statement until the server has answered, and not the reading of the rows afterwards.
 
-Off costs a boolean test. A statement takes the same time with a logger attached as with none, and
-the reporting adds about a quarter of a per cent to a statement's round trip. A clock is not read,
+Off costs a boolean test. On costs less than this can be measured: over four hundred statements a run,
+attached measured 4% *faster* than detached, while two detached runs differed from each other by 3%,
+so the effect is under the noise rather than small. Take the direction and not a figure. A clock is
+not read,
 and a timer is not even allocated, unless something is going to ask for the number. Spans are per
 statement and never per row, the tracing API is imported only when asked for and the SDK never, the
 record carries an opaque connection number rather than the connection's settings (which hold the
