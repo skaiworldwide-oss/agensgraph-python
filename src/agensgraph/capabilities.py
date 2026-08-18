@@ -143,12 +143,24 @@ class Capabilities:
         )
 
     def has_gql_clauses(self, *, check: bool = False) -> bool:
-        """Whether the GQL clauses are understood: LET, NEXT, FINISH, FILTER, FOR and CALL.
+        """Whether the GQL surface is understood.
 
-        This also decides how much of a query can be wrapped for reading in chunks, since
-        the wrap accepts only what the server will read.
+        Confirmed against the grammar and a server, and confirmed absent from 2.17's:
+        ``INSERT`` (the same grammar arm as ``CREATE``, so it *writes*), ``LET``, ``NEXT``,
+        ``FILTER``, ``FINISH``, ``FOR ... IN ... WITH OFFSET AS``, ``CALL { }`` and
+        ``CALL func() YIELD``, ``OPTIONAL CALL``, ``OFFSET`` as a synonym for ``SKIP``,
+        ``RETURN ALL`` and ``WITH ALL``, ``IS [NOT] UNKNOWN``, ``NULLIF``, ``XOR``,
+        ``CURRENT_GRAPH``, and the subquery value expressions ``EXISTS``, ``COUNT``,
+        ``COLLECT``, ``ARRAY`` and ``VALUE``.
+
+        It does **not** decide what can be wrapped for reading in chunks. Three of these --
+        ``FILTER``, ``NEXT`` and ``CALL func() YIELD`` -- the grammar keeps for the top of a
+        statement, so a server that has them still refuses them inside the wrap, and the wrap's
+        own boundary moves between versions in the other direction as well: 2.18 refuses a
+        ``LIMIT`` that is not last where 2.17 takes it. What a subquery holds is the server's to
+        say, and it says so with a syntax error naming the word.
         """
-        return self._at_least(_GQL_CLAUSES, "the GQL clauses", check=check)
+        return self._at_least(_GQL_CLAUSES, "the GQL surface", check=check)
 
     def has_element_ordering(self, *, check: bool = False) -> bool:
         """Whether a vertex or an edge can be sorted on directly.
