@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import psycopg
 from psycopg.adapt import AdaptersMap
+from psycopg.pq import TransactionStatus
 from psycopg.rows import Row, tuple_row
 from psycopg.types.json import Jsonb
 
@@ -495,7 +496,11 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
             raise ValueError(f"a chunk holds at least one row, got {size}")
         self._check(query)
         statement = wrap_for_cursor(query)
-        if self.autocommit and name is None:
+        if (
+            name is None
+            and self.autocommit
+            and (self.pgconn.transaction_status == TransactionStatus.IDLE)
+        ):
             raise NoEnclosingTransaction.for_stream()
         timer = Timer.start()
         with self.cursor(name=name or stream_name()) as cursor:

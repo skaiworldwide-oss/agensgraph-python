@@ -10,6 +10,7 @@ from __future__ import annotations
 import psycopg
 import pytest
 import pytest_asyncio
+from psycopg.pq import TransactionStatus
 
 import agensgraph
 from agensgraph.cypher import check_can_wrap, wrap_for_cursor
@@ -429,6 +430,21 @@ class TestWhatAStreamNeeds:
             pytest.raises(NoEnclosingTransaction, match="transaction"),
         ):
             list(conn.stream("match (n) return n"))
+
+    def test_a_transaction_opened_on_an_autocommit_connection_is_one(self, agens) -> None:  # type: ignore[no-untyped-def]
+        """What the cursor needs is a transaction, not a connection out of autocommit.
+
+        `with conn.transaction():` opens a real one in autocommit -- the status reads INTRANS --
+        and a cursor inside it lives as long as any other. Refusing on the flag gave an error whose
+        own advice was to do what the caller had already done, while passing `name=` went round the
+        check and read every row.
+        """
+        agens.execute("create vlabel thing")
+        agens.execute("create (:thing {n: 1})")
+        agens.autocommit = True
+        with agens.transaction():
+            assert agens.pgconn.transaction_status == TransactionStatus.INTRANS
+            assert len(list(agens.stream("match (n:thing) return n.n"))) == 1
 
     def test_what_is_wrong_with_the_statement_is_said_first(self, dsn: str) -> None:
         """A caller with both faults is not sent round twice."""

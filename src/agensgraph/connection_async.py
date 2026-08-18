@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import psycopg
 from psycopg.adapt import AdaptersMap
+from psycopg.pq import TransactionStatus
 from psycopg.rows import Row, tuple_row
 from psycopg.types.json import Jsonb
 
@@ -540,7 +541,14 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
         # so a caller with both is not sent round twice.
         self._check(query)
         statement = wrap_for_cursor(query)
-        if self.autocommit and name is None:
+        # What the cursor needs is a transaction, which is not the same question as whether the
+        # connection is in autocommit: `with conn.transaction():` opens a real one there, and a
+        # cursor inside it lives as long as any other. So the status is read rather than the flag.
+        if (
+            name is None
+            and self.autocommit
+            and self.pgconn.transaction_status == TransactionStatus.IDLE
+        ):
             raise NoEnclosingTransaction.for_stream()
         # Reported here rather than at the cursor: a server-side cursor is psycopg's own class
         # and not the one that reports for itself, and a stream is a statement like any other.

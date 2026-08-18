@@ -397,8 +397,9 @@ class NoEnclosingTransaction(_pg.ProgrammingError):
         """Build the report."""
         return cls(
             "reading in chunks needs a transaction for the cursor to live in, and this "
-            "connection is in autocommit. Open one -- `with conn.transaction():` -- or read "
-            "the statement whole with execute_query"
+            "connection is in autocommit with none open. Open one -- `with conn.transaction():`, "
+            "which opens a real one even in autocommit -- or read the statement whole with "
+            "execute_query"
         )
 
 
