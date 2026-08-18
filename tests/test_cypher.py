@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+
 import psycopg
 import pytest
 
@@ -13,6 +15,7 @@ from agensgraph.cypher import (
     quote_identifier,
     quote_string,
     without_literals,
+    writable_counters,
 )
 
 # Every shape the server accepts and reads as something other than what it says. Each was
@@ -363,3 +366,96 @@ class TestWhatTheServerDoesWithMoreThanOne:
         assert caught.value.sqlstate == "42601"
         (count,) = agens.execute("select count(*) from bound").fetchone()
         assert count == 0
+
+
+class TestAnEscapeStringEndsWhereTheServerEndsIt:
+    """``E'...'`` honours a backslash escape whatever ``standard_conforming_strings`` says.
+
+    Read as though it did not, the quote a backslash escaped is taken for a closing one and the
+    next for an opening one, so everything after the string is swallowed -- and a second statement
+    hiding there is neither refused nor counted.
+    """
+
+    @pytest.mark.parametrize(
+        ("statement", "refused"),
+        [
+            (r"SELECT E'a\''; CREATE TABLE t(i int)", True),
+            (r"SELECT 'a'''; CREATE TABLE t(i int)", True),
+            (r"SELECT Ename'x'; CREATE TABLE t(i int)", True),
+            (r"MATCH (n) WHERE n.s = E'x\'' RETURN n", False),
+            (r"MATCH (n) WHERE n.s = 'a\b' RETURN n", False),
+            (r"MATCH (n) WHERE n.s = E'a\\' RETURN n", False),
+        ],
+    )
+    def test_a_second_statement_after_one_is_still_found(
+        self, statement: str, refused: bool
+    ) -> None:
+        if refused:
+            with pytest.raises(ValueError, match="more than one statement"):
+                check_single_statement(statement)
+        else:
+            check_single_statement(statement)
+
+    def test_a_write_hiding_after_one_still_counts_as_a_write(self) -> None:
+        assert writable_counters(r"SELECT E'a\''; CREATE TABLE t(i int)")
+
+    @pytest.mark.server
+    @pytest.mark.parametrize(
+        ("statement", "expected"),
+        [(r"SELECT E'a\''", "a'"), (r"SELECT 'a\b'", r"a\b")],
+    )
+    def test_the_server_reads_them_the_same_way(self, agens, statement, expected) -> None:  # type: ignore[no-untyped-def]
+        """Asserted against the server, since the whole point is agreeing with its lexer."""
+        (value,) = agens.execute(statement).fetchone()
+        assert value == expected
+
+
+class TestWhichSettingTheServerIsOnIsNotKnownHere:
+    """A plain string escapes too where ``standard_conforming_strings`` is off.
+
+    Each setting hides a second statement the other does not, so reading the text one way leaves
+    the other way's open. Both readings are taken and either one finding a second statement is
+    enough, which is an answer that does not depend on a setting the caller may not control.
+    """
+
+    ON_HIDES_IT = r"SELECT 'a\'; CREATE TABLE t(i int)"
+    OFF_HIDES_IT = r"SELECT 'a\''; CREATE TABLE t(i int)"
+
+    @pytest.mark.parametrize("statement", [ON_HIDES_IT, OFF_HIDES_IT])
+    def test_a_second_statement_either_setting_would_run_is_refused(
+        self, statement: str
+    ) -> None:
+        with pytest.raises(ValueError, match="more than one statement"):
+            check_single_statement(statement)
+
+    @pytest.mark.parametrize(
+        "statement",
+        [
+            r"SELECT 'a\b'",
+            r"SELECT 'C:\path\'",
+            r"SELECT 'a;b'",
+            r"MATCH (n) WHERE n.s = 'a\b' RETURN n",
+            r"SELECT E'a;b\''",
+        ],
+    )
+    def test_and_one_statement_is_still_one_under_either(self, statement: str) -> None:
+        """Reading twice must not cost a caller whose text was never more than one statement."""
+        check_single_statement(statement)
+
+    @pytest.mark.server
+    @pytest.mark.parametrize("setting", ["on", "off"])
+    def test_the_server_runs_the_one_its_setting_hides(self, agens, setting: str) -> None:  # type: ignore[no-untyped-def]
+        """So neither is hypothetical: each setting leaves the table behind for its own statement."""
+        hidden = self.ON_HIDES_IT if setting == "on" else self.OFF_HIDES_IT
+        agens.execute(f"set standard_conforming_strings = {setting}")
+        try:
+            agens.execute("drop table if exists smuggled_here")
+            with contextlib.suppress(psycopg.Error):
+                agens.execute(hidden.replace("t(i int)", "smuggled_here(i int)"))
+            (made,) = agens.execute(
+                "select to_regclass('smuggled_here') is not null"
+            ).fetchone()
+        finally:
+            agens.execute("drop table if exists smuggled_here")
+            agens.execute("reset standard_conforming_strings")
+        assert made, "the server ran it, so the driver refusing it is not a false positive"

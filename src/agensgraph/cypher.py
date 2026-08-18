@@ -155,12 +155,18 @@ def quote_string(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
-def without_literals(statement: str) -> str:
+def without_literals(statement: str, *, escaping: bool = False) -> str:
     """The statement with everything the lexer does not read as syntax blanked out.
 
     Strings, quoted identifiers, dollar-quoted bodies and comments are replaced by spaces
     of the same length, so that positions still line up and a scan of what is left cannot
     be fooled by something a person wrote inside a string.
+
+    ``escaping`` reads a plain string the way a server with ``standard_conforming_strings`` off
+    reads one, where a backslash escapes the quote after it. The default is the way a server with
+    it on reads one, which is every server since it became the default. A caller that does not
+    know which it is asks both ways: the two disagree only about a statement holding ``\\'``, and
+    they place the end of that string in different halves of the text.
 
     One scan finds where a run can begin, and what is kept is joined from slices, so the cost
     follows the number of literals a statement holds.
@@ -175,7 +181,7 @@ def without_literals(statement: str) -> str:
             continue  # Inside a run already taken.
         ch = statement[start]
         if ch in "'\"":
-            end = _end_of_quoted(statement, start, ch)
+            end = _end_of_quoted(statement, start, ch, escaping=escaping)
         elif ch == "$":
             tag_end = _dollar_tag_end(statement, start)
             if tag_end < 0:
@@ -203,19 +209,54 @@ def without_literals(statement: str) -> str:
     return "".join(out)
 
 
-def _end_of_quoted(statement: str, start: int, quote: str) -> int:
-    """The offset just past a quoted run, where a doubled quote does not end it."""
+def _end_of_quoted(statement: str, start: int, quote: str, *, escaping: bool = False) -> int:
+    """The offset just past a quoted run, where a doubled quote does not end it.
+
+    A run opened by ``E'`` also ends at a quote a backslash escaped. That form honours the escape
+    whatever ``standard_conforming_strings`` is set to, so a backslash inside one is not the
+    literal character it is everywhere else -- and reading ``E'a\\''`` as though it were would take
+    the closing quote for an opening one and swallow the rest of the statement. Measured, that is
+    what it did: everything after such a string was blanked, so a second statement after it was
+    neither seen nor counted.
+
+    A plain string honours the escape too on a server with ``standard_conforming_strings`` off,
+    which is what ``escaping`` reads. Neither form applies inside a quoted identifier: a backslash
+    there is the character, whatever the setting.
+    """
+    if quote != "'":
+        escaped = False
+    elif escaping:
+        escaped = True
+    else:
+        escaped = start > 0 and statement[start - 1] in "Ee"
+        if (
+            escaped
+            and start > 1
+            and (statement[start - 2].isalnum() or statement[start - 2] == "_")
+        ):
+            escaped = False  # Part of a longer word, so the quote opens an ordinary string.
     pos = start + 1
     length = len(statement)
     while pos < length:
         found = statement.find(quote, pos)
         if found < 0:
             return length
+        if escaped and _preceded_by_odd_backslashes(statement, found):
+            pos = found + 1
+            continue
         if statement.startswith(quote * 2, found):
             pos = found + 2
             continue
         return found + 1
     return length
+
+
+def _preceded_by_odd_backslashes(statement: str, at: int) -> bool:
+    """Whether the character at ``at`` is escaped, counting the run of backslashes before it."""
+    count = 0
+    while at - count - 1 >= 0 and statement[at - count - 1] == "\\":
+        count += 1
+    return count % 2 == 1
 
 
 def _dollar_tag_end(statement: str, start: int) -> int:
@@ -305,20 +346,31 @@ def check_single_statement(statement: str) -> None:
     returned one row and left the table behind.
 
     This is one of the few things worth reading the text for, because the server does not refuse it
-    -- running the whole string is what that protocol is for. The other way to close it is to bind
-    a parameter, any parameter, which moves the statement onto the extended protocol where the
-    server does refuse it, with ``42601``. Callers taking text from somewhere else should do both:
-    this says which word is the reason, and the binding is what holds if this is ever wrong.
+    -- running the whole string is what that protocol is for.
+
+    Binding a parameter is a second line only when there is a parameter to bind. A statement sent
+    with **at least one** value goes over the extended protocol, where the server refuses a second
+    statement with ``42601``. An empty set is not enough: measured, ``None``, ``()``, ``{}`` and
+    ``[]`` each went over the simple protocol and ran the smuggled write. So for a statement that
+    takes no parameters -- which is most of what arrives from somewhere else -- this reading is the
+    only thing between the caller and the second statement, and it is worth being strict here.
 
     A terminating semicolon at the end is not a second statement and is allowed. Semicolons inside
     a string or a comment are not separators either, and are not looked at -- the text is read with
     its literals blanked, so one there terminates nothing.
+
+    Where a backslash could escape a quote the text is read both ways, because which one the server
+    means is a session setting this cannot see. Under ``standard_conforming_strings`` on,
+    ``select 'a\\'; create table t(i int)`` ends its string at the backslash and the write is a
+    second statement; with it off the same text is one string and ``select E'a\\''; ...`` is the
+    one that hides a write. Either reading finding a second statement is enough to refuse, so the
+    answer does not depend on a setting the caller may not control.
     """
     if ";" not in statement:
         return
-    bare = without_literals(statement).rstrip()
-    body = bare[:-1] if bare.endswith(";") else bare
-    found = body.find(";")
+    found = _second_statement(without_literals(statement))
+    if found < 0 and "\\" in statement:
+        found = _second_statement(without_literals(statement, escaping=True))
     if found < 0:
         return
     raise ValueError(
@@ -326,6 +378,13 @@ def check_single_statement(statement: str) -> None:
         f"first one. Sent without parameters it would run all of them and report only the first "
         f"one's result, so a statement from somewhere else is taken one at a time."
     )
+
+
+def _second_statement(blanked: str) -> int:
+    """Where a second statement starts in blanked text, or -1. A trailing semicolon ends none."""
+    bare = blanked.rstrip()
+    body = bare[:-1] if bare.endswith(";") else bare
+    return body.find(";")
 
 
 # A clause that changes something. A statement holding one cannot be read in chunks, because
