@@ -96,6 +96,7 @@ __all__ = [
     "mask_dsn",
     "redact_details",
     "retryability",
+    "safe_message",
     "show_error_details",
     "showing_error_details",
     "translate",
@@ -671,6 +672,31 @@ class InterruptedConnection(_pg.OperationalError):
             "a statement on this connection was interrupted rather than finished, so it is "
             "closed instead of being lent to somebody else"
         )
+
+
+def safe_message(exc: BaseException) -> str:
+    """A failure as one line fit to put in front of somebody who did not send the statement.
+
+    The SQLSTATE where there is one, and the server's primary message. Never the DETAIL, which for
+    a constraint violation is the row that broke it: a duplicate key reports
+    ``Key ((properties.'email'::text))=("alice@example.com") already exists``, so the value a
+    caller was writing is in the diagnostics whether or not the driver ever saw a parameter.
+
+    A model reading its own error is the case this is for, and so is a log line, an API body and a
+    tool result. Each of them otherwise builds the same string, and each has to know that a failure
+    the driver raised itself carries no SQLSTATE and that a psycopg one may carry ``None``.
+
+    ``show_error_details`` does not reach this. What that turns on is for reading at a terminal,
+    and this is for handing somewhere else.
+    """
+    code = getattr(exc, "sqlstate", None)
+    diag = getattr(exc, "diag", None)
+    primary = getattr(diag, "message_primary", None)
+    if primary is None:
+        first = exc.args[0] if exc.args else ""
+        primary = first if isinstance(first, str) and first else type(exc).__name__
+    text = primary.splitlines()[0].strip()
+    return f"{code}: {text}" if code else text
 
 
 def mask_dsn(dsn: str | None) -> str:

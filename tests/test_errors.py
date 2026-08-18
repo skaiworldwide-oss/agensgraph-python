@@ -466,3 +466,53 @@ class TestARealMergeRace:
         assert retried[tag] is True
         (count,) = agens.execute("match (n:m {name: 'shared'}) return count(*)").fetchone()
         assert count == 1, "the retry found what the other writer made rather than adding to it"
+
+
+class TestSafeMessage:
+    """One line fit to hand somewhere else: the SQLSTATE and the primary message, never DETAIL.
+
+    DETAIL carries the row for a constraint violation, so the value a caller was writing is in the
+    diagnostics whether or not the driver ever saw a parameter.
+    """
+
+    def make(self, primary: str, detail: str) -> pg.Error:
+        return TestKeepingRowDataOutOfAMessage.Faked(primary, detail)
+
+    def test_it_is_the_code_and_the_primary_line(self) -> None:
+        exc = self.make('syntax error at or near "("', "")
+        assert E.safe_message(exc) == '23505: syntax error at or near "("'
+
+    def test_the_detail_never_reaches_it(self) -> None:
+        detail = "Key ((properties.'email'::text))=(\"alice@example.com\") already exists."
+        exc = self.make("duplicate key value violates unique constraint", detail)
+        assert "alice@example.com" in str(exc), "the message holds it before anything is done"
+        message = E.safe_message(exc)
+        assert "alice@example.com" not in message
+        assert message == "23505: duplicate key value violates unique constraint"
+
+    def test_the_value_is_still_there_to_look_at(self) -> None:
+        """Only the one line is redacted; a post-mortem still needs the row."""
+        detail = "Key (email)=(alice@example.com) already exists."
+        exc = self.make("duplicate key value", detail)
+        E.safe_message(exc)
+        assert exc.diag.message_detail == detail
+
+    def test_a_failure_the_driver_raised_has_no_code_and_still_reads(self) -> None:
+        assert E.safe_message(ValueError("nothing keeps one edge per pair")) == (
+            "nothing keeps one edge per pair"
+        )
+
+    def test_an_exception_with_nothing_in_it_is_named_by_its_class(self) -> None:
+        assert E.safe_message(RuntimeError()) == "RuntimeError"
+
+    def test_only_the_first_line_is_taken(self) -> None:
+        assert E.safe_message(ValueError("first line\nsecond line")) == "first line"
+
+    def test_showing_details_does_not_reach_it(self) -> None:
+        """What that turns on is for reading at a terminal; this is for handing somewhere else."""
+        exc = self.make("duplicate key value", "Key (a)=(secret) already exists.")
+        E.show_error_details(True)
+        try:
+            assert "secret" not in E.safe_message(exc)
+        finally:
+            E.show_error_details(False)

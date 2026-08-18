@@ -1378,6 +1378,23 @@ It cuts DETAIL and CONTEXT and nothing else. A primary message can still echo th
 handed, because that is the server quoting its own input rather than a value belonging to another
 row.
 
+**Handing a failure to somebody who did not send the statement** wants the SQLSTATE and the primary
+message and nothing else, which `safe_message` is:
+
+```python
+agensgraph.safe_message(exc)     # '23505: duplicate key value violates unique constraint "doc_email"'
+```
+
+A model reading its own error is the case for it, and so are a log line, an API body and a tool
+result. It never reaches DETAIL, it stays one line, `show_error_details` does not affect it, and it
+answers for a failure the driver raised itself, which carries no SQLSTATE, as well as for one psycopg
+raised.
+
+A copy's failure is described the same way. It arrives when the copy's block ends rather than from a
+statement, so the cursor that describes every statement never saw it: `load_vertices` of a duplicate
+key put the conflicting value into `str(exc)` where the same write through a statement did not. All
+four copy paths now read the same as a statement, which is asserted by comparing the two messages.
+
 `agensgraph.errors.mask_dsn()` is there for a caller who holds a connection string and wants to write
 it somewhere. Nothing in this driver calls it, and that was checked rather than assumed: no message,
 log record or `__repr__` it produces carries one.
@@ -1598,6 +1615,7 @@ Everything exported from `agensgraph`. The submodules `agensgraph.columnar`, `ag
 | `BatchFailed` | a pipeline failed as a batch, carrying what was sent |
 | `show_error_details(bool)`, `showing_error_details()` | whether DETAIL and CONTEXT reach the message |
 | `redact_details(exc)` | cut them from one exception |
+| `safe_message(exc)` | the code and the primary line, for handing somewhere else |
 | `errors` | the whole hierarchy, plus `translate`, `mask_dsn`, `attach_query` |
 
 **Bulk and memory**

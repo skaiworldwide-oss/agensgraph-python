@@ -26,6 +26,7 @@ from .errors import Retryability as Retryability
 from .errors import is_retryable as is_retryable
 from .errors import redact_details as redact_details
 from .errors import retryability as retryability
+from .errors import safe_message as safe_message
 from .errors import show_error_details as show_error_details
 from .errors import showing_error_details as showing_error_details
 from .introspect import Check as Check
@@ -137,6 +138,7 @@ __all__ = [
     "redact_details",
     "remove_query_logger",
     "retryability",
+    "safe_message",
     "show_error_details",
     "showing_error_details",
     "to_builtins",
