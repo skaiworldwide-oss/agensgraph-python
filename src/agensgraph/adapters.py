@@ -69,17 +69,23 @@ from .errors import StaleLabelCache
 from .numbers import decode_json, encode_json
 
 if TYPE_CHECKING:
-    from psycopg import Connection
+    from collections.abc import Sequence
+
+    from psycopg import AsyncConnection, Connection
     from psycopg.abc import AdaptContext, Buffer
 
     from ._protocol.labels import LabelCache
 
 __all__ = [
     "OIDS",
+    "OID_QUERY",
     "Unspecified",
     "assert_oids",
+    "async_assert_oids",
+    "check_oids",
     "dump_jsonb",
     "graph_adapters",
+    "oid_names",
     "register_binary",
     "register_text",
 ]
@@ -481,6 +487,15 @@ def graph_adapters() -> AdaptersMap:
     return adapters
 
 
+OID_QUERY = "SELECT typname, oid FROM pg_type WHERE typname = ANY(%s)"
+"""The statement that reads the graph types' oids, taking the names to look for."""
+
+
+def oid_names() -> list[str]:
+    """The type names to ask the server about."""
+    return sorted(OIDS)
+
+
 def assert_oids(conn: Connection[Any]) -> None:
     """Check the written-down oids against the connected server.
 
@@ -489,10 +504,22 @@ def assert_oids(conn: Connection[Any]) -> None:
     the binary rendering comes back as raw bytes with no error at all, so a wrong oid is a
     silently wrong result rather than a loud one.
     """
-    names = sorted(OIDS)
-    rows = conn.execute(
-        "SELECT typname, oid FROM pg_type WHERE typname = ANY(%s)", (names,)
-    ).fetchall()
+    check_oids(conn.execute(OID_QUERY, (oid_names(),)).fetchall())
+
+
+async def async_assert_oids(conn: AsyncConnection[Any]) -> None:
+    """Check the written-down oids against the connected server, waiting on it.
+
+    The same check as :func:`assert_oids`, for a caller whose connection has to be waited on.
+    Both hand the rows to the same reading of them, so the two cannot drift apart.
+    """
+    cursor = await conn.execute(OID_QUERY, (oid_names(),))
+    check_oids(await cursor.fetchall())
+
+
+def check_oids(rows: Sequence[Sequence[Any]]) -> None:
+    """Fail if the rows the server sent do not name every graph type at the oid written down."""
+    names = oid_names()
     found = {str(name): int(oid) for name, oid in rows}
     missing = [name for name in names if name not in found]
     if missing:

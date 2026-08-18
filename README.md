@@ -118,6 +118,12 @@ Only the methods that wait for the server are written twice. Everything else (ad
 table, statement checks, building a result) exists once and is shared, and the blocking interface is
 generated from the awaiting one, so the two cannot drift.
 
+`AsyncConnection.connect` is the awaiting entry point. The module-level `agensgraph.connect()` and
+`agensgraph.dbapi.connect()` are the blocking ones and have no awaiting form: `connect()` is
+`Connection.connect` under another name, and DBAPI is a blocking specification. Where a helper takes
+a connection and has to talk to it, the awaiting form is named for it:
+`adapters.async_assert_oids(conn)` beside `adapters.assert_oids(conn)`.
+
 `conn.graph(name)` selects a graph and fills the label table that the composite rendering needs. The
 name is quoted rather than bound, because the grammar has no place for a parameter there. The table
 is dropped again automatically when anything moves the session somewhere else, including a rollback
@@ -463,6 +469,28 @@ with conn.transaction(), conn.cursor(name="export") as cursor:
 
 `columns(records, keys)` is the same transposition without a backend, for a caller who wants plain
 lists. It keeps every column even when two share a name.
+
+**Awaiting the source.** A cursor that has to be awaited needs the awaiting forms, since the
+blocking ones drain with a bare `fetchmany` and would be handed a coroutine:
+
+```python
+from agensgraph.columnar import async_batches, async_to_arrow
+
+async with conn.transaction(), conn.cursor(name="export") as cursor:
+    await cursor.execute('SELECT id, v FROM "graph".emb')
+    async for batch in async_batches(cursor, size=8192):
+        writer.write_batch(batch)
+
+table = await async_to_arrow(conn.stream("MATCH (n:Doc) RETURN n.v"), keys=["v"], size=8192)
+```
+
+`async_to_pandas` and `async_to_polars` match their blocking forms. A `Result` and a list of rows are
+sources here too, so a caller need not know which it holds.
+
+There is no awaiting `reader`. A `pyarrow.RecordBatchReader` is pulled from rather than pushed to and
+refuses an awaiting iterator, so reading one from such a source means either holding the whole result
+(which is what a reader exists to avoid) or awaiting inside the pull, which stops the loop. Loop
+over `async_batches` and hand each batch to the writer instead, as above.
 
 ## Bulk loading
 
@@ -1069,6 +1097,15 @@ password), and no parameter value ever reaches a span.
 agensgraph.observability.add_notice_listener(lambda n: print(n.severity, n.message))
 ```
 
+**A callback runs on whatever ran the statement**, both of these, and it is called rather than
+scheduled. On the awaiting interface that is the task the statement is on, so a callback that blocks
+stops the event loop for as long as it blocks. Keep them to putting a value somewhere: append to a
+list, increment a counter, put onto a queue that something else drains. Writing to a socket or a
+file belongs on the other side of that queue.
+
+Raising in one is safe: it is logged and swallowed, so a listener cannot replace the statement's own
+outcome, and one listener raising does not stop the others being told.
+
 ## Handing a result to something that wants JSON
 
 ```python
@@ -1422,7 +1459,7 @@ Everything exported from `agensgraph`. The submodules `agensgraph.columnar`, `ag
 
 | | |
 |---|---|
-| `columnar` | `to_arrow`, `to_pandas`, `to_polars`, `batches`, `reader`, `columns`, `Layout` |
+| `columnar` | `to_arrow`, `to_pandas`, `to_polars`, `batches`, `reader`, `columns`, `Layout`; `async_to_arrow`, `async_to_pandas`, `async_to_polars`, `async_batches` for a source that is awaited |
 | `vector` | `Vector`, `SparseVector`, `vector_index`, `nearest`, `generated_column`, `Distance`, `SEARCH_OPTIONS` |
 | `dbapi` | the PEP 249 surface |
 | `errors` | the exception hierarchy and the classification function |

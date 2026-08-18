@@ -44,12 +44,16 @@ from .types import Edge, Path, Vertex
 from .vector import SparseVector, Vector
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Iterator
+    from collections.abc import AsyncIterator, Callable, Iterable, Iterator
 
 __all__ = [
     "CHUNK",
     "Layout",
     "Plan",
+    "async_batches",
+    "async_to_arrow",
+    "async_to_pandas",
+    "async_to_polars",
     "batches",
     "columns",
     "edge_payloads",
@@ -998,6 +1002,137 @@ def to_arrow(
 
     built = list(batches(source, keys, size=size, oids=oids, layout=layout, schema=schema))
     return pyarrow.Table.from_batches(built, schema=built[0].schema)
+
+
+async def _async_chunks(rows: Any, size: int | None) -> AsyncIterator[Sequence[Sequence[Any]]]:
+    """The rows in chunks, from a source that has to be waited on.
+
+    The same shape as the blocking one, and for the same reason: a cursor is drained a chunk at a
+    time so a server-side cursor's rows stay on the server, and at least one chunk is always
+    handed over so a schema is settled even for an empty result.
+    """
+    if hasattr(rows, "fetchmany"):
+        empty = True
+        while True:
+            fetched = await (rows.fetchall() if size is None else rows.fetchmany(size))
+            if not fetched:
+                break
+            empty = False
+            yield fetched
+            if size is None:
+                break
+        if empty:
+            yield []
+        return
+    if hasattr(rows, "__aiter__"):
+        empty = True
+        held: list[Sequence[Any]] = []
+        async for row in rows:
+            held.append(row)
+            if size is not None and len(held) >= size:
+                empty = False
+                yield held
+                held = []
+        if held:
+            yield held
+        elif empty:
+            yield []
+        return
+    async for chunk in _as_async(_chunks(rows, size)):
+        yield chunk
+
+
+async def _as_async(source: Iterator[Any]) -> AsyncIterator[Any]:
+    """A blocking iterator read from an awaiting one, for a source that needs no waiting."""
+    for item in source:
+        yield item
+
+
+async def async_batches(
+    source: Any,
+    keys: Sequence[str] | None = None,
+    *,
+    size: int | None = CHUNK,
+    oids: Sequence[int] = (),
+    layout: Layout = DEFAULT,
+    schema: Any = None,
+) -> AsyncIterator[Any]:
+    """Record batches from an awaiting cursor, an awaiting iterator, or anything :func:`batches`
+    takes.
+
+    What an awaiting caller needs to export a result larger than memory: an awaiting server-side
+    cursor hands over a chunk at a time and nothing beyond that chunk is held. A result already in
+    memory works here too, so a caller need not know which it has.
+
+    There is no awaiting form of :func:`reader`, and cannot be a useful one: a
+    ``pyarrow.RecordBatchReader`` is pulled from rather than pushed to, and it refuses an awaiting
+    iterator outright. Reading one from an awaiting source means either holding the whole result,
+    which is what a reader exists to avoid, or waiting inside the pull, which stops the loop.
+    Collect from here instead, or hand the batches to a writer as they arrive.
+    """
+    rows, names, types = _source(source, keys, oids)
+    plan = Plan(names, oids=types, layout=layout, schema=schema)
+    async for chunk in _async_chunks(rows, size):
+        yield plan.batch(chunk)
+
+
+async def async_to_arrow(
+    source: Any,
+    keys: Sequence[str] | None = None,
+    *,
+    size: int | None = None,
+    oids: Sequence[int] = (),
+    layout: Layout = DEFAULT,
+    schema: Any = None,
+) -> Any:
+    """An Arrow table, from a source that has to be waited on. Needs ``pyarrow``."""
+    import pyarrow
+
+    built = [
+        batch
+        async for batch in async_batches(
+            source, keys, size=size, oids=oids, layout=layout, schema=schema
+        )
+    ]
+    return pyarrow.Table.from_batches(built, schema=built[0].schema)
+
+
+async def async_to_pandas(
+    source: Any,
+    keys: Sequence[str] | None = None,
+    *,
+    dtypes: Literal["arrow", "numpy"] = "arrow",
+    size: int | None = None,
+    oids: Sequence[int] = (),
+    layout: Layout = DEFAULT,
+    schema: Any = None,
+) -> Any:
+    """A pandas frame, from a source that has to be waited on. Needs ``pandas``."""
+    import pandas
+
+    table = await async_to_arrow(
+        source, keys, size=size, oids=oids, layout=layout, schema=schema
+    )
+    if dtypes == "arrow":
+        return table.to_pandas(types_mapper=pandas.ArrowDtype)
+    return table.to_pandas()
+
+
+async def async_to_polars(
+    source: Any,
+    keys: Sequence[str] | None = None,
+    *,
+    size: int | None = None,
+    oids: Sequence[int] = (),
+    layout: Layout = DEFAULT,
+    schema: Any = None,
+) -> Any:
+    """A polars frame, from a source that has to be waited on. Needs ``polars``."""
+    import polars
+
+    return polars.from_arrow(
+        await async_to_arrow(source, keys, size=size, oids=oids, layout=layout, schema=schema)
+    )
 
 
 def to_pandas(

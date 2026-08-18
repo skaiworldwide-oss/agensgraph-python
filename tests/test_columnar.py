@@ -17,12 +17,18 @@ from typing import Any
 from uuid import UUID
 
 import pytest
+import pytest_asyncio
 
 import agensgraph
 from agensgraph import bulk
+from agensgraph.adapters import async_assert_oids
 from agensgraph.columnar import (
     Layout,
     Plan,
+    async_batches,
+    async_to_arrow,
+    async_to_pandas,
+    async_to_polars,
     batches,
     columns,
     edge_payloads,
@@ -823,3 +829,117 @@ class TestTwoColumnsOfOneName:
         assert table.num_columns == 2
         assert table.column(0).to_pylist() == [1, 3]
         assert table.column(1).to_pylist() == [2, 4]
+
+
+@pytest.mark.server
+class TestExportingFromAnAwaitingSource:
+    """A cursor that has to be waited on, which is the only source that streams for such a caller.
+
+    The blocking reader drains with a bare ``fetchmany``, which on an awaiting cursor hands back a
+    coroutine: measured, ``to_arrow`` of one raised ``TypeError: zip() argument after * must be an
+    iterable, not coroutine`` and left ``coroutine 'fetchall' was never awaited`` behind it. A
+    result already in memory worked, so what was missing was exactly the streaming shape -- and
+    holding the whole result to get around it is what a cursor exists to avoid.
+    """
+
+    ROWS = 300
+
+    @pytest_asyncio.fixture
+    async def filled(self, dsn: str):  # type: ignore[no-untyped-def]
+        graph = "columnar_async"
+        conn = await agensgraph.AsyncConnection.connect(dsn, autocommit=True)
+        async with conn:
+            await conn.execute(f'drop graph if exists "{graph}" cascade')
+            await conn.execute(f'create graph "{graph}"')
+            await conn.graph(graph)
+            await conn.execute("create vlabel doc")
+            await conn.execute(
+                f"unwind range(1,{self.ROWS})::jsonb as i create (:doc {{n: i}})"
+            )
+            await conn.refresh_labels()
+            await conn.set_autocommit(False)
+            try:
+                yield conn
+            finally:
+                await conn.rollback()
+                await conn.set_autocommit(True)
+                await conn.execute("reset graph_path")
+                await conn.execute(f'drop graph "{graph}" cascade')
+
+    @pytest.mark.asyncio
+    async def test_the_batches_are_the_size_asked_for(self, filled) -> None:  # type: ignore[no-untyped-def]
+        async with filled.cursor(name="sized") as cursor:
+            await cursor.execute("select * from (match (n:doc) return n.n) as t")
+            sizes = [batch.num_rows async for batch in async_batches(cursor, size=100)]
+        assert sizes == [100, 100, 100]
+
+    @pytest.mark.asyncio
+    async def test_the_rows_stay_on_the_server_until_they_are_asked_for(self, filled) -> None:  # type: ignore[no-untyped-def]
+        """The whole point, so it is asserted rather than assumed: the cursor is still open."""
+        async with filled.cursor(name="still_open") as cursor:
+            await cursor.execute("select * from (match (n:doc) return n.n) as t")
+            stream = async_batches(cursor, size=100)
+            first = await stream.__anext__()
+            cursor2 = await filled.execute(
+                "select count(*) from pg_cursors where name = %s", ("still_open",)
+            )
+            (open_cursors,) = await cursor2.fetchone()
+            await stream.aclose()
+        assert first.num_rows == 100
+        assert open_cursors == 1, "the result was not drained to build the first batch"
+
+    @pytest.mark.asyncio
+    async def test_a_table_is_built_from_all_of_them(self, filled) -> None:  # type: ignore[no-untyped-def]
+        async with filled.cursor(name="whole") as cursor:
+            await cursor.execute("select * from (match (n:doc) return n.n) as t")
+            table = await async_to_arrow(cursor, size=100)
+        assert table.num_rows == self.ROWS
+        assert table.column_names == ["n"]
+
+    @pytest.mark.asyncio
+    async def test_an_awaiting_iterator_of_rows_is_a_source_too(self, filled) -> None:  # type: ignore[no-untyped-def]
+        """Which is what ``stream()`` hands back, so the two ways of reading a result agree."""
+        table = await async_to_arrow(
+            filled.stream("match (n:doc) return n.n"), keys=["n"], size=100
+        )
+        assert table.num_rows == self.ROWS
+
+    @pytest.mark.asyncio
+    async def test_a_result_already_read_works_here_as_well(self, filled) -> None:  # type: ignore[no-untyped-def]
+        """So a caller need not know which of the two it is holding."""
+        result = await filled.execute_query("match (n:doc) return n.n as n")
+        table = await async_to_arrow(result)
+        assert table.num_rows == self.ROWS
+
+    @pytest.mark.asyncio
+    async def test_an_empty_result_still_settles_a_schema(self, filled) -> None:  # type: ignore[no-untyped-def]
+        async with filled.cursor(name="none") as cursor:
+            await cursor.execute("select * from (match (n:doc) where false return n.n) as t")
+            table = await async_to_arrow(cursor, size=100)
+        assert table.num_rows == 0
+        assert table.column_names == ["n"]
+
+    @pytest.mark.asyncio
+    async def test_the_frames_are_built_too(self, filled) -> None:  # type: ignore[no-untyped-def]
+        for name, export in (("pandas", async_to_pandas), ("polars", async_to_polars)):
+            async with filled.cursor(name=f"frame_{name}") as cursor:
+                await cursor.execute("select * from (match (n:doc) return n.n) as t")
+                frame = await export(cursor, size=100)
+            assert len(frame) == self.ROWS
+
+    @pytest.mark.asyncio
+    async def test_the_oid_check_is_available_to_such_a_caller(self, filled) -> None:  # type: ignore[no-untyped-def]
+        """It reads one statement, and the reading of the answer is the one the other form uses."""
+        await async_assert_oids(filled)
+
+    def test_there_is_no_awaiting_reader_and_the_reason_is_arrow(self) -> None:
+        """A ``RecordBatchReader`` is pulled from, and it refuses an awaiting iterator outright."""
+        pyarrow = pytest.importorskip("pyarrow")
+
+        async def batches_of():  # type: ignore[no-untyped-def]
+            yield pyarrow.record_batch({"a": [1]})
+
+        with pytest.raises(TypeError, match="not iterable"):
+            pyarrow.RecordBatchReader.from_batches(
+                pyarrow.schema([("a", "int64")]), batches_of()
+            )
