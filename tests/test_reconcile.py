@@ -341,6 +341,23 @@ class TestAgainstAServer:
         assert graph.ensure_indexes([DesiredIndex("doc", ("name",))], drop_extra=True)
         assert [index_properties(i.definition) for i in graph.indexes("doc")] == [("name",)]
 
+    def test_drop_extra_leaves_a_label_the_caller_did_not_name(self, graph) -> None:  # type: ignore[no-untyped-def]
+        """What is read here is the whole graph's, and a caller declaring one label is not
+        saying every other label should have nothing."""
+        graph.execute("create vlabel other")
+        graph.execute("create unique property index other_key on other (k)")
+        graph.execute("create property index on doc (stale)")
+
+        planned = graph.ensure_indexes(
+            [DesiredIndex("doc", ("name",))], drop_extra=True, dry_run=True
+        )
+        assert not any("other_key" in statement for statement in planned)
+        assert any("stale" in statement for statement in planned)
+
+        graph.ensure_indexes([DesiredIndex("doc", ("name",))], drop_extra=True)
+        assert [i.name for i in graph.indexes("other")] == ["other_key"]
+        assert [index_properties(i.definition) for i in graph.indexes("doc")] == [("name",)]
+
     def test_a_real_partial_index_does_not_satisfy_a_desired_plain_one(self, graph) -> None:  # type: ignore[no-untyped-def]
         """Against the server, so the rendering of the WHERE clause is the real one."""
         graph.execute("create property index on doc (c) where c > 0")

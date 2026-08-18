@@ -19,12 +19,23 @@ those reports an invalid constraint type rather than returning nothing. Both are
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, NamedTuple, TypeVar
 
 from .cypher import quote_identifier
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+    from typing import Protocol
+
+    class _HasLabel(Protocol):
+        """Anything the reconcilers key by label: an index, a constraint, or one asked for."""
+
+        @property
+        def label(self) -> str: ...
+
+
+_Labelled = TypeVar("_Labelled", bound="_HasLabel")
+"""What a narrowing hands back, which is whatever kind it was given."""
 
 __all__ = [
     "CONSTRAINTS_QUERY",
@@ -52,6 +63,7 @@ __all__ = [
     "constraint_name",
     "describe_kind",
     "element_count_query",
+    "for_labels",
     "index_elements",
     "index_is_partial",
     "index_method",
@@ -620,6 +632,26 @@ def create_constraint_statement(desired: Unique | Check) -> str:
 
 def drop_constraint_statement(label: str, name: str) -> str:
     return f"drop constraint {quote_identifier(name)} on {quote_identifier(label)}"
+
+
+def for_labels(
+    actual: Sequence[_Labelled], desired: Sequence[_HasLabel], scoped: bool
+) -> Sequence[_Labelled]:
+    """``actual`` narrowed to the labels ``desired`` names, when the caller is dropping.
+
+    The reconcilers read the list they are given as the whole of what should exist, which is what
+    lets an empty one mean "none of these". That only holds while both lists describe the same
+    thing, and a caller declaring one label's indexes is handed the whole graph's -- so the graph's
+    are narrowed to what the caller was talking about before the two are compared. Without the
+    narrowing a list naming one label drops the indexes of every label it did not name.
+
+    Nothing is narrowed when the caller is not dropping, since then the extra ones are only read
+    past.
+    """
+    if not scoped:
+        return actual
+    spoken_for = {want.label for want in desired}
+    return [have for have in actual if have.label in spoken_for]
 
 
 def reconcile_indexes(

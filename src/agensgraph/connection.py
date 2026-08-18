@@ -91,6 +91,7 @@ from .introspect import (
     Unique,
     describe_kind,
     element_count_query,
+    for_labels,
     index_properties,
     property_sample_query,
     reconcile_constraints,
@@ -1105,12 +1106,21 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
         ``drop_extra`` also removes indexes nobody asked for, considering only indexes a
         :class:`~agensgraph.DesiredIndex` could describe. One over an expression is left alone.
 
+        It reaches only the labels ``desired`` names. A caller saying what one label should have is
+        saying nothing about any other, and what is read here is the whole graph's -- so without
+        this, a list naming one label would drop the indexes of every label it did not name,
+        including uniqueness something else depends on.
+
         The state is read again afterwards and anything still outstanding is raised. Naming an
         operator class that is already the default does this, since the server omits a default when
         printing a definition.
         """
         name = self._graph_of(graph)
-        statements = reconcile_indexes(desired, self.indexes(graph=name), drop_extra=drop_extra)
+        statements = reconcile_indexes(
+            desired,
+            for_labels(self.indexes(graph=name), desired, drop_extra),
+            drop_extra=drop_extra,
+        )
         if dry_run:
             return statements
         for statement in statements:
@@ -1131,10 +1141,15 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
 
         Matched by name. A :class:`~agensgraph.Unique` given no name is named after its property; a
         :class:`~agensgraph.Check` has to be given one.
+
+        ``drop_extra`` reaches only the labels ``desired`` names, for the reason given in
+        :meth:`ensure_indexes`.
         """
         name = self._graph_of(graph)
         statements = reconcile_constraints(
-            desired, self.constraints(graph=name), drop_extra=drop_extra
+            desired,
+            for_labels(self.constraints(graph=name), desired, drop_extra),
+            drop_extra=drop_extra,
         )
         if dry_run:
             return statements
