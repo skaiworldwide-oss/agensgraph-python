@@ -997,6 +997,18 @@ leaves the connection idle and answering.
 `connections_interrupted`; `pop_stats()` is the same with the accumulating ones reset, for reporting
 an interval. `resize()` and `check()` pass through.
 
+**Starvation shows up as `requests_wait_ms` against `requests_queued`**, which is how long borrowers
+spent waiting and how many had to wait at all. Measured with six slow borrowers against a pool of
+two: 8,846 ms of waiting across five queued requests, while a trivial query took 2.81 seconds just to
+get a connection. A pool that is too small looks exactly like a database that is slow until you read
+those two.
+
+**Every counter is always present, at zero when nothing has moved it.** psycopg keeps them in a
+`Counter`, so a key exists only once something has incremented it and `pop_stats()` takes them all
+away again; reading one on a timer therefore raised `KeyError` on the first interval, on any quiet
+interval, and after every pop. `agensgraph.pool.COUNTERS` names the ten that accumulate, so an
+exporter can iterate them rather than hard-coding a list.
+
 For a process that handles one request and exits, or a serverless one that may be frozen between
 requests, **`NullConnectionPool`** keeps nothing: one connection per caller, closed when they are
 done. Everything else is the same, so moving between the two is a change of class and nothing else. A

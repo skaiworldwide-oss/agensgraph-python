@@ -8,6 +8,7 @@ to, and that waiting for a connection is spent from the caller's budget.
 
 from __future__ import annotations
 
+import asyncio
 import time
 
 import psycopg_pool
@@ -720,3 +721,59 @@ class TestKeepingNothingAwaiting:
         finally:
             await p.close()
         assert not (before & after)
+
+
+class TestTheStatsAreReadableOnASchedule:
+    """A counter reported only once something has moved it cannot be read on a timer.
+
+    psycopg keeps them in a ``Counter``, so a key appears when it is first incremented and
+    ``pop_stats`` takes them all away again. Reading one every interval therefore raised
+    ``KeyError`` for the first interval, for any interval with no traffic, and for every interval
+    after a pop until that counter moved. They are reported at zero instead.
+    """
+
+    @pytest.mark.asyncio
+    async def test_every_counter_is_there_before_anything_happens(self, dsn: str) -> None:
+        pool = agensgraph.AsyncConnectionPool(dsn, min_size=1, max_size=1)
+        await pool.open(wait=True)
+        try:
+            stats = pool.get_stats()
+            missing = [name for name in agensgraph.pool.COUNTERS if name not in stats]
+            assert missing == []
+            assert stats["requests_wait_ms"] == 0
+        finally:
+            await pool.close()
+
+    @pytest.mark.asyncio
+    async def test_and_still_there_after_they_are_taken(self, dsn: str) -> None:
+        pool = agensgraph.AsyncConnectionPool(dsn, min_size=1, max_size=1)
+        await pool.open(wait=True)
+        try:
+            async with pool.connection() as conn:
+                await conn.execute("select 1")
+            assert pool.pop_stats()["requests_num"] >= 1
+            after = pool.get_stats()
+            missing = [name for name in agensgraph.pool.COUNTERS if name not in after]
+            assert missing == [], "a pop must not take the keys away with the values"
+            assert after["requests_num"] == 0
+        finally:
+            await pool.close()
+
+    @pytest.mark.asyncio
+    async def test_waiting_for_a_connection_is_counted(self, dsn: str) -> None:
+        """Which is the pair that shows starvation: how long, against how many queued."""
+        pool = agensgraph.AsyncConnectionPool(dsn, min_size=2, max_size=2)
+        await pool.open(wait=True)
+        try:
+
+            async def slow() -> None:
+                async with pool.connection() as conn:
+                    await conn.execute("select pg_sleep(0.5)")
+
+            waiting = [asyncio.create_task(slow()) for _ in range(6)]
+            await asyncio.gather(*waiting)
+            stats = pool.get_stats()
+            assert stats["requests_queued"] >= 1, "more borrowers than connections"
+            assert stats["requests_wait_ms"] > 0, "and they waited, which has to be reportable"
+        finally:
+            await pool.close()
