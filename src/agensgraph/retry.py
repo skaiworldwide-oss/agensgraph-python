@@ -213,6 +213,7 @@ class RetryPolicy:
         *,
         number: int,
         wrote: bool = False,
+        merging: bool = False,
         remaining: float | None = None,
     ) -> Attempt:
         """What to do about a failure on attempt *number*.
@@ -220,11 +221,13 @@ class RetryPolicy:
         ``wrote`` says whether the transaction had written anything, which decides whether a
         lost connection is worth reconnecting for or is a commit whose outcome is now unknown.
         ``remaining`` is what is left of the caller's budget; a wait that would not leave time
-        for another attempt is not worth taking.
+        for another attempt is not worth taking. ``merging`` says the statement creates only what
+        is missing, which is what makes another writer having got there first a reason to run it
+        again rather than a failure.
         """
         if number < 1:
             raise ValueError(f"an attempt is numbered from one, got {number}")
-        recovery = retryability(exc, wrote=wrote)
+        recovery = retryability(exc, wrote=wrote, merging=merging)
         delay = 0.0
 
         if not recovery.is_retryable:

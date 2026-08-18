@@ -210,7 +210,9 @@ _BY_CLASS: dict[str, Retryability] = {
 }
 
 
-def retryability(exc: BaseException, *, wrote: bool = False) -> Retryability:
+def retryability(
+    exc: BaseException, *, wrote: bool = False, merging: bool = False
+) -> Retryability:
     """Classify a failure.
 
     Pass ``wrote=True`` when the transaction had issued a write. A connection lost
@@ -219,6 +221,15 @@ def retryability(exc: BaseException, *, wrote: bool = False) -> Retryability:
     it becomes :attr:`Retryability.UNKNOWN` and wants resolving rather than repeating.
     A conflict stays safe either way, because a conflict is the server saying it rolled
     the transaction back.
+
+    Pass ``merging=True`` when the statement creates only what is missing -- a ``MERGE``, or
+    anything else whose whole intent is that the element ends up existing. Two writers merging
+    the same element report ``23505``, and one merging an element whose label does not exist yet
+    reports ``42P07`` from the label the other writer created underneath it. Neither is a caller
+    mistake there: both say somebody else arrived first, which is the outcome asked for, and
+    running the statement again finds what they made. Both stay :attr:`Retryability.FATAL`
+    without this, because a uniqueness violation is ordinarily the caller writing a duplicate and
+    only the caller knows which of the two it meant.
     """
     for kind, answer in _OURS:
         if isinstance(exc, kind):
@@ -230,9 +241,20 @@ def retryability(exc: BaseException, *, wrote: bool = False) -> Retryability:
     else:
         found = _classify_foreign(exc)
 
+    if merging and found is Retryability.FATAL and _is_someone_else_first(exc):
+        # Aborted, like any conflict, so the same connection runs it again after a rollback.
+        return Retryability.SAFE
     if wrote and found is Retryability.RECONNECT:
         return Retryability.UNKNOWN
     return found
+
+
+_ARRIVED_FIRST = frozenset({"23505", "42P07"})
+"""What the server says when another writer created the thing this one was creating."""
+
+
+def _is_someone_else_first(exc: BaseException) -> bool:
+    return isinstance(exc, _pg.Error) and exc.sqlstate in _ARRIVED_FIRST
 
 
 def _classify_foreign(exc: BaseException) -> Retryability:
@@ -259,9 +281,9 @@ def _classify_foreign(exc: BaseException) -> Retryability:
     return found
 
 
-def is_retryable(exc: BaseException, *, wrote: bool = False) -> bool:
+def is_retryable(exc: BaseException, *, wrote: bool = False, merging: bool = False) -> bool:
     """Whether another attempt is sound. See :func:`retryability` for the rest."""
-    return retryability(exc, wrote=wrote).is_retryable
+    return retryability(exc, wrote=wrote, merging=merging).is_retryable
 
 
 class CapabilityError(_pg.NotSupportedError):

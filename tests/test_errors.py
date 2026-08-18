@@ -90,6 +90,32 @@ def test_a_lost_connection_becomes_unknown_after_a_write() -> None:
     assert E.retryability(error_for("08006"), wrote=True) is R.UNKNOWN
 
 
+class TestSomebodyElseGotThereFirst:
+    """A statement that creates only what is missing has a different answer for a conflict."""
+
+    @pytest.mark.parametrize("state", ["23505", "42P07"])
+    def test_it_is_fatal_unless_the_caller_says_it_was_merging(self, state: str) -> None:
+        """Only the caller knows whether a duplicate is its own mistake or another writer."""
+        assert E.retryability(error_for(state)) is R.FATAL
+        assert E.retryability(error_for(state), merging=True) is R.SAFE
+        assert E.is_retryable(error_for(state), merging=True)
+
+    @pytest.mark.parametrize("state", ["23503", "23502", "42601", "42501"])
+    def test_and_nothing_else_becomes_retryable(self, state: str) -> None:
+        """A missing reference or a bad statement is not somebody arriving first."""
+        assert E.retryability(error_for(state), merging=True) is R.FATAL
+
+    def test_a_write_before_it_does_not_change_the_answer(self) -> None:
+        assert E.retryability(error_for("23505"), wrote=True, merging=True) is R.SAFE
+
+    def test_the_policy_authorises_the_attempt(self) -> None:
+        from agensgraph import RetryPolicy
+
+        policy = RetryPolicy(attempts=3)
+        assert policy.decide(error_for("23505"), number=1, wrote=True).retry is False
+        assert policy.decide(error_for("23505"), number=1, wrote=True, merging=True).retry
+
+
 def test_a_connection_failure_with_no_sqlstate_is_a_reconnect() -> None:
     assert E.retryability(pg.OperationalError("could not connect")) is R.RECONNECT
 
@@ -380,3 +406,63 @@ class TestKeepingRowDataOutOfAMessage:
         finally:
             E.show_error_details(False)
         assert not E.showing_error_details()
+
+
+@pytest.mark.server
+class TestARealMergeRace:
+    """The classification above, against two writers rather than a constructed exception."""
+
+    def test_the_conflict_is_the_one_merging_answers_for(self, agens, dsn: str) -> None:  # type: ignore[no-untyped-def]
+        import threading
+        import time
+
+        import agensgraph
+        from agensgraph import DesiredIndex, RetryPolicy
+
+        graph = agens.label_table.graph
+        agens.execute("create vlabel m")
+        agens.ensure_indexes([DesiredIndex("m", ("name",), unique=True)])
+
+        caught: dict[str, BaseException] = {}
+        retried: dict[str, bool] = {}
+
+        def writer(tag: str, hold: bool) -> None:
+            conn = agensgraph.connect(dsn, autocommit=False)
+            conn.graph(graph)
+            try:
+                conn.execute("merge (n:m {name: 'shared'})")
+                if hold:
+                    time.sleep(0.5)
+                conn.commit()
+            except Exception as exc:
+                caught[tag] = exc
+                conn.rollback()
+                # Selecting a graph is transactional, so the rollback undid it.
+                conn.graph(graph)
+                policy = RetryPolicy(attempts=3)
+                attempt = policy.decide(exc, number=1, wrote=True, merging=True)
+                retried[tag] = attempt.retry
+                if attempt.retry:
+                    conn.execute("merge (n:m {name: 'shared'})")
+                    conn.commit()
+                    policy.succeeded()
+            finally:
+                conn.close()
+
+        first = threading.Thread(target=writer, args=("a", True))
+        second = threading.Thread(target=writer, args=("b", False))
+        first.start()
+        time.sleep(0.05)
+        second.start()
+        first.join()
+        second.join()
+
+        if not caught:
+            pytest.skip("the two writers did not overlap, so there is no conflict to classify")
+        (tag, exc), *_ = caught.items()
+        assert exc.sqlstate in {"23505", "42P07"}  # type: ignore[attr-defined]
+        assert E.retryability(exc) is R.FATAL, "not retryable without the caller saying why"
+        assert E.retryability(exc, merging=True) is R.SAFE
+        assert retried[tag] is True
+        (count,) = agens.execute("match (n:m {name: 'shared'}) return count(*)").fetchone()
+        assert count == 1, "the retry found what the other writer made rather than adding to it"
