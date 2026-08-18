@@ -22,7 +22,7 @@ import re
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Iterator, Mapping
 
 __all__ = [
     "WRAP",
@@ -372,8 +372,11 @@ def wrap_for_cursor(statement: str, *, alias: str = "t") -> str:
     trailing ``ORDER BY``, ``SKIP`` or ``LIMIT``; ``FINISH`` in place of ``RETURN``; and ``UNION``,
     ``INTERSECT`` or ``EXCEPT`` between parenthesised reads. The alias is required.
 
-    What it refuses: any write, ``FILTER``, a ``LIMIT`` or ``ORDER BY`` that is not last, and
-    ``CALL func() YIELD``, which the grammar allows only as a top-level clause.
+    What the server refuses inside it: ``FILTER``, ``NEXT``, ``CALL func() YIELD`` -- the grammar
+    keeps those for the top of a statement -- and a ``LIMIT`` or ``ORDER BY`` that is not last.
+    Those come back as a syntax error naming the word, and they are the server's to refuse rather
+    than this function's, because which of them a subquery takes moves between server versions.
+    What is refused here, before the statement is sent, is a write.
     """
     check_can_wrap(statement)
     return WRAP.format(statement=_without_terminator(statement), alias=quote_identifier(alias))
@@ -418,18 +421,35 @@ def writable_counters(statement: str) -> frozenset[int]:
     return frozenset(groups)
 
 
+_NAMES_A_COLUMN = re.compile(r"\bas\s+$", re.IGNORECASE)
+
+
+def _clauses(pattern: re.Pattern[str], blanked: str) -> Iterator[re.Match[str]]:
+    """Matches of ``pattern`` that are clauses rather than names.
+
+    A keyword after ``AS`` names a column, and the server takes it there: ``RETURN n.name AS
+    create`` is a read, and it wraps. Being preceded by a dot or followed by a colon is already
+    excluded by the patterns themselves, which is what keeps ``n.create`` and ``{set: 1}`` out.
+    """
+    for found in pattern.finditer(blanked):
+        if _NAMES_A_COLUMN.search(blanked, 0, found.start()):
+            continue
+        yield found
+
+
 def check_can_wrap(statement: str) -> None:
     """Refuse a statement that cannot be read in chunks, saying which part is the reason.
 
-    Only a write is caught here. The subtler refusals -- a ``LIMIT`` that is not last, an
-    ``ORDER BY`` that is not final -- the server reports clearly by itself, and repeating that
-    judgement client-side would mean keeping a copy of the grammar in step with it.
+    Only a write is caught here, and a write is refused wherever it is sent. Everything else is
+    the grammar's judgement and the server's to make: the read-only subset a subquery takes
+    differs between server versions -- 2.18 refuses a ``LIMIT`` that is not last where 2.17 takes
+    the same statement -- so a driver predicting it would have to keep a copy of every version's
+    grammar in step with it, and be wrong about whichever server it guessed at.
     """
-    found = _WRITE_CLAUSE.search(without_literals(statement))
-    if found is None:
-        return
-    raise ValueError(
-        f"a statement that writes cannot be read in chunks: it holds "
-        f"{found.group(0).upper()}, and reading in chunks needs the statement placed where a "
-        f"subquery goes, which takes only the read-only subset. Read it whole instead."
-    )
+    blanked = without_literals(statement)
+    for found in _clauses(_WRITE_CLAUSE, blanked):
+        raise ValueError(
+            f"a statement that writes cannot be read in chunks: it holds "
+            f"{found.group(1).upper()}, and reading in chunks needs the statement placed where a "
+            f"subquery goes, which takes only the read-only subset. Read it whole instead."
+        )

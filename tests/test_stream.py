@@ -359,6 +359,28 @@ class TestTheWrapAroundAwkwardStatements:
     def test_and_a_name_that_merely_holds_the_word_is_not(self, statement: str) -> None:
         check_can_wrap(statement)
 
+    @pytest.mark.parametrize(
+        "statement",
+        [
+            "match (n:doc) return n.name as create",
+            "match (n:doc) return n.a as set, n.b as delete",
+            "match (n:doc) return 1 as merge",
+        ],
+    )
+    def test_a_word_naming_a_column_is_not_the_clause_it_spells(self, statement: str) -> None:
+        """``AS`` puts a name next, and the server takes a reserved one there."""
+        check_can_wrap(statement)
+
+    @pytest.mark.server
+    def test_the_server_agrees_the_alias_is_a_read(self, agens) -> None:  # type: ignore[no-untyped-def]
+        """Asserted against the server, so the driver is not alone in calling it one."""
+        agens.execute("create vlabel doc")
+        agens.execute("create (:doc {name: 'a'})")
+        (row,) = agens.execute(
+            wrap_for_cursor("match (n:doc) return n.name as create")
+        ).fetchall()
+        assert row[0] == "a"
+
 
 @pytest.mark.server
 class TestWhatAStreamNeeds:
