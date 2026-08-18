@@ -22,7 +22,7 @@ import re
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Mapping
+    from collections.abc import Mapping
 
 __all__ = [
     "WRAP",
@@ -454,20 +454,24 @@ def writable_counters(statement: str) -> frozenset[int]:
     return frozenset(groups)
 
 
-_NAMES_A_COLUMN = re.compile(r"\bas\s+$", re.IGNORECASE)
+def _names_a_column(blanked: str, start: int) -> bool:
+    """Whether the word at ``start`` is a name given by ``AS`` rather than a clause.
 
-
-def _clauses(pattern: re.Pattern[str], blanked: str) -> Iterator[re.Match[str]]:
-    """Matches of ``pattern`` that are clauses rather than names.
-
-    A keyword after ``AS`` names a column, and the server takes it there: ``RETURN n.name AS
-    create`` is a read, and it wraps. Being preceded by a dot or followed by a colon is already
+    ``RETURN n.name AS create`` is a read, and the server takes it: ``AS`` puts a name next and a
+    reserved word is allowed to be one. Being preceded by a dot or followed by a colon is already
     excluded by the patterns themselves, which is what keeps ``n.create`` and ``{set: 1}`` out.
+
+    Read backwards over the whitespace and then the two characters before it, rather than by
+    searching everything ahead of the match, which costs the length of the statement each time a
+    keyword appears in a long one.
     """
-    for found in pattern.finditer(blanked):
-        if _NAMES_A_COLUMN.search(blanked, 0, found.start()):
-            continue
-        yield found
+    end = start
+    while end > 0 and blanked[end - 1].isspace():
+        end -= 1
+    if end == start or blanked[end - 2 : end].lower() != "as":
+        return False
+    before = blanked[end - 3 : end - 2]
+    return not (before.isalnum() or before == "_")
 
 
 def check_can_wrap(statement: str) -> None:
@@ -480,9 +484,15 @@ def check_can_wrap(statement: str) -> None:
     grammar in step with it, and be wrong about whichever server it guessed at.
     """
     blanked = without_literals(statement)
-    for found in _clauses(_WRITE_CLAUSE, blanked):
-        raise ValueError(
-            f"a statement that writes cannot be read in chunks: it holds "
-            f"{found.group(1).upper()}, and reading in chunks needs the statement placed where a "
-            f"subquery goes, which takes only the read-only subset. Read it whole instead."
-        )
+    # One search for the statement that holds none of the words, which is what an ordinary read
+    # is; the walk below is entered only once a word has been found.
+    found = _WRITE_CLAUSE.search(blanked)
+    while found is not None:
+        if not _names_a_column(blanked, found.start()):
+            raise ValueError(
+                f"a statement that writes cannot be read in chunks: it holds "
+                f"{found.group(1).upper()}, and reading in chunks needs the statement placed "
+                f"where a subquery goes, which takes only the read-only subset. Read it whole "
+                f"instead."
+            )
+        found = _WRITE_CLAUSE.search(blanked, found.end())

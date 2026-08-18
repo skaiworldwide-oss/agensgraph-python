@@ -371,6 +371,33 @@ class TestTheWrapAroundAwkwardStatements:
         """``AS`` puts a name next, and the server takes a reserved one there."""
         check_can_wrap(statement)
 
+    @pytest.mark.parametrize(
+        "statement",
+        [
+            "match (n:doc) with n.a as alias create (:made {v: alias})",
+            "match (n:doc) with n.a as has create (:made {v: has})",
+            "match (n:doc) with n.a as was delete n",
+            "match (n:doc) with n.a as _as set n.b = 1",
+        ],
+    )
+    def test_a_word_merely_ending_in_as_does_not_make_the_next_one_a_name(
+        self, statement: str
+    ) -> None:
+        """The word before is read too, so the name is ``alias`` and what follows is the clause."""
+        with pytest.raises(ValueError, match="cannot be read in chunks"):
+            check_can_wrap(statement)
+
+    @pytest.mark.parametrize(
+        "statement",
+        [
+            "match (n:doc) return n.a as\n  create",
+            "match (n:doc) return n.a as\tcreate",
+            "match (n:doc) return n.a AS create",
+        ],
+    )
+    def test_the_name_is_found_however_it_is_spaced_from_as(self, statement: str) -> None:
+        check_can_wrap(statement)
+
     @pytest.mark.server
     def test_the_server_agrees_the_alias_is_a_read(self, agens) -> None:  # type: ignore[no-untyped-def]
         """Asserted against the server, so the driver is not alone in calling it one."""
@@ -380,6 +407,16 @@ class TestTheWrapAroundAwkwardStatements:
             wrap_for_cursor("match (n:doc) return n.name as create")
         ).fetchall()
         assert row[0] == "a"
+
+    @pytest.mark.server
+    def test_and_agrees_the_one_after_a_word_ending_in_as_writes(self, agens) -> None:  # type: ignore[no-untyped-def]
+        """Which is what the refusal is protecting: it would take the wrap and write a row."""
+        agens.execute("create vlabel doc")
+        agens.execute("create vlabel made")
+        agens.execute("create (:doc {a: 1})")
+        agens.execute("match (n:doc) with n.a as alias create (:made {v: alias})")
+        (count,) = agens.execute("match (m:made) return count(*)").fetchone()
+        assert count == 1
 
 
 @pytest.mark.server
