@@ -1032,11 +1032,20 @@ worth keeping: capping afterwards makes the cap reachable only by chance and the
 one the name describes. A backpressure retry doubles the ceiling before capping, so it waits longer
 without breaking the cap.
 
-**A counter is not a budget.** Four layers each willing to try three times is sixty four attempts
+**A counter is not a budget.** Four layers each willing to try three times is eighty one attempts
 from one user action, so the allowance is a token bucket shared across the process: a transient
 failure costs more than a rejection does, because a connection failure is usually the whole service
 rather than this one request. When it is exhausted, the message says so, which saves a great deal of
 support time.
+
+**The allowance fills with time, and you should not rely on `succeeded()` to fill it.** Four transient
+failures spend enough to stop the retrying, and calling `succeeded()` is the only other thing that
+pays a token back. Since the default allowance is one object for the whole process, an allowance
+spent and never credited used to mean every retry everywhere was off until a restart. Time returns
+the tokens now: an allowance drained to nothing is retrying again about a minute later, which is the
+timescale of a failover rather than of a request. Reporting successes still helps, and recovers it
+sooner. `TokenBucket(capacity, refill=...)` sets the rate, and a `refill` of zero is refused rather
+than accepted as an allowance that can only ever be spent.
 
 The connection's fate is decided in one place on every exit path, including cancellation, rather than
 delegated to a callback that some paths skip.

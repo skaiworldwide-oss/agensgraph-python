@@ -14,6 +14,7 @@ those are a description of the current implementation and not a promise.
 
 from __future__ import annotations
 
+import math
 import sys
 import threading
 
@@ -51,10 +52,16 @@ def run_on_threads(work) -> None:  # type: ignore[no-untyped-def]
         thread.join()
 
 
+# These three are about the lock and nothing else: no update lost, no torn read. Time returning
+# tokens would put a fraction into every reading and none of the arithmetic below would hold, so it
+# is turned off -- which is also the strict form of the allowance, for a caller reporting every
+# success.
+
+
 def test_the_retry_allowance_loses_no_updates() -> None:
     """Read, modify, write -- so it holds a lock rather than trusting an operation to be atomic."""
     capacity = THREADS * EACH * REJECTION_COST
-    bucket = TokenBucket(capacity)
+    bucket = TokenBucket(capacity, refill=math.inf)
 
     def spend() -> None:
         for _ in range(EACH):
@@ -65,7 +72,7 @@ def test_the_retry_allowance_loses_no_updates() -> None:
 
 
 def test_paying_back_loses_nothing_either() -> None:
-    bucket = TokenBucket(THREADS * EACH)
+    bucket = TokenBucket(THREADS * EACH, refill=math.inf)
     for _ in range(THREADS * EACH):
         bucket.spend(Retryability.BACKPRESSURE)
     assert bucket.tokens() == 0
@@ -80,7 +87,7 @@ def test_paying_back_loses_nothing_either() -> None:
 
 def test_the_allowance_never_reads_as_a_number_it_never_held() -> None:
     """A torn read would show a value between two states, which no observer should ever see."""
-    bucket = TokenBucket(1000)
+    bucket = TokenBucket(1000, refill=math.inf)
     seen: list[float] = []
     stop = threading.Event()
 

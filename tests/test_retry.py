@@ -8,12 +8,14 @@ enough draws to mean something.
 from __future__ import annotations
 
 import random
+import time
 
 import psycopg.errors as pg
 import pytest
 
 from agensgraph.errors import Retryability
 from agensgraph.retry import (
+    REFILL_SECONDS,
     REJECTION_COST,
     SUCCESS_CREDIT,
     TRANSIENT_COST,
@@ -68,32 +70,70 @@ class TestFullJitter:
             full_jitter(bad)
 
 
+def a_bucket(capacity: int = 100) -> TokenBucket:
+    """A bucket whose refill is too slow to enter an assertion about what things cost.
+
+    The costs are what those tests are about. That time returns tokens is asserted on its own,
+    below, where the refill is fast on purpose.
+    """
+    return TokenBucket(capacity, refill=1_000_000.0)
+
+
 class TestTokenBucket:
     def test_it_starts_full_and_allows_retrying(self) -> None:
         bucket = TokenBucket(100)
-        assert bucket.tokens() == 100
+        assert bucket.tokens() == pytest.approx(100)
         assert bucket.allows_retry
 
     def test_it_stops_at_half_and_not_at_empty(self) -> None:
         """A failing server should see the ordinary load, not the load plus every retry."""
-        bucket = TokenBucket(100)
+        bucket = a_bucket()
         spent = 0
         while bucket.allows_retry:
             bucket.spend(Retryability.RECONNECT)
             spent += 1
         assert spent == 4  # 100 -> 86 -> 72 -> 58 -> 44
-        assert bucket.tokens() == 100 - 4 * TRANSIENT_COST
+        assert bucket.tokens() == pytest.approx(100 - 4 * TRANSIENT_COST)
+
+    def test_time_fills_it_again_with_no_help_from_the_caller(self) -> None:
+        """The defect this closes: a caller driving the loop by hand never reports a success.
+
+        Four transient failures spend enough to stop retrying, and a success is the only other
+        thing that paid a token back. So an allowance spent once stayed spent for the life of the
+        process, and being a process-wide singleton by default, that was every retry everywhere.
+        """
+        bucket = TokenBucket(100, refill=1.0)
+        while bucket.allows_retry:
+            bucket.spend(Retryability.RECONNECT)
+        assert not bucket.allows_retry
+        time.sleep(0.7)
+        assert bucket.allows_retry, "time alone has to be enough, or nothing ever recovers"
+
+    def test_the_shipped_rate_recovers_on_a_failover_timescale(self) -> None:
+        """Stated rather than measured, since waiting a minute is not a test."""
+        assert REFILL_SECONDS / 2 == 60.0
+
+    def test_it_is_not_filled_past_capacity_by_waiting(self) -> None:
+        bucket = TokenBucket(10, refill=0.01)
+        time.sleep(0.1)
+        assert bucket.tokens() == 10
+
+    def test_an_allowance_that_never_fills_is_refused(self) -> None:
+        """Since it could only ever be spent, which is the state this is here to prevent."""
+        for bad in (0.0, -1.0):
+            with pytest.raises(ValueError, match="never recovers"):
+                TokenBucket(10, refill=bad)
 
     def test_a_rejection_costs_less_than_a_transient_failure(self) -> None:
         """Being turned away is about this request; a transient failure is usually the service."""
         assert REJECTION_COST < TRANSIENT_COST
-        rejected, transient = TokenBucket(100), TokenBucket(100)
+        rejected, transient = a_bucket(), a_bucket()
         rejected.spend(Retryability.BACKPRESSURE)
         transient.spend(Retryability.RECONNECT)
         assert rejected.tokens() > transient.tokens()
 
     def test_successes_pay_it_back(self) -> None:
-        bucket = TokenBucket(100)
+        bucket = a_bucket()
         for _ in range(4):
             bucket.spend(Retryability.RECONNECT)
         assert not bucket.allows_retry
@@ -102,10 +142,10 @@ class TestTokenBucket:
         assert bucket.allows_retry
 
     def test_it_never_goes_below_nothing_or_above_full(self) -> None:
-        bucket = TokenBucket(10)
+        bucket = a_bucket(10)
         for _ in range(50):
             bucket.spend(Retryability.RECONNECT)
-        assert bucket.tokens() == 0
+        assert 0 <= bucket.tokens() < 1, "spending past empty leaves nothing, never a debt"
         for _ in range(500):
             bucket.credit()
         assert bucket.tokens() == 10
@@ -198,7 +238,8 @@ class TestDeciding:
     def test_deciding_not_to_retry_spends_nothing(self, policy: RetryPolicy) -> None:
         before = policy.bucket.tokens()
         policy.decide(failure(SYNTAX), number=1)
-        assert policy.bucket.tokens() == before
+        # Not equal: time returns tokens, so what is asserted is that none were taken.
+        assert policy.bucket.tokens() >= before
 
     def test_deciding_to_retry_spends(self, policy: RetryPolicy) -> None:
         before = policy.bucket.tokens()
@@ -212,13 +253,13 @@ class TestDeciding:
         assert policy.bucket.tokens() > before
 
     def test_a_shared_allowance_is_shared(self) -> None:
-        """A counter is per call site; four layers of three attempts is sixty-four tries."""
-        bucket = TokenBucket(100)
+        """A counter is per call site; four layers of three attempts is eighty-one tries."""
+        bucket = a_bucket()
         one = RetryPolicy(bucket=bucket, rng=random.Random(7))
         two = RetryPolicy(bucket=bucket, rng=random.Random(8))
         one.decide(failure(LOST), number=1)
         assert two.bucket is bucket
-        assert two.bucket.tokens() == 100 - TRANSIENT_COST
+        assert two.bucket.tokens() == pytest.approx(100 - TRANSIENT_COST)
 
     @pytest.mark.parametrize("bad", [0, -1])
     def test_there_is_always_a_first_attempt(self, bad: int) -> None:

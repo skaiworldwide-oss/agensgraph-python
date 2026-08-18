@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import random
 import threading
+import time
 from typing import TYPE_CHECKING
 
 from .errors import Retryability, attach_retry_history, retryability
@@ -36,6 +37,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
 __all__ = [
+    "REFILL_SECONDS",
     "SHARED_ALLOWANCE",
     "Attempt",
     "RetryPolicy",
@@ -78,21 +80,49 @@ def full_jitter(
     return pick(0.0, ceiling)
 
 
+REFILL_SECONDS = 120.0
+"""How long an empty allowance takes to fill, which decides how long a spent one stays spent.
+
+The allowance exists so that a service in trouble sees the ordinary load and not the ordinary load
+with every retry on top. That reason expires: once the failures stop arriving, the trouble is over
+and the next caller should be allowed to try again. Time is the only thing that says so without the
+caller's help, so time returns the tokens.
+
+At this rate a bucket drained to nothing is back above the halfway mark, and so retrying again,
+about a minute later -- the timescale of a failover rather than of a request.
+
+``refill=math.inf`` turns it off, leaving a reported success the only thing that pays anything back.
+That is the strict form of the idea and it is what a caller who reports every success wants; it is
+not the default, because a caller who forgets has no way back.
+"""
+
+
 class TokenBucket:
     """A process-wide allowance for retrying, so that a counter cannot be multiplied.
 
-    Held at a fixed size, drained by a failed attempt and refilled a little by each success.
-    While it is at or below half, nothing retries -- which is the point: a service that is
-    failing should see the ordinary load and not the ordinary load plus every retry.
+    Held at a fixed size, drained by a failed attempt, and filled by time passing and a little
+    more by each reported success. While it is at or below half, nothing retries -- which is the
+    point: a service that is failing should see the ordinary load and not the ordinary load plus
+    every retry.
+
+    **Time is what makes it recover, and that is not a refinement.** A success pays a token back,
+    but reporting one is the caller's to do and a caller driving the loop by hand forgets: four
+    transient failures spend enough to stop retrying, and with nothing but successes to refill it
+    the allowance stayed spent for the life of the process. Since it is a process-wide singleton
+    by default, that was every retry everywhere, silently, until a restart.
     """
 
-    __slots__ = ("_capacity", "_lock", "_tokens")
+    __slots__ = ("_capacity", "_last", "_lock", "_rate", "_tokens")
 
-    def __init__(self, capacity: int = 100) -> None:
+    def __init__(self, capacity: int = 100, *, refill: float = REFILL_SECONDS) -> None:
         if capacity <= 0:
             raise ValueError(f"a bucket has to hold something, got {capacity}")
+        if refill <= 0:
+            raise ValueError(f"an allowance that never fills never recovers, got {refill}")
         self._capacity = capacity
         self._tokens = float(capacity)
+        self._rate = capacity / refill
+        self._last = time.monotonic()
         # Not relying on any container being atomic, which is a description of an
         # implementation and not a promise.
         self._lock = threading.Lock()
@@ -101,26 +131,40 @@ class TokenBucket:
     def capacity(self) -> int:
         return self._capacity
 
+    def _now(self) -> float:
+        """The tokens there are, having first added what time has returned.
+
+        Read rather than added on a timer, so nothing has to run for an idle allowance to fill.
+        The caller holds the lock.
+        """
+        now = time.monotonic()
+        if now > self._last:
+            self._tokens = min(
+                float(self._capacity), self._tokens + (now - self._last) * self._rate
+            )
+            self._last = now
+        return self._tokens
+
     def tokens(self) -> float:
         with self._lock:
-            return self._tokens
+            return self._now()
 
     @property
     def allows_retry(self) -> bool:
         """Whether there is enough left to be worth spending."""
         with self._lock:
-            return self._tokens > self._capacity / 2
+            return self._now() > self._capacity / 2
 
     def spend(self, recovery: Retryability) -> None:
         """Take what an attempt of this kind costs."""
         cost = REJECTION_COST if recovery is Retryability.BACKPRESSURE else TRANSIENT_COST
         with self._lock:
-            self._tokens = max(0.0, self._tokens - cost)
+            self._tokens = max(0.0, self._now() - cost)
 
     def credit(self) -> None:
-        """Return what a success is worth."""
+        """Return what a success is worth, on top of what time has already returned."""
         with self._lock:
-            self._tokens = min(float(self._capacity), self._tokens + SUCCESS_CREDIT)
+            self._tokens = min(float(self._capacity), self._now() + SUCCESS_CREDIT)
 
     def __repr__(self) -> str:
         return f"TokenBucket({self.tokens():.0f}/{self._capacity})"
