@@ -164,6 +164,63 @@ class TestTheBoundaryHoldsForAnOrdinaryRole:
         assert refused["smuggled"] == "42501", "including one hidden behind another statement"
 
 
+@pytest.fixture
+def reaching(agens, dsn):  # type: ignore[no-untyped-def]
+    """A connection as a role that can *reach* the privilege without holding it.
+
+    A membership granted ``with inherit false`` carries nothing until ``set role`` names it. Such a
+    role is as dangerous as one that holds the privilege outright, because naming a membership moves
+    no rows and a read-only transaction has no reason to refuse it.
+    """
+    holder, name = "agens_program_holder", "agens_program_reacher"
+    for role in (name, holder):
+        with contextlib.suppress(psycopg.Error):
+            agens.execute(f'drop owned by "{role}" cascade')
+    try:
+        agens.execute(f'drop role if exists "{name}"')
+        agens.execute(f'drop role if exists "{holder}"')
+        agens.execute(f'create role "{holder}"')
+        agens.execute(f'grant pg_execute_server_program to "{holder}"')
+        agens.execute(f'create role "{name}" login')
+        agens.execute(f'grant "{holder}" to "{name}" with inherit false')
+    except psycopg.Error:
+        pytest.skip("this role cannot grant a membership, so the reach cannot be tested")
+    theirs = psycopg.conninfo.make_conninfo(dsn, user=name, password="")
+    try:
+        with agensgraph.connect(theirs, autocommit=False) as conn:
+            yield conn
+    except psycopg.OperationalError:
+        pytest.skip("this server will not let the test connect as another role")
+    finally:
+        for role in (name, holder):
+            with contextlib.suppress(psycopg.Error):
+                agens.execute(f'drop owned by "{role}" cascade')
+            agens.execute(f'drop role if exists "{role}"')
+
+
+class TestARoleThatCanReachThePrivilege:
+    """Being able to name a membership is being able to use it.
+
+    Measured: a role the driver called safe opened a read-only transaction, named its membership,
+    and ran a command on the host. So the question the driver asks is what the role can reach.
+    """
+
+    def test_it_is_refused_the_transaction(self, reaching) -> None:  # type: ignore[no-untyped-def]
+        assert reaching.can_run_server_programs() is True
+        with pytest.raises(ConfigurationError) as caught, reaching.read_only_transaction():
+            pass
+        assert "pg_execute_server_program" in str(caught.value)
+
+    def test_naming_the_membership_is_not_a_write(self, reaching) -> None:  # type: ignore[no-untyped-def]
+        """Which is why holding the privilege at this moment is the wrong thing to ask about."""
+        with reaching.read_only_transaction(allow_server_programs=True):
+            reaching.execute('set role "agens_program_holder"')
+            (held,) = reaching.execute(
+                "select pg_has_role(current_user, 'pg_execute_server_program', 'usage')"
+            ).fetchone()
+        assert held is True, "the transaction allowed the role to take the privilege"
+
+
 class TestTheAwaitingInterface:
     @pytest.mark.asyncio
     async def test_it_refuses_a_write_there_too(self, dsn: str) -> None:

@@ -129,7 +129,7 @@ catalog is the feature.
 """
 
 SERVER_PROGRAM_QUERY = """
-select rolsuper or pg_has_role(current_user, 'pg_execute_server_program', 'usage')
+select rolsuper or pg_has_role(current_user, 'pg_execute_server_program', 'member')
 from pg_roles where rolname = current_user
 """
 """Whether this role could run a command on the server's host.
@@ -142,6 +142,12 @@ Asked of the role rather than looked for in the statement, because looking for i
 does not work: a second statement after a semicolon, or a leading comment, gets a copy past any
 reading of the text, and all three were demonstrated. Whether the copy can run at all is a
 privilege, and a privilege is a thing the server can be asked about once.
+
+Asked as ``member`` rather than ``usage``, because the question is what the role can reach and not
+what it holds right now. A membership granted ``WITH INHERIT FALSE`` carries no privilege until
+``SET ROLE`` names it, so ``usage`` answers no -- and ``SET ROLE`` moves no rows, so a read-only
+transaction has no reason to refuse it. Measured: a role that ``usage`` called safe opened a
+read-only transaction, named the membership, and ran a command on the host.
 """
 
 DECLARED_PROPERTIES_QUERY = _DECLARED_PROPERTIES.format(label="")
