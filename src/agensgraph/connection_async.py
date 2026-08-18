@@ -673,6 +673,21 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
 
     # -- loading a lot at once -----------------------------------------------------------
 
+    @asynccontextmanager
+    async def _describing_a_copy(self) -> AsyncGenerator[None]:
+        """Describe a failure a copy reports the way one from a statement is described.
+
+        A copy's failure arrives when its block ends rather than from a statement, so the cursor
+        that describes every statement never sees it. Undescribed, the whole of what the server
+        said reaches the caller, and for a copy that is the row it refused: measured,
+        ``load_vertices`` of a duplicate key put the conflicting value into ``str(exc)`` while the
+        same write through a statement did not.
+        """
+        try:
+            yield
+        except psycopg.Error as exc:
+            raise self._translated(exc) from None
+
     async def load_vertices(
         self,
         label: str,
@@ -692,6 +707,7 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
         name = await self._graph_of(graph)
         loaded = 0
         async with (
+            self._describing_a_copy(),
             self.cursor() as cursor,
             cursor.copy(vertex_copy_statement(name, label)) as copy,
         ):
@@ -891,6 +907,7 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
         name = await self._graph_of(graph)
         loaded = 0
         async with (
+            self._describing_a_copy(),
             self.cursor() as cursor,
             cursor.copy(edge_copy_statement(name, label)) as copy,
         ):
@@ -920,7 +937,7 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
         name = await self._graph_of(graph)
         chunks = vertex_payloads(source, size=size)
         # The count comes from the copy's command tag, which is set once the copy block has ended.
-        async with self.cursor() as cursor:
+        async with self._describing_a_copy(), self.cursor() as cursor:
             async with cursor.copy(vertex_copy_statement(name, label)) as copy:
                 for block in vertex_blocks(payload for chunk in chunks for payload in chunk):
                     await copy.write(block)
@@ -948,7 +965,7 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
 
         name = await self._graph_of(graph)
         chunks = edge_payloads(source, start=start, end=end, size=size)
-        async with self.cursor() as cursor:
+        async with self._describing_a_copy(), self.cursor() as cursor:
             async with cursor.copy(edge_copy_statement(name, label)) as copy:
                 for block in edge_blocks(row for chunk in chunks for row in chunk):
                     await copy.write(block)

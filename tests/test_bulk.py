@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import gc
 
+import psycopg
 import pytest
 import pytest_asyncio
 
@@ -438,3 +439,38 @@ class TestTheGraphIdBinaryLoader:
         assert GraphIdBinaryLoader(7002).load(b"\x00\x03\x00\x00\x00\x00\x00\x01") == GraphId(
             3, 1
         )
+
+
+@pytest.mark.server
+class TestACopysFailureIsDescribedToo:
+    """A copy reports its failure when the block ends rather than from a statement, so the cursor
+    that describes every statement never saw it, and the whole of what the server said reached the
+    caller. For a copy that is the row it refused.
+    """
+
+    def test_the_row_it_refused_is_not_in_the_message(self, agens) -> None:  # type: ignore[no-untyped-def]
+        secret = "alice@example.com"
+        agens.execute("create vlabel doc")
+        agens.refresh_labels()
+        agens.execute("create unique property index on doc (email)")
+        agens.execute("create (:doc {email: %s})", (secret,))
+        with pytest.raises(psycopg.Error) as caught:
+            agens.load_vertices("doc", [{"email": secret}])
+        assert caught.value.sqlstate == "23505"
+        assert secret not in str(caught.value)
+        assert secret in (caught.value.diag.message_detail or ""), (
+            "only the one line is redacted; a post-mortem still needs the row"
+        )
+
+    def test_a_statement_and_a_copy_read_the_same_way(self, agens) -> None:  # type: ignore[no-untyped-def]
+        """Which is the point: how a failure reads should not depend on how it was sent."""
+        secret = "bob@example.com"
+        agens.execute("create vlabel doc")
+        agens.refresh_labels()
+        agens.execute("create unique property index on doc (email)")
+        agens.execute("create (:doc {email: %s})", (secret,))
+        with pytest.raises(psycopg.Error) as by_statement:
+            agens.execute("create (:doc {email: %s})", (secret,))
+        with pytest.raises(psycopg.Error) as by_copy:
+            agens.load_vertices("doc", [{"email": secret}])
+        assert str(by_statement.value) == str(by_copy.value)

@@ -621,6 +621,21 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
             return None
         return tuple(int(part) for part in str(rows[0][0]).split(".") if part.isdigit())
 
+    @contextmanager
+    def _describing_a_copy(self) -> Generator[None]:
+        """Describe a failure a copy reports the way one from a statement is described.
+
+        A copy's failure arrives when its block ends rather than from a statement, so the cursor
+        that describes every statement never sees it. Undescribed, the whole of what the server
+        said reaches the caller, and for a copy that is the row it refused: measured,
+        ``load_vertices`` of a duplicate key put the conflicting value into ``str(exc)`` while the
+        same write through a statement did not.
+        """
+        try:
+            yield
+        except psycopg.Error as exc:
+            raise self._translated(exc) from None
+
     def load_vertices(
         self, label: str, properties: Iterable[Mapping[str, Any]], *, graph: str | None = None
     ) -> int:
@@ -635,7 +650,11 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
         """
         name = self._graph_of(graph)
         loaded = 0
-        with self.cursor() as cursor, cursor.copy(vertex_copy_statement(name, label)) as copy:
+        with (
+            self._describing_a_copy(),
+            self.cursor() as cursor,
+            cursor.copy(vertex_copy_statement(name, label)) as copy,
+        ):
             copy.set_types(VERTEX_COLUMN_TYPES)
             for row in vertex_rows(properties):
                 copy.write_row(row)
@@ -820,7 +839,11 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
         """
         name = self._graph_of(graph)
         loaded = 0
-        with self.cursor() as cursor, cursor.copy(edge_copy_statement(name, label)) as copy:
+        with (
+            self._describing_a_copy(),
+            self.cursor() as cursor,
+            cursor.copy(edge_copy_statement(name, label)) as copy,
+        ):
             copy.set_types(EDGE_COLUMN_TYPES)
             for row in edge_rows(edges):
                 copy.write_row(row)
@@ -846,7 +869,7 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
 
         name = self._graph_of(graph)
         chunks = vertex_payloads(source, size=size)
-        with self.cursor() as cursor:
+        with self._describing_a_copy(), self.cursor() as cursor:
             with cursor.copy(vertex_copy_statement(name, label)) as copy:
                 for block in vertex_blocks(payload for chunk in chunks for payload in chunk):
                     copy.write(block)
@@ -874,7 +897,7 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
 
         name = self._graph_of(graph)
         chunks = edge_payloads(source, start=start, end=end, size=size)
-        with self.cursor() as cursor:
+        with self._describing_a_copy(), self.cursor() as cursor:
             with cursor.copy(edge_copy_statement(name, label)) as copy:
                 for block in edge_blocks(row for chunk in chunks for row in chunk):
                     copy.write(block)
