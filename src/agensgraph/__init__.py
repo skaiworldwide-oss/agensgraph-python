@@ -32,6 +32,7 @@ from .introspect import Check as Check
 from .introspect import Constraint as Constraint
 from .introspect import DeclaredProperty as DeclaredProperty
 from .introspect import DesiredIndex as DesiredIndex
+from .introspect import DesiredLabel as DesiredLabel
 from .introspect import Graph as Graph
 from .introspect import GraphDescription as GraphDescription
 from .introspect import Index as Index
@@ -85,6 +86,7 @@ __all__ = [
     "Deadline",
     "DeclaredProperty",
     "DesiredIndex",
+    "DesiredLabel",
     "Distance",
     "Edge",
     "Expired",

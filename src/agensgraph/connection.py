@@ -82,6 +82,7 @@ from .introspect import (
     Constraint,
     DeclaredProperty,
     DesiredIndex,
+    DesiredLabel,
     Graph,
     GraphDescription,
     Index,
@@ -96,6 +97,7 @@ from .introspect import (
     property_sample_query,
     reconcile_constraints,
     reconcile_indexes,
+    reconcile_labels,
 )
 from .notify import LISTENING_QUERY, NOTIFY_QUERY, listen_statement, unlisten_statement
 from .observability import Timer, query_span, report_notice
@@ -1127,6 +1129,36 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
             self._run(statement)
         if statements:
             self._settled(reconcile_indexes(desired, self.indexes(graph=name)), "indexes")
+        return statements
+
+    def ensure_labels(
+        self,
+        desired: Sequence[DesiredLabel],
+        *,
+        graph: str | None = None,
+        dry_run: bool = False,
+    ) -> list[str]:
+        """Make the labels asked for that are not there, and return the statements that took.
+
+        An empty list means they all existed, which is what a second run gives. ``dry_run``
+        returns the statements without running them.
+
+        Nothing is dropped, whatever is left out: a label holds the elements written to it, so
+        removing one is a decision about data. There is no ``drop_extra`` here for that reason.
+
+        Declaring labels is worth doing at startup because a write to a label that does not exist
+        makes one, which puts DDL inside the write's transaction -- and two writers arriving
+        together report ``42P07`` from each other's label. The label table is reloaded afterwards,
+        since what it holds is exactly what these statements changed.
+        """
+        name = self._graph_of(graph)
+        statements = reconcile_labels(desired, self.labels(graph=name))
+        if dry_run:
+            return statements
+        for statement in statements:
+            self._run(statement)
+        if statements:
+            self.refresh_labels()
         return statements
 
     def ensure_constraints(

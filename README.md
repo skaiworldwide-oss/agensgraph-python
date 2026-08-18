@@ -657,8 +657,13 @@ conn.describe(refresh=True)     # gather first, which is a write
 Say what the schema should be, and let the driver work out the difference:
 
 ```python
-from agensgraph import DesiredIndex, Unique, Check
+from agensgraph import DesiredIndex, DesiredLabel, Unique, Check
 
+conn.ensure_labels([
+    DesiredLabel("person"),
+    DesiredLabel("knows", kind="e"),
+    DesiredLabel("employee", parent="person"),
+])
 conn.ensure_indexes([
     DesiredIndex("person", ["email"], unique=True),
     DesiredIndex("doc", ["title"], method="gin"),
@@ -669,7 +674,17 @@ conn.ensure_constraints([
 ])
 ```
 
-Both return the statements they ran, take `dry_run=True` to return them without running any, and
+**Declare the labels a server writes to.** A write to a label that is not there makes one, and that
+is DDL inside whatever transaction the write is in, so two writers arriving together race. Measured
+with eight writers merging one edge of an undeclared label: **seven of the eight failed**, six with
+`23505` and one with `42P07`. With the label declared first, none did.
+
+`ensure_labels` never drops, whatever is left out of the list. A label holds the elements written to
+it, so removing one is a decision about data rather than schema, and a reconciler able to take it
+could empty a graph by being handed a shorter list. A name already there as the other kind is
+refused, naming both kinds.
+
+All three return the statements they ran, take `dry_run=True` to return them without running any, and
 `drop_extra=True` to remove what is there and not asked for. Running the same declaration twice is a
 no-op the second time.
 
@@ -1332,7 +1347,7 @@ Everything exported from `agensgraph`. The submodules `agensgraph.columnar`, `ag
 | `Label` | a label or property name to be placed into a statement as an identifier |
 | `Unspecified` | a string sent with no type, which is psycopg's own default behaviour |
 | `Distance` | `L2`, `INNER_PRODUCT`, `COSINE`, `L1`, `HAMMING`, `JACCARD` |
-| `DesiredIndex`, `Unique`, `Check` | what you want to exist, for the reconcilers |
+| `DesiredIndex`, `Unique`, `Check`, `DesiredLabel` | what you want to exist, for the reconcilers |
 
 **What a statement gives back**
 
@@ -1356,6 +1371,7 @@ Everything exported from `agensgraph`. The submodules `agensgraph.columnar`, `ag
 
 | | |
 |---|---|
+| `connection.ensure_labels(desired)` | make the labels asked for; never drops one |
 | `connection.describe()` | labels, properties, triples and counts, without a scan |
 | `GraphDescription`, `Triple`, `PropertyShape` | what it returns |
 | `connection.upsert_vertices(label, key, rows)` | copy what is missing, optionally refresh the rest |

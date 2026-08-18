@@ -625,3 +625,85 @@ class TestAnIndexDeclarationQuotesEveryNameInIt:
         assert statement == "create property index on doc (name)"
         (statement,) = reconcile_indexes([DesiredIndex("doc", ("tags",), method="gin")], [])
         assert statement == "create property index on doc using gin (tags)"
+
+
+class TestDeclaringLabels:
+    """A write to a label that is not there makes one, which is DDL inside the write."""
+
+    def test_it_asks_for_what_is_missing(self) -> None:
+        from agensgraph import DesiredLabel
+        from agensgraph.introspect import Label, reconcile_labels
+
+        actual = [Label(3, "doc", "v", None)]
+        assert reconcile_labels([DesiredLabel("doc")], actual) == []
+        assert reconcile_labels([DesiredLabel("KNOWS", "e")], actual) == [
+            'create elabel if not exists "KNOWS"'
+        ]
+
+    def test_a_name_needing_quoting_gets_it(self) -> None:
+        from agensgraph import DesiredLabel
+        from agensgraph.introspect import reconcile_labels
+
+        assert reconcile_labels([DesiredLabel("WORKS AT", "e")], []) == [
+            'create elabel if not exists "WORKS AT"'
+        ]
+
+    def test_the_same_name_under_the_other_kind_is_refused(self) -> None:
+        """The server refuses it too, and the message is clearer from here."""
+        from agensgraph import DesiredLabel
+        from agensgraph.introspect import Label, reconcile_labels
+
+        with pytest.raises(
+            ValueError, match="as a vertex label and the graph has it as an edge"
+        ):
+            reconcile_labels([DesiredLabel("KNOWS", "v")], [Label(4, "KNOWS", "e", None)])
+
+
+@pytest.mark.server
+class TestDeclaringLabelsAgainstTheServer:
+    def test_it_converges_and_creates_both_kinds(self, agens) -> None:  # type: ignore[no-untyped-def]
+        from agensgraph import DesiredLabel
+
+        want = [
+            DesiredLabel("Memory"),
+            DesiredLabel("KNOWS", "e"),
+            DesiredLabel("WORKS AT", "e"),
+        ]
+        assert len(agens.ensure_labels(want)) == 3
+        assert agens.ensure_labels(want) == [], "the second run found work to do"
+        kinds = {label.name: label.kind for label in agens.labels()}
+        assert kinds["Memory"] == "v"
+        assert kinds["KNOWS"] == kinds["WORKS AT"] == "e"
+
+    def test_a_declared_edge_label_takes_concurrent_writers(self, agens, dsn: str) -> None:  # type: ignore[no-untyped-def]
+        """Undeclared, eight writers merging one edge report 42P07 from each other's label."""
+        import threading
+
+        from agensgraph import DesiredLabel
+
+        graph = agens.label_table.graph
+        agens.execute("create vlabel m")
+        agens.execute("create (:m {k: 'x'})")
+        agens.execute("create (:m {k: 'y'})")
+        agens.ensure_labels([DesiredLabel("LINKS", "e")])
+
+        failures: list[str | None] = []
+
+        def writer() -> None:
+            conn = agensgraph.connect(dsn, autocommit=False)
+            conn.graph(graph)
+            try:
+                conn.execute("""match (a:m {k:'x'}), (b:m {k:'y'}) merge (a)-[:"LINKS"]->(b)""")
+                conn.commit()
+            except Exception as exc:
+                failures.append(getattr(exc, "sqlstate", None))
+                conn.rollback()
+            finally:
+                conn.close()
+
+        threads = [threading.Thread(target=writer) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        assert "42P07" not in failures, "the label was declared, so no writer had to make it"

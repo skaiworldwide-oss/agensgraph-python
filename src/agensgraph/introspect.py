@@ -52,6 +52,7 @@ __all__ = [
     "Constraint",
     "DeclaredProperty",
     "DesiredIndex",
+    "DesiredLabel",
     "Graph",
     "GraphDescription",
     "Index",
@@ -61,6 +62,7 @@ __all__ = [
     "Triple",
     "Unique",
     "constraint_name",
+    "create_label_statement",
     "describe_kind",
     "element_count_query",
     "for_labels",
@@ -72,6 +74,7 @@ __all__ = [
     "property_sample_query",
     "reconcile_constraints",
     "reconcile_indexes",
+    "reconcile_labels",
 ]
 
 MAX_IDENTIFIER = 63
@@ -353,6 +356,22 @@ class IndexElement(NamedTuple):
         if self.nulls_first is not None and self.nulls_first != self.descending:
             parts.append("nulls first" if self.nulls_first else "nulls last")
         return " ".join(parts)
+
+
+class DesiredLabel(NamedTuple):
+    """A label somebody wants to exist, so that writing to it does not have to make it.
+
+    A write to a label that is not there makes one, and that is DDL running inside whatever
+    transaction the write is in. Two writers doing it at once is a race the server reports as
+    ``42P07``, from the label the other one created underneath this one. Declaring the labels a
+    server writes to at startup takes the DDL out of the writes.
+    """
+
+    name: str
+    kind: str = "v"
+    """``'v'`` for a vertex label, ``'e'`` for an edge label."""
+    parent: str | None = None
+    """The label this one inherits, for a graph that groups its labels that way."""
 
 
 class DesiredIndex(NamedTuple):
@@ -705,6 +724,43 @@ def constraint_name_of_index(desired: DesiredIndex) -> str:
     if not desired.name:
         raise ValueError(f"a partial index on {desired.label} needs a name")
     return desired.name[:MAX_IDENTIFIER]
+
+
+def create_label_statement(name: str, kind: str, parent: str | None = None) -> str:
+    """The statement that makes a label of the kind given."""
+    if kind not in ("v", "e"):
+        raise ValueError(f"a label is a vertex or an edge label, got {kind!r}")
+    word = "vlabel" if kind == "v" else "elabel"
+    statement = f"create {word} if not exists {quote_identifier(name)}"
+    if parent is not None:
+        statement += f" inherits ({quote_identifier(parent)})"
+    return statement
+
+
+def reconcile_labels(desired: Sequence[DesiredLabel], actual: Sequence[Label]) -> list[str]:
+    """The statements that make the labels asked for, for the ones that are not there.
+
+    Nothing is ever dropped. A label holds the elements written to it, so removing one is a
+    decision about data rather than about schema, and a reconciler that took it would be able to
+    empty a graph by being handed a shorter list.
+
+    A label already there under the other kind is refused rather than remade, since the server
+    would refuse it too and the message is clearer from here.
+    """
+    have = {label.name: label for label in actual}
+    statements: list[str] = []
+    for want in desired:
+        found = have.get(want.name)
+        if found is None:
+            statements.append(create_label_statement(want.name, want.kind, want.parent))
+        elif found.kind != want.kind:
+            wanted, has = (
+                ("a vertex", "an edge") if want.kind == "v" else ("an edge", "a vertex")
+            )
+            raise ValueError(
+                f"{want.name!r} is asked for as {wanted} label and the graph has it as {has} one"
+            )
+    return statements
 
 
 def reconcile_constraints(
