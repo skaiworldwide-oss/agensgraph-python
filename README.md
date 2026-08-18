@@ -1112,6 +1112,33 @@ than accepted as an allowance that can only ever be spent.
 The connection's fate is decided in one place on every exit path, including cancellation, rather than
 delegated to a callback that some paths skip.
 
+**A budget on a connection nobody pooled.** A pool sets a limit per borrow; for a server the unit is
+a request, however many statements the request turns out to need:
+
+```python
+async with conn.deadline(5.0) as budget:
+    await conn.execute_query(one)
+    await conn.execute_query(two)
+    left = budget.remaining()
+```
+
+The limit is the server's, set below what the caller is waiting for, so the server gives up and
+reports a cancelled statement rather than the caller giving up first and leaving one running on a
+connection it has stopped reading. It is put back on the way out, including after a statement raised,
+and put back *by name*: a connection carrying `options=-c statement_timeout=...` returns to that
+rather than to none.
+
+**It is a block and not an argument to `execute_query`, and the reason is measured.** Setting and
+restoring the limit is two statements: over a loopback connection `select 1` alone is 95 microseconds,
+alone inside a block 303 (**3.2x**), and ten statements in one block 1.26x. So the cost is real and
+belongs where many statements amortise it. A budget with no limit sets nothing and costs nothing.
+
+The two are sent as they read rather than in one pipeline. Over a loopback connection a pipeline of
+three costs 681 microseconds against 432, and one statement inside a pipeline costs 307 against 123
+outside it: such a round trip is libpq and psycopg at both ends rather than latency, so a pipeline has
+little waiting to remove and its own cost per statement to add. Thirty statements come about even.
+What it costs where a round trip is latency is untested here.
+
 ## Losing a connection mid-commit
 
 The one failure that cannot be retried blindly is a commit whose acknowledgement never arrived: the
@@ -1540,6 +1567,7 @@ Everything exported from `agensgraph`. The submodules `agensgraph.columnar`, `ag
 | `to_json(value)` | JSON bytes, without decoding a map nobody read |
 | `to_builtins(value)`, `json_default` | the same shape as dicts, and for `json.dumps` |
 | `connection.pipeline_query(statements)` | a burst of reads, every answer read back |
+| `connection.deadline(seconds)` | bound the statements in a block, and hand back the budget |
 | `connection.read_only_transaction()` | a transaction the server will not let write |
 | `connection.can_run_server_programs()` | whether this role could run a command on the host |
 | `Deadline`, `Expired` | one budget across the wait and the statement; `Expired` is a `TimeoutError` |

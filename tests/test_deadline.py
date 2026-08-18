@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import time
 
+import psycopg
 import pytest
 
+import agensgraph
 from agensgraph.deadline import Deadline, Expired
 
 
@@ -145,3 +147,92 @@ def test_the_clock_is_the_monotonic_one() -> None:
     budget = Deadline(0.05)
     time.sleep(0.06)
     assert budget.expired
+
+
+@pytest.mark.server
+class TestABudgetOnAConnectionNobodyPooled:
+    """A pool sets a limit per borrow. A bare connection never got one, and for a server the unit
+    is a request rather than a borrow: one budget, however many statements the request needs.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_server_gives_up_and_not_the_caller(self, dsn: str) -> None:
+        """Which is the point of asking the server: a caller giving up first leaves a statement
+        running on a connection it has stopped reading."""
+        conn = await agensgraph.AsyncConnection.connect(dsn, autocommit=True)
+        async with conn:
+            started = time.monotonic()
+            with pytest.raises(psycopg.Error) as caught:
+                async with conn.deadline(1.0, gap=0.5):
+                    await conn.execute("select pg_sleep(10)")
+            assert caught.value.sqlstate == "57014"
+            assert time.monotonic() - started < 3.0, "the server stopped it, near the limit"
+
+    @pytest.mark.asyncio
+    async def test_the_limit_is_put_back_afterwards(self, dsn: str) -> None:
+        conn = await agensgraph.AsyncConnection.connect(dsn, autocommit=True)
+        async with conn:
+            async with conn.deadline(5.0):
+                cursor = await conn.execute("show statement_timeout")
+                (inside,) = await cursor.fetchone()
+            cursor = await conn.execute("show statement_timeout")
+            (after,) = await cursor.fetchone()
+        assert inside != after
+        assert after == "0"
+
+    @pytest.mark.asyncio
+    async def test_and_put_back_when_a_statement_raised(self, dsn: str) -> None:
+        conn = await agensgraph.AsyncConnection.connect(dsn, autocommit=True)
+        async with conn:
+            with pytest.raises(psycopg.Error):
+                async with conn.deadline(5.0):
+                    await conn.execute("select 1/0")
+            cursor = await conn.execute("show statement_timeout")
+            (after,) = await cursor.fetchone()
+        assert after == "0"
+
+    @pytest.mark.asyncio
+    async def test_it_is_put_back_by_name_and_not_by_number(self, dsn: str) -> None:
+        """A connection carrying its own limit returns to that one, not to none."""
+        conn = await agensgraph.AsyncConnection.connect(
+            dsn, autocommit=True, options="-c statement_timeout=5000"
+        )
+        async with conn:
+            async with conn.deadline(1.0):
+                pass
+            cursor = await conn.execute("show statement_timeout")
+            (after,) = await cursor.fetchone()
+        assert after == "5s"
+
+    @pytest.mark.asyncio
+    async def test_a_budget_with_no_limit_sends_nothing(self, dsn: str) -> None:
+        conn = await agensgraph.AsyncConnection.connect(dsn, autocommit=True)
+        seen: list[str] = []
+
+        def record(record) -> None:  # type: ignore[no-untyped-def]
+            seen.append(record.statement)
+
+        agensgraph.add_query_logger(record)
+        try:
+            async with conn, conn.deadline(None):
+                await conn.execute("select 1")
+        finally:
+            agensgraph.remove_query_logger(record)
+        assert not [text for text in seen if "statement_timeout" in text]
+
+    @pytest.mark.asyncio
+    async def test_the_budget_is_handed_back(self, dsn: str) -> None:
+        """So a caller can ask what is left of it, which is what makes it a budget."""
+        conn = await agensgraph.AsyncConnection.connect(dsn, autocommit=True)
+        async with conn, conn.deadline(3.0) as budget:
+            await conn.execute("select 1")
+            assert budget.total == 3.0
+            assert 0 < budget.remaining() <= 3.0
+
+    @pytest.mark.asyncio
+    async def test_an_existing_budget_can_be_handed_in(self, dsn: str) -> None:
+        conn = await agensgraph.AsyncConnection.connect(dsn, autocommit=True)
+        async with conn:
+            held = Deadline(4.0)
+            async with conn.deadline(held) as budget:
+                assert budget is held
