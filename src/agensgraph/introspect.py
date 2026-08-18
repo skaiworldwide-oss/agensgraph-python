@@ -40,6 +40,7 @@ _Labelled = TypeVar("_Labelled", bound="_HasLabel")
 __all__ = [
     "CONSTRAINTS_QUERY",
     "DECLARED_PROPERTIES_QUERY",
+    "ENDPOINT_COLUMNS",
     "GRAPHS_QUERY",
     "INDEXES_QUERY",
     "LABELS_QUERY",
@@ -399,6 +400,15 @@ class DesiredIndex(NamedTuple):
     An index over a nested path or an expression, or one with ``INCLUDE`` columns, is not described
     here, and is neither matched nor dropped. Write those as DDL, or
     :func:`agensgraph.vector.vector_index` for a vector.
+
+    **An edge's endpoints cannot be keyed here.** ``start`` and ``end`` are columns of the edge's
+    table and this keys on *properties*, so a unique index naming them is built over
+    ``properties.'start'`` and ``properties.'end'`` and guarantees nothing: an edge carrying no such
+    property indexes NULL, and no two NULLs conflict. It is refused rather than written, since the
+    server prints it exactly as the columns would print and nothing afterwards could tell them apart.
+    For that guarantee run plain SQL, which is over the columns and does refuse a duplicate::
+
+        create unique index links_pair on "social".links (start, "end")
     """
 
     label: str
@@ -621,6 +631,17 @@ def constraint_name(desired: Unique | Check) -> str:
     return f"{desired.label}_{desired.property}_unique"[:MAX_IDENTIFIER]
 
 
+ENDPOINT_COLUMNS = frozenset({"start", "end"})
+"""The two columns an edge joins, which are columns and not properties.
+
+An edge's endpoints live in columns of its own table. A property index keys on the *property* of the
+name it is given, so naming one of these builds an index over a property that is almost never there,
+which for a unique index is a guarantee of nothing: every edge lacking the property indexes NULL and
+no two NULLs conflict. The server prints such an index as ``(start, "end")``, which is what the
+endpoint columns would print as too, so nothing downstream can tell them apart either.
+"""
+
+
 def create_index_statement(desired: DesiredIndex, *, if_not_exists: bool = False) -> str:
     """The statement that makes an index.
 
@@ -635,6 +656,20 @@ def create_index_statement(desired: DesiredIndex, *, if_not_exists: bool = False
     """
     if not desired.properties:
         raise ValueError(f"an index covers at least one property, got none for {desired.label}")
+    named = {element.property.lower() for element in desired.elements}
+    if desired.unique and named & ENDPOINT_COLUMNS:
+        raise ValueError(
+            f"a unique index on {sorted(named & ENDPOINT_COLUMNS)} for {desired.label} would "
+            f"guarantee nothing. A property index keys on the property of that name, so this "
+            f"builds one over properties.'start' and properties.'end' rather than over an edge's "
+            f"endpoint columns -- and an edge carrying no such property indexes NULL, which no "
+            f"other NULL conflicts with. Measured: the index is accepted, reported as unique, and "
+            f"a duplicate edge is still taken. To key an edge on its endpoints, run "
+            f'`create unique index ... on "<graph>"."{desired.label}" (start, "end")` as plain '
+            f"SQL, which is over the columns and does refuse a duplicate. To key it on a property "
+            f"that happens to be called that, write that index as DDL too, so nobody reads this "
+            f"one as the endpoints."
+        )
     if desired.where is not None and not desired.name:
         raise ValueError(
             f"a partial index on {desired.label} needs a name, because its predicate is stored "

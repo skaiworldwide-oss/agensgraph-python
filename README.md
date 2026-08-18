@@ -719,6 +719,25 @@ conn.ensure_constraints([
 ])
 ```
 
+**An edge's endpoints cannot be keyed through `DesiredIndex`, and asking is refused.** `start` and
+`end` are columns of the edge's own table, while a property index keys on the *property* of the name
+it is given. So a unique index naming them is built over `properties.'start'` and
+`properties.'end'`, an edge carrying no such property indexes NULL, and no two NULLs conflict:
+measured before this was refused, the index was accepted, reported as unique, a duplicate edge was
+still taken, and eight concurrent merges of one triple left two edges. The server prints it as
+`(start, "end")`, exactly as the columns would print, so nothing afterwards could tell them apart.
+
+For that guarantee, write it as plain SQL over the columns, which does refuse a duplicate with
+`23505`:
+
+```python
+conn.execute(f'CREATE UNIQUE INDEX links_pair ON "{graph}".links (start, "end")')
+```
+
+It is not reconciled, for the same reason `indexes()` does not report it: that reader admits an
+expression index or one over a promoted column, which are the server's own conditions, and endpoint
+columns are neither.
+
 **Declare the labels a server writes to.** A write to a label that is not there makes one, and that
 is DDL inside whatever transaction the write is in, so two writers arriving together race. Measured
 with eight writers merging one edge of an undeclared label: **seven of the eight failed**, six with

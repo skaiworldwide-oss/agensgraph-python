@@ -18,6 +18,7 @@ The server's rules that the tests turn on:
 
 from __future__ import annotations
 
+import psycopg
 import pytest
 import pytest_asyncio
 
@@ -784,3 +785,67 @@ class TestTheGeneratedDdlAgainstTheServer:
         with pytest.raises(agensgraph.errors.Error) as caught:
             agens.execute(statement)
         assert caught.value.sqlstate == "42P07"
+
+
+class TestAUniqueIndexOnAnEdgesEndpoints:
+    """The endpoints are columns, and a property index keys on the property of that name.
+
+    So asking for one over ``start`` and ``end`` builds it over ``properties.'start'`` and
+    ``properties.'end'``, which an edge carrying no such property leaves NULL -- and no two NULLs
+    conflict, so a unique index over them refuses nothing. Measured: the index is
+    accepted, ``indexes()`` reports it unique, a duplicate edge is still taken, and eight concurrent
+    merges of one triple leave two edges. The server prints it as ``(start, "end")``, which is what
+    the columns would print as, so nothing downstream can tell the two apart.
+    """
+
+    @pytest.mark.parametrize(
+        "properties",
+        [("start", "end"), ("start",), ("end",), ("END",), ("start", "weight")],
+    )
+    def test_asking_for_one_is_refused(self, properties: tuple[str, ...]) -> None:
+        with pytest.raises(ValueError, match="would guarantee nothing"):
+            create_index_statement(DesiredIndex("links", properties, unique=True, name="x"))
+
+    def test_the_refusal_says_how_to_get_the_guarantee(self) -> None:
+        with pytest.raises(ValueError) as caught:
+            create_index_statement(DesiredIndex("links", ("start", "end"), unique=True))
+        message = str(caught.value)
+        assert "create unique index" in message, "the form that does refuse a duplicate"
+        assert '(start, "end")' in message
+
+    @pytest.mark.parametrize("properties", [("start", "end"), ("start",)])
+    def test_one_that_is_not_unique_promises_nothing_and_is_left_alone(
+        self, properties: tuple[str, ...]
+    ) -> None:
+        """Only the guarantee is refused. A useless index is not a wrong answer."""
+        assert "property index" in create_index_statement(DesiredIndex("links", properties))
+
+    def test_an_ordinary_unique_index_is_untouched(self) -> None:
+        assert (
+            create_index_statement(DesiredIndex("doc", ("sku",), unique=True))
+            == "create unique property index on doc (sku)"
+        )
+
+
+@pytest.mark.server
+class TestWhatDoesGuaranteeAnEdgesEndpoints:
+    def test_the_reconciler_refuses_it_rather_than_running_it(self, agens) -> None:  # type: ignore[no-untyped-def]
+        agens.execute("create elabel links")
+        agens.refresh_labels()
+        with pytest.raises(ValueError, match="would guarantee nothing"):
+            agens.ensure_indexes([DesiredIndex("links", ("start", "end"), unique=True)])
+
+    def test_a_plain_unique_index_on_the_columns_does_refuse_a_duplicate(self, agens) -> None:  # type: ignore[no-untyped-def]
+        """Which is what the refusal points at, so it is asserted rather than only recommended."""
+        graph = agens.label_table.graph
+        agens.execute("create vlabel p")
+        agens.execute("create elabel links")
+        agens.refresh_labels()
+        agens.execute("create (:p {n: 1}), (:p {n: 2})")
+        agens.execute(f'create unique index links_pair on "{graph}".links (start, "end")')
+        agens.execute("match (a:p {n:1}), (b:p {n:2}) create (a)-[:links]->(b)")
+        with pytest.raises(psycopg.Error) as caught:
+            agens.execute("match (a:p {n:1}), (b:p {n:2}) create (a)-[:links]->(b)")
+        assert caught.value.sqlstate == "23505"
+        (count,) = agens.execute("match ()-[r:links]->() return count(*)").fetchone()
+        assert count == 1
