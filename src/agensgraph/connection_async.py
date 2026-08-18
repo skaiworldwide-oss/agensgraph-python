@@ -624,7 +624,7 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
         No identity is supplied. The column's default produces the same identities a ``CREATE``
         would, so nothing here has to reproduce the server's numbering.
         """
-        name = self._graph_of(graph)
+        name = await self._graph_of(graph)
         loaded = 0
         async with (
             self.cursor() as cursor,
@@ -667,7 +667,7 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
                 f"on_existing is 'skip' or 'update', not {on_existing!r}: there is no third thing "
                 f"to do with an element that is already there"
             )
-        name = self._graph_of(graph)
+        name = await self._graph_of(graph)
         material = list(rows)
         indexed = await self._key_is_unique(label, key, graph=name)
         if require_unique and not indexed:
@@ -723,7 +723,7 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
         joins and nothing in a source file says that -- :meth:`identity_map` is how the mapping
         from whatever the source calls an element to the identity the server gave it is read.
         """
-        name = self._graph_of(graph)
+        name = await self._graph_of(graph)
         loaded = 0
         async with (
             self.cursor() as cursor,
@@ -752,7 +752,7 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
         from .bulk import vertex_blocks
         from .columnar import vertex_payloads
 
-        name = self._graph_of(graph)
+        name = await self._graph_of(graph)
         chunks = vertex_payloads(source, size=size)
         # The count comes from the copy's command tag, which is set once the copy block has ended.
         async with self.cursor() as cursor:
@@ -781,7 +781,7 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
         from .bulk import edge_blocks
         from .columnar import edge_payloads
 
-        name = self._graph_of(graph)
+        name = await self._graph_of(graph)
         chunks = edge_payloads(source, start=start, end=end, size=size)
         async with self.cursor() as cursor:
             async with cursor.copy(edge_copy_statement(name, label)) as copy:
@@ -820,7 +820,7 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
         which touches no property map: 3 milliseconds for the same 20,000. And ``keys`` turns the
         read into one index lookup per key.
         """
-        name = self._graph_of(graph)
+        name = await self._graph_of(graph)
         if keys is not None and await self._key_is_unique(label, key, graph=name):
             return await self._identity_of_keys(label, key, keys, graph=name)
         column = await self._promoted_key_column(label, key, graph=name)
@@ -884,7 +884,8 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
         of them were never asked for.
         """
         return [
-            Label(*row) for row in await self._fetch(LABELS_QUERY, (self._graph_of(graph),))
+            Label(*row)
+            for row in await self._fetch(LABELS_QUERY, (await self._graph_of(graph),))
         ]
 
     async def can_promote_properties(self) -> bool:
@@ -927,7 +928,7 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
         false. ``refresh`` gathers first. It is not the default because it is a write, and a
         description is not a thing that should write.
         """
-        name = self._graph_of(graph)
+        name = await self._graph_of(graph)
         if refresh and not await self.meta_is_current(graph=name):
             await self._run(GATHER_META)
         labels = await self.labels(graph=name)
@@ -973,7 +974,7 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
         comes from what the catalog holds: triples for a graph that has edges is as much as can be
         established, and a graph with no edges has nothing to gather.
         """
-        name = self._graph_of(graph)
+        name = await self._graph_of(graph)
         if await self._has_meta_flag():
             rows = await self._fetch(META_VALID_QUERY, (name,))
             return bool(rows) and bool(rows[0][0])
@@ -1008,7 +1009,7 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
         """
         if not await self.can_promote_properties():
             return []
-        name = self._graph_of(graph)
+        name = await self._graph_of(graph)
         query = DECLARED_PROPERTIES_QUERY if label is None else DECLARED_PROPERTIES_FOR_LABEL
         rows = await self._fetch(query, (name,) if label is None else (name, label))
         return [DeclaredProperty(*row) for row in rows]
@@ -1017,7 +1018,7 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
         self, label: str | None = None, *, graph: str | None = None
     ) -> list[Index]:
         """Every property index. A uniqueness constraint is not one; see :meth:`constraints`."""
-        name = self._graph_of(graph)
+        name = await self._graph_of(graph)
         query = INDEXES_QUERY if label is None else INDEXES_FOR_LABEL
         params = (name,) if label is None else (name, label)
         return [Index(*row) for row in await self._fetch(query, params)]
@@ -1031,7 +1032,7 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
         exclusion constraints out -- and a uniqueness assertion is kept as an exclusion, so it
         would otherwise be invisible.
         """
-        name = self._graph_of(graph)
+        name = await self._graph_of(graph)
         query = CONSTRAINTS_QUERY if label is None else CONSTRAINTS_FOR_LABEL
         rows = await self._fetch(query, (name,) if label is None else (name, label))
         return [Constraint(*row) for row in rows]
@@ -1213,7 +1214,7 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
         operator class that is already the default does this, since the server omits a default when
         printing a definition.
         """
-        name = self._graph_of(graph)
+        name = await self._graph_of(graph)
         statements = reconcile_indexes(
             desired,
             for_labels(await self.indexes(graph=name), desired, drop_extra),
@@ -1249,7 +1250,7 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
         together report ``42P07`` from each other's label. The label table is reloaded afterwards,
         since what it holds is exactly what these statements changed.
         """
-        name = self._graph_of(graph)
+        name = await self._graph_of(graph)
         statements = reconcile_labels(desired, await self.labels(graph=name))
         if dry_run:
             return statements
@@ -1275,7 +1276,7 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
         ``drop_extra`` reaches only the labels ``desired`` names, for the reason given in
         :meth:`ensure_indexes`.
         """
-        name = self._graph_of(graph)
+        name = await self._graph_of(graph)
         statements = reconcile_constraints(
             desired,
             for_labels(await self.constraints(graph=name), desired, drop_extra),
@@ -1308,7 +1309,7 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
         the label id is part of every element's identity, so counting per label needs nothing
         from a row but its id.
         """
-        name = self._graph_of(graph)
+        name = await self._graph_of(graph)
         names = {label.id: label.name for label in await self.labels(graph=name)}
         counts: dict[str, int] = {}
         for edges in (False, True):
@@ -1316,11 +1317,22 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
                 counts[names.get(labid, str(labid))] = int(count)
         return counts
 
-    def _graph_of(self, given: str | None) -> str:
-        """The graph to read about: the one named, or the one this connection is reading."""
+    async def _graph_of(self, given: str | None) -> str:
+        """The graph to read about: the one named, or the one this connection is reading.
+
+        A table naming no graph is asked about rather than refused. Two states arrive here as
+        the same missing name: a session reading no graph, which is the caller's to fix, and a
+        table dropped because a statement went past that might have moved the session, which is
+        one statement away from being known. Only the server can tell them apart, and asking it
+        also answers correctly when the session really did move, where the name held before it
+        would name the graph it has left.
+
+        The reading is reached only by a caller that named no graph and a table that names none
+        either, so an ordinary call still costs nothing.
+        """
         if given is not None:
             return given
-        graph = self.label_table.graph
+        graph = self.label_table.graph or await self._current_graph()
         if graph is None:
             raise ValueError(
                 "no graph is selected on this connection, so name the one to read about"

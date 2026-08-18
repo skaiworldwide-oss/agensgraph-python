@@ -1229,10 +1229,21 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
         return counts
 
     def _graph_of(self, given: str | None) -> str:
-        """The graph to read about: the one named, or the one this connection is reading."""
+        """The graph to read about: the one named, or the one this connection is reading.
+
+        A table naming no graph is asked about rather than refused. Two states arrive here as
+        the same missing name: a session reading no graph, which is the caller's to fix, and a
+        table dropped because a statement went past that might have moved the session, which is
+        one statement away from being known. Only the server can tell them apart, and asking it
+        also answers correctly when the session really did move, where the name held before it
+        would name the graph it has left.
+
+        The reading is reached only by a caller that named no graph and a table that names none
+        either, so an ordinary call still costs nothing.
+        """
         if given is not None:
             return given
-        graph = self.label_table.graph
+        graph = self.label_table.graph or self._current_graph()
         if graph is None:
             raise ValueError(
                 "no graph is selected on this connection, so name the one to read about"

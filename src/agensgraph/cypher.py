@@ -302,6 +302,13 @@ def changes_graph_path(statement: str) -> bool:
     string counts. Saying yes to a statement that changes nothing costs a reload of the label
     table; saying no to one that does costs a wrong label on every binary read after it.
 
+    A mention inside a string is counted deliberately, rather than blanked out first. The
+    statement that changes the setting can carry the name in a literal too, and the literal can
+    be somewhere blanking cannot see into: ``do $$ begin perform set_config('graph_path', 'g',
+    false); end $$`` moves the session, and a dollar-quoted body is blanked whole, so reading
+    the blanked text finds nothing to report. The false negative that would produce is the one
+    that costs a wrong label; a false positive costs a reload.
+
     Every statement is read, so what it costs matters. Lowering once and then asking whether
     two literals appear is what a substring search does in one pass, and the pattern is
     reached only by a statement holding the word it needs.

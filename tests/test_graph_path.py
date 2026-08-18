@@ -11,7 +11,7 @@ from __future__ import annotations
 import pytest
 
 import agensgraph
-from agensgraph.cypher import changes_graph_path, quote_identifier
+from agensgraph.cypher import changes_graph_path, quote_identifier, without_literals
 from agensgraph.errors import StaleLabelCache
 
 MOVES = [
@@ -186,3 +186,74 @@ class TestTheCompositeRenderingWithNoTable:
                 0
             ]
             assert vertex.label == "account"
+
+
+@pytest.mark.server
+class TestATableNamingNoGraphIsAskedAboutRatherThanRefused:
+    """A statement mentioning the setting in its data drops the table, and must cost no more.
+
+    The mention is counted whatever it is inside, which is the safe direction to be wrong in.
+    What made it expensive was that dropping the table dropped the graph's *name* with it, and
+    a reader that wanted the name was refused rather than told to ask: measured, a plain read
+    whose data held the words left the next `indexes()` raising.
+    """
+
+    def test_a_read_whose_data_mentions_the_setting_costs_a_reading(self, agens) -> None:  # type: ignore[no-untyped-def]
+        agens.execute("create vlabel doc")
+        agens.refresh_labels()
+        before = agens.label_table.graph
+        agens.execute("match (n:doc) where n.note = 'graph_path' return n")
+        assert agens.label_table.graph is None, "the table is dropped, as it should be"
+        assert [i.name for i in agens.indexes("doc")] == []
+        assert agens.describe().graph == before
+
+    def test_and_the_reading_answers_with_where_the_session_is_now(
+        self, agens, second_graph: str
+    ) -> None:  # type: ignore[no-untyped-def]
+        """Which is why it is read rather than remembered: the name held before it is stale.
+
+        A table that kept its name across a real move would answer for the graph the session
+        has left, and every reader of it would describe the wrong graph.
+        """
+        agens.execute("create vlabel doc")
+        agens.refresh_labels()
+        agens.execute(f"select set_config('graph_path', '{second_graph}', false)")
+        assert agens.describe().graph == second_graph
+
+    def test_a_session_reading_no_graph_is_still_refused(self, agens) -> None:  # type: ignore[no-untyped-def]
+        """The two states arrive as the same missing name, and only one of them is recoverable."""
+        agens.execute("create vlabel doc")
+        agens.execute("reset graph_path")
+        with pytest.raises(ValueError, match="no graph is selected"):
+            agens.indexes("doc")
+
+    def test_naming_a_graph_never_reads_the_setting(self, agens) -> None:  # type: ignore[no-untyped-def]
+        """A caller that said which graph is answered without a statement being sent for it."""
+        agens.execute("create vlabel doc")
+        graph = agens.label_table.graph
+        agens.execute("reset graph_path")
+        assert [i.name for i in agens.indexes("doc", graph=graph)] == []
+
+
+@pytest.mark.server
+class TestWhyTheMentionIsNotBlankedOutFirst:
+    """Blanking the literals before searching would be a false negative where it costs most."""
+
+    def test_a_dollar_quoted_body_can_move_the_session(self, agens, second_graph: str) -> None:  # type: ignore[no-untyped-def]
+        """And a dollar-quoted body is blanked whole, so the blanked text mentions nothing."""
+        statement = (
+            f"do $$ begin perform set_config('graph_path', '{second_graph}', false); end $$"
+        )
+        assert "graph_path" not in without_literals(statement)
+        agens.execute(statement)
+        (now,) = agens.execute("select current_setting('graph_path')").fetchone()
+        assert now == second_graph, "the session moved, so a reader of the text has to say so"
+        assert changes_graph_path(statement), "and reading it as written does"
+
+    def test_the_table_follows_it(self, agens, second_graph: str) -> None:  # type: ignore[no-untyped-def]
+        agens.execute("create vlabel doc")
+        agens.refresh_labels()
+        agens.execute(
+            f"do $$ begin perform set_config('graph_path', '{second_graph}', false); end $$"
+        )
+        assert agens.describe().graph == second_graph
