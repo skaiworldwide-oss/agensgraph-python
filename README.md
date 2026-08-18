@@ -1123,6 +1123,21 @@ neither a superuser nor a member of `pg_execute_server_program`**, and the bound
 | `COPY ... TO PROGRAM`, including one hidden behind another statement | the privilege, `42501` |
 | a plain read | nothing, it runs |
 
+**One thing the server will not refuse for you: a second statement.** Text sent with no parameters
+goes over the simple query protocol, which runs every statement in the string and reports only the
+first one's result, so a read with a write after a semicolon runs the write and looks like the read.
+Measured: `select 1; create table t(i int)` returned a row and left the table behind.
+
+```python
+cypher.check_single_statement(model_output)     # refuses, naming the word that is the reason
+```
+
+Binding a parameter, any parameter, closes the same hole from the other side: it moves the statement
+onto the extended protocol, where the server does refuse it with `42601`. Callers taking text from
+somewhere else want both. The check reads the text with its literals blanked, so a semicolon inside
+a string, a dollar-quoted body or a comment separates nothing, and a terminating semicolon is not a
+second statement.
+
 `cypher.check_can_wrap()` is a reasonable hint to show a user early, and it already beats a
 write-detecting regex on `RETURN n.set`. It is not a boundary and is not used as one.
 

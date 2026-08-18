@@ -29,6 +29,7 @@ __all__ = [
     "changes_graph_path",
     "check_bindable_positions",
     "check_can_wrap",
+    "check_single_statement",
     "needs_a_reading_first",
     "quote_identifier",
     "quote_string",
@@ -292,6 +293,38 @@ def check_bindable_positions(statement: str) -> None:
         f"{found.group(0)!r}. The server accepts this and reads the parameter as a "
         f"property map, matching a walk of any length. Write the length into the "
         f"statement instead."
+    )
+
+
+def check_single_statement(statement: str) -> None:
+    """Refuse text that is more than one statement, for text somebody else wrote.
+
+    A statement sent with no parameters goes over the simple query protocol, which runs every
+    statement in the string and reports only the first one's result. So a read with a write after a
+    semicolon runs the write and looks like the read: measured, ``select 1; create table t(i int)``
+    returned one row and left the table behind.
+
+    This is one of the few things worth reading the text for, because the server does not refuse it
+    -- running the whole string is what that protocol is for. The other way to close it is to bind
+    a parameter, any parameter, which moves the statement onto the extended protocol where the
+    server does refuse it, with ``42601``. Callers taking text from somewhere else should do both:
+    this says which word is the reason, and the binding is what holds if this is ever wrong.
+
+    A terminating semicolon at the end is not a second statement and is allowed. Semicolons inside
+    a string or a comment are not separators either, and are not looked at -- the text is read with
+    its literals blanked, so one there terminates nothing.
+    """
+    if ";" not in statement:
+        return
+    bare = without_literals(statement).rstrip()
+    body = bare[:-1] if bare.endswith(";") else bare
+    found = body.find(";")
+    if found < 0:
+        return
+    raise ValueError(
+        f"this is more than one statement: there is a {statement[found : found + 30]!r} after the "
+        f"first one. Sent without parameters it would run all of them and report only the first "
+        f"one's result, so a statement from somewhere else is taken one at a time."
     )
 
 

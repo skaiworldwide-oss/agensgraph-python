@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import psycopg
 import pytest
 
 import agensgraph
 from agensgraph import DesiredIndex, Unique
 from agensgraph.cypher import (
     check_bindable_positions,
+    check_single_statement,
     quote_identifier,
     quote_string,
     without_literals,
@@ -297,3 +299,67 @@ class TestMultiplicationByAParameter:
         agens.execute("create (:m %s)", ({"price": 10, "qty": 4, "tags": [7]},))
         (got,) = agens.execute_query(statement, (3,)).records[0]
         assert got == expected
+
+
+class TestMoreThanOneStatement:
+    """Sent with no parameters, a string of statements runs all of them and reports the first.
+
+    So a read with a write after a semicolon runs the write and looks like the read, which is why
+    this one is read from the text: the server does not refuse it, because running the whole string
+    is what the simple query protocol is for.
+    """
+
+    @pytest.mark.parametrize(
+        "statement",
+        [
+            "select 1; create table t(i int)",
+            "match (n) return n; create (:x)",
+            "select 1;;",
+            "-- a comment\nselect 1; drop table t",
+        ],
+    )
+    def test_a_second_statement_is_refused(self, statement: str) -> None:
+        with pytest.raises(ValueError, match="more than one statement"):
+            check_single_statement(statement)
+
+    @pytest.mark.parametrize(
+        "statement",
+        [
+            "match (n) return n",
+            "match (n) return n;",
+            "match (n) return n;   \n",
+            "match (n) where n.s = 'a;b' return n",
+            "match (n) return n -- trailing ; here",
+            "match (n) return n /* ; */",
+            "match (n) where n.s = $$a;b$$ return n",
+        ],
+    )
+    def test_one_statement_is_sent(self, statement: str) -> None:
+        """A terminator is not a second statement, and a semicolon in a literal separates nothing."""
+        check_single_statement(statement)
+
+    def test_the_refusal_shows_what_came_after(self) -> None:
+        """A caller has to be able to see which part of its own text is the reason."""
+        with pytest.raises(ValueError) as caught:
+            check_single_statement("match (n) return n; create (:sneaked)")
+        assert "create (:sneaked)" in str(caught.value)
+
+
+@pytest.mark.server
+class TestWhatTheServerDoesWithMoreThanOne:
+    """The two halves of the argument above, each asserted rather than assumed."""
+
+    def test_without_parameters_it_runs_them_all(self, agens) -> None:  # type: ignore[no-untyped-def]
+        agens.execute("create temp table smuggled(i int)")
+        agens.execute("select 1; insert into smuggled values (7)")
+        (count,) = agens.execute("select count(*) from smuggled").fetchone()
+        assert count == 1, "the statement after the semicolon ran"
+
+    def test_binding_a_parameter_is_what_refuses_it(self, agens) -> None:  # type: ignore[no-untyped-def]
+        """Which is the other half of the answer, and the half that holds if the reading is wrong."""
+        agens.execute("create temp table bound(i int)")
+        with pytest.raises(psycopg.Error) as caught:
+            agens.execute("select %s; insert into bound values (8)", ("x",))
+        assert caught.value.sqlstate == "42601"
+        (count,) = agens.execute("select count(*) from bound").fetchone()
+        assert count == 0
