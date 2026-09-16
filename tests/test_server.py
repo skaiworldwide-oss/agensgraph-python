@@ -603,11 +603,13 @@ class TestTheMechanismsAReadRelieson:
             assert conn.capabilities.has_property_promotion() in (True, False)
             assert sent == []
 
-    def test_the_counting_notices_a_statement(self, dsn: str) -> None:
-        """Or the two above are asserting nothing."""
+    def test_the_counting_notices_a_statement(self, dsn: str, second_graph: str) -> None:
+        """Or the two above are asserting nothing.
+
+        graph() sends two whatever the server is: one to move, one to read the labels.
+        """
         with agensgraph.connect(dsn) as conn, counting_statements() as sent:
-            conn.execute_query("return 1")
-            conn.refresh_labels()
+            conn.graph(second_graph)
         assert len(sent) >= 2
 
 
