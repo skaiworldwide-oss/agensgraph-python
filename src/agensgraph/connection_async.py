@@ -281,8 +281,7 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
         """
         self._check_lent()
         await super().commit()
-        self._agens_graph_path_in_transaction = False
-        self._follow_reported_graph_path()
+        self._transaction_ended(rolled_back=False)
 
     @classmethod
     async def connect(cls, conninfo: str = "", **kwargs: Any) -> AsyncConnection[Any]:
@@ -363,11 +362,49 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
         """
         self._check_lent()
         await super().rollback()
+        self._transaction_ended(rolled_back=True)
+
+    def _transaction_ended(self, *, rolled_back: bool) -> None:
+        """Bring the label table in step with a transaction that just ended.
+
+        Where the server reports the path, what it reports decides. Elsewhere a rollback over
+        a path set inside the transaction drops the table. The note of that setting ends with
+        the outermost transaction; a block rolled back to a savepoint keeps it.
+        """
+        if self.closed:
+            return
         if self._agens_reports_graph_path:
             self._follow_reported_graph_path()
-        elif self._agens_graph_path_in_transaction:
+            return
+        if rolled_back and self._agens_graph_path_in_transaction:
             self.label_table.invalidate()
+        if self.pgconn.transaction_status == TransactionStatus.IDLE:
             self._agens_graph_path_in_transaction = False
+
+    @asynccontextmanager
+    async def transaction(
+        self, savepoint_name: str | None = None, force_rollback: bool = False
+    ) -> AsyncGenerator[psycopg.AsyncTransaction]:
+        """psycopg's transaction block, on a handle its holder still has.
+
+        The block ends with a statement no cursor of this connection runs, so the label table is
+        brought in step here as the block closes.
+        """
+        self._check_lent()
+        rolled_back = True
+        try:
+            async with super().transaction(savepoint_name, force_rollback) as block:
+                yield block
+                rolled_back = force_rollback
+        finally:
+            self._transaction_ended(rolled_back=rolled_back)
+
+    @asynccontextmanager
+    async def pipeline(self) -> AsyncGenerator[psycopg.AsyncPipeline]:
+        """psycopg's pipeline mode, on a handle its holder still has."""
+        self._check_lent()
+        async with super().pipeline() as pipeline:
+            yield pipeline
 
     async def execute_query(
         self,
@@ -622,6 +659,7 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
         # What is wrong with the statement is said before what is wrong with the connection,
         # so a caller with both is not sent round twice.
         self._check(query)
+        self._check_lent()
         statement = wrap_for_cursor(query)
         # What the cursor needs is a transaction, which is not the same question as whether the
         # connection is in autocommit: `with conn.transaction():` opens a real one there, and a
@@ -707,7 +745,11 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
         said reaches the caller, and for a copy that is the row it refused: measured,
         ``load_vertices`` of a duplicate key put the conflicting value into ``str(exc)`` while the
         same write through a statement did not.
+
+        The handle is checked here as well, since a copy runs through no cursor of this
+        connection's that would check it.
         """
+        self._check_lent()
         try:
             yield
         except psycopg.Error as exc:

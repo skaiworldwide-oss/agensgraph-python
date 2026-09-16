@@ -258,8 +258,7 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
         """
         self._check_lent()
         super().commit()
-        self._agens_graph_path_in_transaction = False
-        self._follow_reported_graph_path()
+        self._transaction_ended(rolled_back=False)
 
     @classmethod
     def connect(cls, conninfo: str = "", **kwargs: Any) -> Connection[Any]:
@@ -334,11 +333,49 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
         """
         self._check_lent()
         super().rollback()
+        self._transaction_ended(rolled_back=True)
+
+    def _transaction_ended(self, *, rolled_back: bool) -> None:
+        """Bring the label table in step with a transaction that just ended.
+
+        Where the server reports the path, what it reports decides. Elsewhere a rollback over
+        a path set inside the transaction drops the table. The note of that setting ends with
+        the outermost transaction; a block rolled back to a savepoint keeps it.
+        """
+        if self.closed:
+            return
         if self._agens_reports_graph_path:
             self._follow_reported_graph_path()
-        elif self._agens_graph_path_in_transaction:
+            return
+        if rolled_back and self._agens_graph_path_in_transaction:
             self.label_table.invalidate()
+        if self.pgconn.transaction_status == TransactionStatus.IDLE:
             self._agens_graph_path_in_transaction = False
+
+    @contextmanager
+    def transaction(
+        self, savepoint_name: str | None = None, force_rollback: bool = False
+    ) -> Generator[psycopg.Transaction]:
+        """psycopg's transaction block, on a handle its holder still has.
+
+        The block ends with a statement no cursor of this connection runs, so the label table is
+        brought in step here as the block closes.
+        """
+        self._check_lent()
+        rolled_back = True
+        try:
+            with super().transaction(savepoint_name, force_rollback) as block:
+                yield block
+                rolled_back = force_rollback
+        finally:
+            self._transaction_ended(rolled_back=rolled_back)
+
+    @contextmanager
+    def pipeline(self) -> Generator[psycopg.Pipeline]:
+        """psycopg's pipeline mode, on a handle its holder still has."""
+        self._check_lent()
+        with super().pipeline() as pipeline:
+            yield pipeline
 
     def execute_query(
         self,
@@ -575,6 +612,7 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
         if size < 1:
             raise ValueError(f"a chunk holds at least one row, got {size}")
         self._check(query)
+        self._check_lent()
         statement = wrap_for_cursor(query)
         if (
             name is None
@@ -653,7 +691,11 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
         said reaches the caller, and for a copy that is the row it refused: measured,
         ``load_vertices`` of a duplicate key put the conflicting value into ``str(exc)`` while the
         same write through a statement did not.
+
+        The handle is checked here as well, since a copy runs through no cursor of this
+        connection's that would check it.
         """
+        self._check_lent()
         try:
             yield
         except psycopg.Error as exc:

@@ -262,13 +262,11 @@ class TestRollingBackTheGraphPath:
         self, dsn: str, agens, second_graph: str
     ) -> None:  # type: ignore[no-untyped-def]
         """psycopg ends a ``transaction()`` block with a statement no cursor of the connection
-        runs. Where the server reports the path, a describing method sees the move back by
-        itself and lists the first graph's labels, not the second's."""
+        runs. The block's own end is where the table is brought in step, so a describing method
+        lists the first graph's labels, not the second's, whatever the server reports."""
         agens.execute("create vlabel person")
         first = agens.label_table.graph
         with agensgraph.Connection.connect(dsn) as conn:
-            if not conn._agens_reports_graph_path:
-                pytest.skip("this server does not report graph_path")
             conn.graph(first)
             conn.commit()
             with conn.transaction():
@@ -279,6 +277,42 @@ class TestRollingBackTheGraphPath:
             names = {label.name for label in conn.labels()}
             assert "person" in names
             assert "account" not in names
+            conn.rollback()
+
+    def test_a_block_rolled_back_over_a_graph_change_drops_the_table(
+        self, dsn: str, agens, second_graph: str
+    ) -> None:  # type: ignore[no-untyped-def]
+        """And a binary read afterwards refuses rather than naming the second graph's label,
+        which is what it did where the server does not report the path."""
+        agens.execute("create vlabel person")
+        agens.execute("create (:person {n: 'x'})")
+        first = agens.label_table.graph
+        with agensgraph.Connection.connect(dsn) as conn:
+            conn.graph(first)
+            conn.commit()
+            with conn.transaction():
+                conn.graph(second_graph)
+                assert conn.label_table.graph == second_graph
+                raise psycopg.Rollback
+            assert conn.label_table.graph is None
+            with pytest.raises(StaleLabelCache, match="refresh_labels"):
+                conn.execute_query("match (n) return n", binary_=True)
+            conn.refresh_labels()
+            (vertex,) = conn.execute_query("match (n) return n", binary_=True).records[0]
+            assert vertex.label == "person"
+            conn.rollback()
+
+    def test_a_block_rolled_back_to_a_savepoint_drops_the_table_too(
+        self, dsn: str, agens, second_graph: str
+    ) -> None:  # type: ignore[no-untyped-def]
+        first = agens.label_table.graph
+        with agensgraph.Connection.connect(dsn) as conn:
+            conn.graph(first)
+            with conn.transaction(), conn.transaction():
+                conn.graph(second_graph)
+                raise psycopg.Rollback
+            assert conn.label_table.graph is None
+            assert conn.execute("show graph_path").fetchone()[0] == first
             conn.rollback()
 
 

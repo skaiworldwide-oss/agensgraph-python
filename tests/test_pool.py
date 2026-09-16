@@ -461,6 +461,22 @@ class TestAHandleKeptPastItsBlock:
                 with pytest.raises(ReleasedConnection):
                     run()
 
+    def test_and_every_way_round_a_cursor_of_its_own(self, dsn: str) -> None:
+        """A server-side cursor, a copy, and the two blocks psycopg runs through its own
+        machinery rather than through a cursor this driver made. Each reaches the server, so
+        each has to be refused where the statements above are."""
+        with agensgraph.ConnectionPool(dsn, min_size=1, max_size=1, timeout=5.0) as pool:
+            with pool.connection() as conn:
+                escaped = conn
+            for run in (
+                lambda: next(escaped.stream("return 1")),
+                lambda: escaped.load_vertices("doc", [{"n": 1}], graph="g"),
+                lambda: escaped.transaction().__enter__(),
+                lambda: escaped.pipeline().__enter__(),
+            ):
+                with pytest.raises(ReleasedConnection):
+                    run()
+
     def test_it_is_refused_while_the_connection_sits_in_the_pool(self, dsn: str) -> None:
         with agensgraph.ConnectionPool(dsn, min_size=1, max_size=1, timeout=5.0) as pool:
             with pool.connection() as conn:
