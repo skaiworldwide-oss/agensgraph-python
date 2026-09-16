@@ -1202,8 +1202,9 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
         A server that cannot promote a property has nowhere to record one, and reading the catalog
         that is not there would raise instead of saying none -- so the catalog is asked for first,
         once per connection. Asked rather than worked out from the version, because the version
-        does not answer it: the 2.18 release branch and main both report ``2.18-devel`` and only
-        one of them has the catalog.
+        does not answer it: a development build reports the line it is on and nothing of what it
+        carries, and two servers both reporting ``2.18-devel`` were found to differ, one with the
+        catalog and one without.
         """
         if not await self.can_promote_properties():
             return []

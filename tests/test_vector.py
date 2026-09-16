@@ -42,8 +42,9 @@ def needs_vectors(conn) -> None:  # type: ignore[no-untyped-def]
 def needs_promotion(conn) -> None:  # type: ignore[no-untyped-def]
     """Skip where a property cannot be given a column of its own.
 
-    Asked of the server rather than of its version, because the version does not answer it: the
-    2.18 release branch and main both report ``2.18-devel`` and only one of them can.
+    Asked of the server rather than of its version, because the version does not answer it: a
+    development build reports the line it is on and nothing of what it carries, and two servers
+    both reporting ``2.18-devel`` were found to differ, only one of which could.
     """
     if not conn.can_promote_properties():
         pytest.skip("this server cannot store a property in a column of its own")

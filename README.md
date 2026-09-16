@@ -689,7 +689,8 @@ finds them.
 
 `declared_properties()` asks the server whether it can promote a property at all before reading the
 catalog that records one, because that catalog does not exist on every server and the version cannot
-tell you: the 2.18 release branch and main both report `2.18-devel`, and only one of them has it.
+tell you: a development build reports the line it is on and nothing of what it carries, and two
+servers both reporting `2.18-devel` were found to differ, one with the catalog and one without.
 
 ## Describing a graph
 
@@ -1469,10 +1470,19 @@ the `agversion` parameter the server sends at startup, so the check costs no rou
 The floor is what the build tests against: every release named here has the whole suite run against
 it on every change, so support is a thing that is checked rather than a thing that is claimed.
 
+What the server reports there has had more than one shape, and the driver reads any of them the same
+way: by the two leading numbers, which are the AgensGraph line and the PostgreSQL major beneath it.
+From 2.18 a release reports four numbers — `2.18.6.0`, whose third is the PostgreSQL minor that
+build carries and whose fourth is the AgensGraph one. A candidate for a release adds `-rc1`, `-rc2`
+and so on to that, and a build from a development branch reports the line and `-devel` with no
+numbers after it. Earlier releases are shorter, `2.17.0` and `2.16`. Everything past the first two
+numbers says which build of the line is in front of you rather than what it can do, so no gate
+below reads it.
+
 ```python
 caps = conn.capabilities
-caps.version                      # (2, 18)
-caps.reported                     # '2.18-devel'
+caps.version                      # (2, 18)  -- the line, and PostgreSQL 18 under it
+caps.reported                     # '2.18.6.0'
 caps.has_property_promotion()     # a property stored in a column of its own
 caps.has_gql_clauses()            # LET, NEXT, FINISH, FILTER, FOR, CALL
 caps.has_element_ordering()       # ORDER BY on a vertex or an edge
@@ -1650,9 +1660,14 @@ uv run python tools/async_to_sync.py --check   # fail if it is out of date
 ```
 
 Continuous integration runs the offline suite on Python 3.11 through 3.14, the full suite against
-AgensGraph v2.17, v2.18 and main (each with pgvector built against it), the linter and formatter,
-`mypy --strict`, a resolution at the lowest declared versions, a fuzzer over the text reader, and an
-install of the built wheel and source distribution into clean environments.
+the AgensGraph 2.17 and 2.18 lines and against main (each with pgvector built against it), the
+linter and formatter, `mypy --strict`, a resolution at the lowest declared versions, a fuzzer over
+the text reader, and an install of the built wheel and source distribution into clean environments.
+
+A line is named there rather than a branch, and the branch carrying it is resolved when the job
+runs. The engine names a release branch after the PostgreSQL minor it carries — `v2.17.10`,
+`v2.18.6` — so the branch holding a line changes every time a minor is merged into it, and a name
+written down goes stale at the next merge.
 
 Many tests pin engine behaviour the driver works around, deliberately: if a later release fixes one,
 that test fails and names the workaround to drop.

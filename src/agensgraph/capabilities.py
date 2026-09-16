@@ -35,18 +35,19 @@ _GQL_CLAUSES = (2, 18)
 _ELEMENT_ORDERING = (2, 18)
 _ENDPOINT_ELISION = (2, 18)
 
-# A release build reports '2.18' and a development build '2.18-devel', so only the two
-# leading numbers are read and whatever follows them is kept for reporting.
+# The two leading numbers are the AgensGraph line and the PostgreSQL major under it. What follows
+# them names the build and its shape varies by release -- '2.16', '2.17.0', '2.18.6.0',
+# '2.18.6.0-rcN', '2.18-devel' -- so it is kept as reported and never read.
 _VERSION = re.compile(r"(\d+)\.(\d+)")
 
 
 def parse_version(text: str) -> tuple[int, int]:
-    """Read the major and minor numbers out of a reported version."""
+    """Read the AgensGraph line and the PostgreSQL major out of a reported version."""
     match = _VERSION.match(text.strip())
     if match is None:
         raise CapabilityError(
             f"cannot read an AgensGraph version from {text!r}. The server reports one in "
-            f"`agversion`, as `2.18` or `2.18-devel`"
+            f"`agversion`, as `2.18.6.0`, `2.18.6.0-rc1`, `2.18-devel`, or `2.17.0` before 2.18"
         )
     return int(match.group(1)), int(match.group(2))
 
@@ -104,7 +105,11 @@ class Capabilities:
 
     @property
     def version(self) -> tuple[int, int]:
-        """The major and minor numbers, for comparing."""
+        """The AgensGraph line and the PostgreSQL major under it, for comparing.
+
+        A release, a candidate for it and a development build of one line all compare alike;
+        :attr:`reported` has the version entire.
+        """
         return self._version
 
     @property

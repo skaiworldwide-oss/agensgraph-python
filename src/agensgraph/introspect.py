@@ -141,9 +141,10 @@ select to_regclass('pg_catalog.ag_label_property') is not null
 """Whether this server can store a property in a column of its own.
 
 Asked of the catalog rather than worked out from the version, because the version cannot answer
-it: the 2.18 release branch and main both report ``2.18-devel`` and only one of them has the
-catalog. A server that cannot promote a property has nowhere to record one, so the presence of the
-catalog is the feature.
+it: a development build reports the line it is on and nothing of what it carries, and two servers
+both reporting ``2.18-devel`` were found to differ, one with the catalog and one without. A server
+that cannot promote a property has nowhere to record one, so the presence of the catalog is the
+feature.
 """
 
 SERVER_PROGRAM_QUERY = """
