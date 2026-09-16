@@ -766,7 +766,8 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
 
         Faster than any statement because it is one stream rather than a statement per row:
         measured at 223,000 rows a second against 140,000 for a single ``UNWIND ... CREATE`` and
-        47,000 for one statement each.
+        47,000 for the same rows through ``executemany``, which psycopg pipelines. A plain loop of
+        one statement a row is slower again; see :mod:`agensgraph.bulk` for the spread.
 
         No identity is supplied. The column's default produces the same identities a ``CREATE``
         would, so nothing here has to reproduce the server's numbering.

@@ -155,7 +155,11 @@ class GraphMixin:
 
     _agens_adapters: AdaptersMap
     pgconn: PGconn
-    info: ConnectionInfo
+
+    if TYPE_CHECKING:
+        # psycopg defines it as a property, not a field.
+        @property
+        def info(self) -> ConnectionInfo: ...
 
     _agens_capabilities: Capabilities | None = None
     _agens_has_meta_flag: bool | None = None

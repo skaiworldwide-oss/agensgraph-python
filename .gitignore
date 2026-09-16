@@ -8,3 +8,6 @@ dist
 # Agent worktrees and local session state.
 .claude/
 .scratch/
+# A library: CI resolves the dependencies fresh, so a new psycopg release is tested rather than
+# frozen out by a lock.
+uv.lock

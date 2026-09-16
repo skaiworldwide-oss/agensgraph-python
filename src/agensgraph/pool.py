@@ -414,7 +414,7 @@ class ConnectionPool:
 
     def _with_counters(self, stats: dict[str, int]) -> dict[str, int]:
         """psycopg's stats, with every counter present and this pool's own added."""
-        out = dict.fromkeys(COUNTERS, 0)
+        out: dict[str, int] = dict.fromkeys(COUNTERS, 0)
         out.update(stats)
         out["generation"] = self._generation
         out["connections_retired"] = self._retired

@@ -17,7 +17,7 @@ dependencies = [
 ]
 keywords = ["agensgraph", "graph", "database", "postgresql", "cypher", "gql", "driver"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
     "Topic :: Database",
     "Topic :: Database :: Front-Ends",
@@ -36,6 +36,9 @@ email = "skaisw@skaiworldwide.com"
 [project.urls]
 Homepage = "https://github.com/skaiworldwide-oss/agensgraph-python"
 Source = "https://github.com/skaiworldwide-oss/agensgraph-python"
+Documentation = "https://github.com/skaiworldwide-oss/agensgraph-python#readme"
+Changelog = "https://github.com/skaiworldwide-oss/agensgraph-python/blob/master/CHANGELOG.md"
+Issues = "https://github.com/skaiworldwide-oss/agensgraph-python/issues"
 
 [project.optional-dependencies]
 otel = ["opentelemetry-api>=1.33"]
@@ -57,6 +60,10 @@ tests = [
 typing = [
     "mypy>=1.13",
     "typing-extensions>=4.12",
+    # Pinned for the same reason the linter is: a type checker's rules move between releases, and a
+    # floor lets a build start failing on code nobody touched. The two disagree on purpose -- five
+    # real defects were found by this one that mypy passed, and four more by a later release of it.
+    "pyright==1.1.411",
 ]
 # Pinned exactly, not floored. Formatting and lint rules move between releases -- 0.16.0 went
 # from 59 default rules to 413 -- so a floor lets a build start failing on code nobody touched.
@@ -76,7 +83,7 @@ source = "vcs"
 packages = ["src/agensgraph"]
 
 [tool.hatch.build.targets.sdist]
-include = ["src", "tests", "README.md", "LICENSE", "pyproject.toml"]
+include = ["src", "tests", "README.md", "CHANGELOG.md", "LICENSE", "pyproject.toml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -4,7 +4,7 @@
 [![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue.svg)](https://pypi.org/project/agensgraph-python/)
 [![AgensGraph](https://img.shields.io/badge/AgensGraph-2.17%2B-1f6feb.svg)](https://github.com/skaiworldwide-oss/agensgraph)
 [![Tests](https://github.com/skaiworldwide-oss/agensgraph-python/actions/workflows/python-driver-test.yaml/badge.svg)](https://github.com/skaiworldwide-oss/agensgraph-python/actions/workflows/python-driver-test.yaml)
-[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](https://github.com/skaiworldwide-oss/agensgraph-python/blob/master/LICENSE)
 
 Read and write an [AgensGraph](https://github.com/skaiworldwide-oss/agensgraph) graph from Python,
 in blocking or awaiting code, over [psycopg 3](https://www.psycopg.org/psycopg3/).
@@ -525,8 +525,11 @@ by_key = conn.identity_map("Doc", "key")
 conn.load_edges("Cites", [(by_key["a"], by_key["b"], {"weight": 1})])
 ```
 
-`COPY` in binary rather than a statement per row: about thirty times a statement at a time, and
-better than half again on top of the best a single `UNWIND ... CREATE` can do.
+`COPY` in binary rather than a statement per row: about thirty times a loop of one statement a row
+in a single transaction, and better than half again on top of the best a single `UNWIND ... CREATE`
+can do. Say which loop you mean when you compare, because the answer moves by two orders of
+magnitude between one in a transaction, one in autocommit paying a commit a row, and `executemany`,
+which psycopg pipelines.
 
 No identity is supplied. The label table's `id` column has a default that builds the graph id from
 the label's own id and its sequence, so copying only the property map produces exactly the identities
@@ -1709,6 +1712,7 @@ Everything exported from `agensgraph`. The submodules `agensgraph.columnar`, `ag
 | `vector` | `Vector`, `SparseVector`, `VectorIndex`, `vector_index`, `describe_vector_index`, `nearest`, `generated_column`, `Distance`, `SEARCH_OPTIONS` |
 | `dbapi` | the PEP 249 surface |
 | `errors` | the exception hierarchy and the classification function |
+| `adapters` | `register_text`, `register_binary`, to read graph types on a psycopg connection this driver did not make |
 
 ## Development
 
@@ -1727,8 +1731,9 @@ uv run python tools/async_to_sync.py --check   # fail if it is out of date
 
 Continuous integration runs the offline suite on Python 3.11 through 3.14, the full suite against
 the AgensGraph 2.17 and 2.18 lines and against main (each with pgvector built against it), the
-linter and formatter, `mypy --strict`, a resolution at the lowest declared versions, a fuzzer over
-the text reader, and an install of the built wheel and source distribution into clean environments.
+linter and formatter, `mypy --strict` and pyright strict, a resolution at the lowest declared
+versions, a fuzzer over the text reader, and an install of the built wheel and source distribution
+into clean environments.
 
 A line is named there rather than a branch, and the branch carrying it is resolved when the job
 runs. The engine names a release branch after the PostgreSQL minor it carries — `v2.17.10`,
@@ -1738,16 +1743,35 @@ written down goes stale at the next merge.
 Many tests pin engine behaviour the driver works around, deliberately: if a later release fixes one,
 that test fails and names the workaround to drop.
 
+A release is a tag. Date this version's section of `CHANGELOG.md`, tag the commit `v<version>` and
+push the tag: the release workflow builds both distributions from it, checks that they carry the
+tag's version and that the README renders, runs the offline suite, publishes to PyPI through trusted
+publishing, and makes the GitHub release.
+
+The notes on that release are `docs/release-notes/<version>.md` where somebody wrote them, and that
+version's changelog section otherwise, so a routine release needs nothing written.
+
 ## Relationship to 1.x
 
-2.0 is a rewrite with no backwards compatibility. 1.x was a psycopg2 type-extension shim of about
-nine hundred lines, and it was incorrect on output the engine legitimately produces: an empty path
+2.0 is a rewrite with no backwards compatibility. 1.x was a psycopg2 type-extension shim of under
+five hundred lines, and it was incorrect on output the engine legitimately produces: an empty path
 raised, `NULL` elements had no representation, a label containing `{` collapsed a whole path into one
 token, an unanchored graph id match turned `7.9.5` into `(7,9)`, every returned value was unhashable,
 and `len(path)` made a valid single-vertex path falsy.
 
 The distribution name and the import name are unchanged. 1.x remains on a maintenance branch for
 security only, and the psycopg2 line does not migrate.
+
+One habit does not carry over. Importing 1.x registered its casters into psycopg2's global map, so
+every psycopg2 connection in the process read graph types without asking. This driver keeps its
+adapters on its own connections, so a plain PostgreSQL connection in the same process is unaffected.
+Where you have a psycopg 3 connection this driver did not make, say so:
+
+```python
+from agensgraph.adapters import register_text
+
+register_text(conn)          # reads vertices, edges and paths on that connection
+```
 
 ## License
 

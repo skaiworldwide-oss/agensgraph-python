@@ -2,8 +2,10 @@
 
 Copying is the fast way in, and the reason is that it is one stream rather than a statement per
 row. Measured on this driver against twenty thousand vertices: **225,000 rows a second** by
-copying, against 140,000 for a single ``UNWIND ... CREATE`` and 5,400 for one statement per row --
-so 1.6 times the best Cypher can do and **thirty-two** times the obvious approach.
+copying, against 140,000 for a single ``UNWIND ... CREATE`` and 5,400 for a statement per row
+inside one transaction -- so 1.6 times the best Cypher can do and **thirty-two** times the obvious
+approach. Which statement per row is meant matters: the same loop in autocommit pays a commit a row
+and is slower again by two orders, and ``executemany``, which psycopg pipelines, sits between them.
 
 An identity does not have to be supplied. A label table's ``id`` column has a default that builds
 the graph id from the label's own id and the label's sequence, so copying only the property map
@@ -480,7 +482,10 @@ def split_edges_by_what_exists(
     updates: list[dict[str, Any]] = []
     seen: set[tuple[GraphId, GraphId]] = set()
     for start, end, properties in edges:
-        if start is None or end is None:
+        # The type says neither can be null, and a caller whose lookup returned nothing passes one
+        # anyway. Checked here because this already walks every edge; the copy path does not, and
+        # pays the server's not-null failure naming the column rather than a test per row.
+        if start is None or end is None:  # pyright: ignore[reportUnnecessaryComparison]
             raise ValueError("an edge joins two elements, and one of these is null")
         pair = (start, end)
         found = present.get(pair)

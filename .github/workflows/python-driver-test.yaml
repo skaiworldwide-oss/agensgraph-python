@@ -43,8 +43,11 @@ jobs:
           uv run ruff format --check src tests tools
           uv run ruff check src tests tools
 
+      # Both, because they disagree: pyright has found defects mypy passed, and the reverse.
       - name: Types
-        run: uv run mypy
+        run: |
+          uv run mypy
+          uv run pyright
 
       # Three separate things go wrong here, so all three are checked: a generated file edited
       # directly, a generated file left behind by an edit to its source, and an awaiting module
