@@ -220,8 +220,7 @@ class Cursor(psycopg.Cursor[Row]):
         the reported value is still the old one.
         """
         conn = cast("Connection[Row]", self.connection)
-        reported_move = conn._agens_reports_graph_path and conn._graph_path_moved()
-        if not reported_move and (not changes_graph_path(text)):
+        if conn._follow_reported_graph_path() or not changes_graph_path(text):
             return
         conn.label_table.invalidate()
         if not conn.autocommit and (not conn._agens_reports_graph_path):
@@ -252,9 +251,15 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
         self._agens_labels = LabelCache()
 
     def commit(self) -> None:
+        """Commit, and drop the label table if the graph path went back with it.
+
+        A path set with ``SET LOCAL`` ends with its transaction. Seen where the server reports
+        the path; the statement text says a path was set, not for how long.
+        """
         self._check_lent()
         super().commit()
         self._agens_graph_path_in_transaction = False
+        self._follow_reported_graph_path()
 
     @classmethod
     def connect(cls, conninfo: str = "", **kwargs: Any) -> Connection[Any]:
@@ -299,6 +304,7 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
         A graph the table does not name is asked of the server, which is one statement more
         and is what makes this the way back from any change the driver only saw go past.
         """
+        self._follow_reported_graph_path()
         graph = self.label_table.graph
         if graph is None:
             graph = self._current_graph()
@@ -329,10 +335,8 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
         self._check_lent()
         super().rollback()
         if self._agens_reports_graph_path:
-            if self._graph_path_moved():
-                self.label_table.invalidate()
-            return
-        if self._agens_graph_path_in_transaction:
+            self._follow_reported_graph_path()
+        elif self._agens_graph_path_in_transaction:
             self.label_table.invalidate()
             self._agens_graph_path_in_transaction = False
 
@@ -1475,9 +1479,14 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
 
         The reading is reached only by a caller that named no graph and a table that names none
         either, so an ordinary call still costs nothing.
+
+        Where the server reports the path, the table is checked against it first. psycopg ends
+        a ``transaction()`` block without a cursor of this connection, so no statement watch
+        saw the path go back.
         """
         if given is not None:
             return given
+        self._follow_reported_graph_path()
         graph = self.label_table.graph or self._current_graph()
         if graph is None:
             raise ValueError(

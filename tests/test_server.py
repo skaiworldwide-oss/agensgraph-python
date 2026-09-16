@@ -603,8 +603,25 @@ class TestTheMechanismsAReadRelieson:
             assert conn.capabilities.has_property_promotion() in (True, False)
             assert sent == []
 
+    def test_where_the_session_is_costs_no_statement_where_the_server_reports_it(
+        self, dsn: str, second_graph: str
+    ) -> None:
+        """Every describing method needs the graph before it can name a table. Where the
+        server reports the path that is read off the connection, and a method given no graph
+        sends only its own statement."""
+        with agensgraph.connect(dsn) as conn:
+            if not conn._agens_reports_graph_path:
+                pytest.skip("this server does not report graph_path")
+            conn.execute(f'set graph_path = "{second_graph}"')
+            conn.commit()
+            assert conn.label_table.graph is None
+            with counting_statements() as sent:
+                names = {label.name for label in conn.labels()}
+            assert "account" in names
+            assert len(sent) == 1, sent
+
     def test_the_counting_notices_a_statement(self, dsn: str, second_graph: str) -> None:
-        """Or the two above are asserting nothing.
+        """Or those above are asserting nothing.
 
         graph() sends two whatever the server is: one to move, one to read the labels.
         """

@@ -302,6 +302,17 @@ class GraphMixin:
         self._agens_graph_path_seen = now
         return True
 
+    def _follow_reported_graph_path(self) -> bool:
+        """Drop the label table if the reported graph path has moved since it was last read.
+
+        Nothing on a server that does not report it. Called after a commit or a rollback, and
+        before a describing method reads which graph the table names.
+        """
+        if not self._agens_reports_graph_path or not self._graph_path_moved():
+            return False
+        self.label_table.invalidate()
+        return True
+
     # -- statements ---------------------------------------------------------------------
 
     def _check(self, statement: Any) -> None:

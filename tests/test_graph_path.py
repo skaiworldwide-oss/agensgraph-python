@@ -10,10 +10,11 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import psycopg
 import pytest
 
 import agensgraph
-from agensgraph._core import GraphMixin
+from agensgraph._core import GraphMixin, LabelCache
 from agensgraph.cypher import changes_graph_path, quote_identifier, without_literals
 from agensgraph.errors import StaleLabelCache
 
@@ -54,7 +55,7 @@ def test_and_one_that_does_not_is_left_alone(statement: str) -> None:
 
 
 class _Session(GraphMixin):
-    """Enough of a connection for the two methods that read the reported graph path.
+    """Enough of a connection for the methods that read the reported graph path.
 
     Built here rather than run against a server because the servers this suite can reach do
     not all report it: 2.18.6 does, and 2.17 and 2.18.4 do not.
@@ -98,16 +99,52 @@ class TestReadingTheGraphPathTheServerReports:
         session.reported = "first"
         assert session._graph_path_moved()
 
-    @pytest.mark.server
-    def test_what_the_driver_read_is_what_the_server_does(self, agens) -> None:  # type: ignore[no-untyped-def]
-        """Reported from 2.18.6, and not before it.
+    def test_following_the_path_drops_the_table_once_per_move(self) -> None:
+        session = _Session("first")
+        session._note_graph_path()
+        session._agens_labels = LabelCache()
+        session.label_table.load("first", [])
+        assert not session._follow_reported_graph_path()
+        assert session.label_table.graph == "first"
+        session.reported = "second"
+        assert session._follow_reported_graph_path()
+        assert session.label_table.graph is None
+        session.label_table.load("second", [])
+        assert not session._follow_reported_graph_path()
+        assert session.label_table.graph == "second"
 
-        Read off the connection rather than off the version, because 2.18.4 and 2.18.6 report
-        the same two leading numbers and differ here.
-        """
-        assert agens._agens_reports_graph_path is (
-            agens.info.parameter_status("graph_path") is not None
-        )
+    def test_a_server_that_does_not_report_it_is_never_followed(self) -> None:
+        """The text of the statements is the only signal there, and that is read elsewhere."""
+        session = _Session(None)
+        session._note_graph_path()
+        session._agens_labels = LabelCache()
+        session.label_table.load("first", [])
+        session.reported = "second"
+        assert not session._follow_reported_graph_path()
+        assert session.label_table.graph == "first"
+
+
+@pytest.mark.server
+class TestTheReportedPathIsWhatTheServerWouldAnswer:
+    """Where the server reports the path the driver reads it in place of asking, so the two
+    must agree. On a server that does not report it both are the one query, as a control."""
+
+    def test_where_the_session_is_read_free_is_where_the_server_says(
+        self, agens, second_graph: str
+    ) -> None:  # type: ignore[no-untyped-def]
+        def asked() -> str:
+            # Names the setting, so the text scan drops the table once this has run.
+            return agens.execute("select current_setting('graph_path')").fetchone()[0]
+
+        held = agens.label_table.graph
+        assert agens._current_graph() == held
+        assert asked() == held
+        agens.execute(f'set graph_path = "{second_graph}"')
+        assert agens._current_graph() == second_graph
+        assert asked() == second_graph
+        agens.execute("reset graph_path")
+        assert agens._current_graph() is None
+        assert asked() == ""
 
 
 @pytest.mark.server
@@ -199,6 +236,49 @@ class TestRollingBackTheGraphPath:
             conn.graph(second_graph)
             conn.commit()
             assert conn.label_table.graph == second_graph
+            conn.rollback()
+
+    def test_a_path_set_for_the_transaction_goes_back_at_commit(
+        self, dsn: str, agens, second_graph: str
+    ) -> None:  # type: ignore[no-untyped-def]
+        """``SET LOCAL`` ends with its transaction, so a commit moves the session back as a
+        rollback does. Seen where the server reports the path; the statement text says a path
+        was set, not for how long."""
+        first = agens.label_table.graph
+        with agensgraph.Connection.connect(dsn) as conn:
+            if not conn._agens_reports_graph_path:
+                pytest.skip("this server does not report graph_path")
+            conn.graph(first)
+            conn.commit()
+            conn.execute(f'set local graph_path = "{second_graph}"')
+            conn.refresh_labels()
+            assert conn.label_table.graph == second_graph
+            conn.commit()
+            assert conn.label_table.graph is None
+            assert conn.execute("show graph_path").fetchone()[0] == first
+            conn.rollback()
+
+    def test_a_block_ended_behind_the_cursor_is_seen_by_what_describes(
+        self, dsn: str, agens, second_graph: str
+    ) -> None:  # type: ignore[no-untyped-def]
+        """psycopg ends a ``transaction()`` block with a statement no cursor of the connection
+        runs. Where the server reports the path, a describing method sees the move back by
+        itself and lists the first graph's labels, not the second's."""
+        agens.execute("create vlabel person")
+        first = agens.label_table.graph
+        with agensgraph.Connection.connect(dsn) as conn:
+            if not conn._agens_reports_graph_path:
+                pytest.skip("this server does not report graph_path")
+            conn.graph(first)
+            conn.commit()
+            with conn.transaction():
+                conn.execute(f'set graph_path = "{second_graph}"')
+                conn.refresh_labels()
+                assert conn.label_table.graph == second_graph
+                raise psycopg.Rollback
+            names = {label.name for label in conn.labels()}
+            assert "person" in names
+            assert "account" not in names
             conn.rollback()
 
 

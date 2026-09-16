@@ -8,6 +8,9 @@ id, a sequence with no gaps and no repeats, and elements the ordinary reader dec
 from __future__ import annotations
 
 import gc
+import math
+import time
+from typing import TYPE_CHECKING
 
 import psycopg
 import pytest
@@ -22,9 +25,22 @@ from agensgraph.bulk import (
     vertex_copy_statement,
 )
 
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
 pytestmark = pytest.mark.server
 
 ROWS = 5000
+
+
+def fastest_of(times: int, run: Callable[[], object]) -> float:
+    """The best of *times* runs: how fast it goes, and not how the machine was doing."""
+    best = math.inf
+    for _ in range(times):
+        started = time.monotonic()
+        run()
+        best = min(best, time.monotonic() - started)
+    return best
 
 
 @pytest.fixture
@@ -274,18 +290,19 @@ class TestAKeyWithAColumnOfItsOwn:
 class TestItIsWorthDoing:
     def test_it_beats_a_statement_per_row(self, loaded) -> None:  # type: ignore[no-untyped-def]
         """Not a benchmark -- a floor, so a regression that makes it slower than the alternative
-        fails rather than merely disappoints."""
-        import time
+        fails rather than merely disappoints.
 
-        rows = [{"n": i} for i in range(2000)]
-        started = time.monotonic()
-        loaded.load_vertices("doc", rows)
-        copying = time.monotonic() - started
+        The best of three on each side. Both finish in tens of milliseconds, and one slow run
+        on a shared machine turned the comparison around once.
+        """
+        rows = [{"n": i} for i in range(ROWS)]
+        copying = fastest_of(3, lambda: loaded.load_vertices("doc", rows))
 
         loaded.execute("create vlabel other")
-        started = time.monotonic()
-        loaded.cursor().executemany("create (:other %s)", [(row,) for row in rows])
-        one_at_a_time = time.monotonic() - started
+        params = [(row,) for row in rows]
+        one_at_a_time = fastest_of(
+            3, lambda: loaded.cursor().executemany("create (:other %s)", params)
+        )
 
         assert copying < one_at_a_time
 
