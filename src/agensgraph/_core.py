@@ -34,6 +34,7 @@ from .summary import GraphWriteCounts
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Sequence
 
+    from psycopg import ConnectionInfo
     from psycopg.adapt import AdaptersMap
     from psycopg.pq.abc import PGconn
     from psycopg.sql import SQL, Composed
@@ -154,6 +155,7 @@ class GraphMixin:
 
     _agens_adapters: AdaptersMap
     pgconn: PGconn
+    info: ConnectionInfo
 
     _agens_capabilities: Capabilities | None = None
     _agens_has_meta_flag: bool | None = None
@@ -186,8 +188,19 @@ class GraphMixin:
     """Whether the graph path was set inside the transaction now open.
 
     Setting it is part of the transaction, so a rollback puts it back and takes the label
-    table out of step with the session.
+    table out of step with the session. Kept only where the path is read from the statements
+    that go past; a server that reports it says so itself after the rollback.
     """
+
+    _agens_reports_graph_path: bool = False
+    """Whether the server sends the graph path as a run-time parameter.
+
+    From 2.18.6. Not a version question, though: 2.18.4 and 2.18.6 report the same two leading
+    numbers and differ here, so it is read off the connection rather than off the version.
+    """
+
+    _agens_graph_path_seen: str = ""
+    """The graph path this connection last read from a reported parameter."""
 
     _agens_pooled: bool = False
     """Whether a pool owns this connection, and so decides who may use it and when."""
@@ -246,7 +259,7 @@ class GraphMixin:
         """
         caps = self._agens_capabilities
         if caps is None:
-            caps = Capabilities.of(self)  # type: ignore[arg-type]
+            caps = Capabilities.of(self)
             self._agens_capabilities = caps
         return caps
 
@@ -268,6 +281,26 @@ class GraphMixin:
         if not self._agens_binary_ready:
             register_binary(self, self.label_table)  # type: ignore[arg-type]
             self._agens_binary_ready = True
+
+    # -- the graph the session is reading -------------------------------------------------
+
+    def _note_graph_path(self) -> None:
+        """Read whether the server reports the graph path, and record what it reports."""
+        reported = self.info.parameter_status("graph_path")
+        self._agens_reports_graph_path = reported is not None
+        self._agens_graph_path_seen = reported or ""
+
+    def _graph_path_moved(self) -> bool:
+        """Whether the reported graph path differs from the one last read here.
+
+        Reading it records it, so one change is reported once. Only meaningful where the
+        server reports the path at all.
+        """
+        now = self.info.parameter_status("graph_path") or ""
+        if now == self._agens_graph_path_seen:
+            return False
+        self._agens_graph_path_seen = now
+        return True
 
     # -- statements ---------------------------------------------------------------------
 

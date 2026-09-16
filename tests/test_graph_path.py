@@ -8,9 +8,12 @@ Everything here is about making sure it cannot.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 import agensgraph
+from agensgraph._core import GraphMixin
 from agensgraph.cypher import changes_graph_path, quote_identifier, without_literals
 from agensgraph.errors import StaleLabelCache
 
@@ -48,6 +51,63 @@ def test_a_statement_that_moves_the_session_is_recognised(statement: str) -> Non
 @pytest.mark.parametrize("statement", STAYS)
 def test_and_one_that_does_not_is_left_alone(statement: str) -> None:
     assert not changes_graph_path(statement)
+
+
+class _Session(GraphMixin):
+    """Enough of a connection for the two methods that read the reported graph path.
+
+    Built here rather than run against a server because the servers this suite can reach do
+    not all report it: 2.18.6 does, and 2.17 and 2.18.4 do not.
+    """
+
+    def __init__(self, reported: str | None) -> None:
+        self.reported = reported
+
+    @property
+    def info(self) -> SimpleNamespace:  # type: ignore[override]
+        return SimpleNamespace(parameter_status=lambda name: self.reported)
+
+
+class TestReadingTheGraphPathTheServerReports:
+    def test_a_server_that_does_not_report_it_is_read_as_not_reporting(self) -> None:
+        session = _Session(None)
+        session._note_graph_path()
+        assert not session._agens_reports_graph_path
+
+    def test_a_server_reporting_no_graph_at_all_still_reports(self) -> None:
+        """It answers with an empty string at connect, which is an answer and not a silence."""
+        session = _Session("")
+        session._note_graph_path()
+        assert session._agens_reports_graph_path
+        assert session._agens_graph_path_seen == ""
+
+    def test_a_move_is_seen_once_and_not_again(self) -> None:
+        session = _Session("")
+        session._note_graph_path()
+        assert not session._graph_path_moved()
+        session.reported = "other"
+        assert session._graph_path_moved()
+        assert not session._graph_path_moved()
+
+    def test_a_move_back_is_a_move(self) -> None:
+        """Which is what a rollback performs, and what reading the statement cannot see."""
+        session = _Session("first")
+        session._note_graph_path()
+        session.reported = "second"
+        assert session._graph_path_moved()
+        session.reported = "first"
+        assert session._graph_path_moved()
+
+    @pytest.mark.server
+    def test_what_the_driver_read_is_what_the_server_does(self, agens) -> None:  # type: ignore[no-untyped-def]
+        """Reported from 2.18.6, and not before it.
+
+        Read off the connection rather than off the version, because 2.18.4 and 2.18.6 report
+        the same two leading numbers and differ here.
+        """
+        assert agens._agens_reports_graph_path is (
+            agens.info.parameter_status("graph_path") is not None
+        )
 
 
 @pytest.mark.server

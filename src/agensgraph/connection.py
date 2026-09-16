@@ -211,14 +211,20 @@ class Cursor(psycopg.Cursor[Row]):
         """Drop the label table if the statement that just ran moved the session elsewhere.
 
         After the statement rather than before it, because a statement that failed changed
-        nothing. Setting the graph path is undone by rolling back, so a change made inside a
-        transaction is remembered until that transaction ends.
+        nothing.
+
+        Both signals are read where both are available. A reported path catches what the text
+        cannot: a move made inside a function body, one made by a database default the session
+        never named, and the move back a rollback performs. The text catches what the report
+        cannot: inside a pipeline the statement is queued and its answer has not arrived, so
+        the reported value is still the old one.
         """
-        if not changes_graph_path(text):
-            return
         conn = cast("Connection[Row]", self.connection)
+        reported_move = conn._agens_reports_graph_path and conn._graph_path_moved()
+        if not reported_move and (not changes_graph_path(text)):
+            return
         conn.label_table.invalidate()
-        if not conn.autocommit:
+        if not conn.autocommit and (not conn._agens_reports_graph_path):
             conn._agens_graph_path_in_transaction = True
 
 
@@ -263,6 +269,7 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
         """
         conn = super().connect(conninfo, **with_keepalives(kwargs, conninfo))
         conn.add_notice_handler(report_notice)
+        conn._note_graph_path()
         try:
             _ = conn.capabilities
         except BaseException:
@@ -300,7 +307,14 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
         self._accept_labels(graph, self._fetch(self._label_statement(), (graph,)))
 
     def _current_graph(self) -> str | None:
-        """The graph the session is reading, or ``None`` if it is reading none."""
+        """The graph the session is reading, or ``None`` if it is reading none.
+
+        Free where the server reports the path, which is what every describing method here
+        needs before it can name a table -- so on such a server none of them pays a round
+        trip to find out where it is.
+        """
+        if self._agens_reports_graph_path:
+            return self.info.parameter_status("graph_path") or None
         rows = self._fetch(CURRENT_GRAPH_QUERY, ())
         name = rows[0][0] if rows else ""
         return name or None
@@ -314,6 +328,10 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
         """
         self._check_lent()
         super().rollback()
+        if self._agens_reports_graph_path:
+            if self._graph_path_moved():
+                self.label_table.invalidate()
+            return
         if self._agens_graph_path_in_transaction:
             self.label_table.invalidate()
             self._agens_graph_path_in_transaction = False
