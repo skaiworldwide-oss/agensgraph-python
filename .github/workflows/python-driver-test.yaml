@@ -144,14 +144,28 @@ jobs:
         # suite against all of them is what checks the version gates: a test that needs something
         # only the newest has, and does not say so, fails on the older ones instead of passing
         # everywhere by accident.
-        engine: [v2.17, v2.18, main]
+        #
+        # A line, not a branch: the engine names a release branch after the PostgreSQL minor it
+        # carries (v2.17.10, v2.18.6), so the branch for a line moves at every minor merge.
+        engine: ["2.17", "2.18", "main"]
     name: against-a-server (${{ matrix.engine }})
     steps:
       - name: Find the engine's latest commit
         run: |
-          hash=$(git ls-remote https://github.com/skaiworldwide-oss/agensgraph.git \
-                   "refs/heads/${{ matrix.engine }}" | awk '{print $1}')
-          test -n "$hash" || { echo "no branch ${{ matrix.engine }}"; exit 1; }
+          repo=https://github.com/skaiworldwide-oss/agensgraph.git
+          if [ "${{ matrix.engine }}" = main ]; then
+            branch=main
+          else
+            # sort -V and not sort, so v2.18.10 lands above v2.18.6 rather than below it.
+            branch=$(git ls-remote --heads "$repo" "refs/heads/v${{ matrix.engine }}.*" \
+                       | sed 's#.*refs/heads/##' | sort -V | tail -1)
+            test -n "$branch" || {
+              echo "no release branch for AgensGraph ${{ matrix.engine }}"; exit 1; }
+          fi
+          hash=$(git ls-remote "$repo" "refs/heads/$branch" | awk '{print $1}')
+          test -n "$hash" || { echo "no branch $branch"; exit 1; }
+          echo "AgensGraph ${{ matrix.engine }} is branch $branch at $hash"
+          echo "AG_BRANCH=$branch" >> $GITHUB_ENV
           echo "AG_COMMIT_HASH=$hash" >> $GITHUB_ENV
 
       # Resolved rather than pinned, so the build tracks pgvector's releases the way it already
@@ -180,7 +194,7 @@ jobs:
       - name: Build the engine
         if: steps.agcache.outputs.cache-hit != 'true'
         run: |
-          git clone --depth 1 --branch ${{ matrix.engine }} \
+          git clone --depth 1 --branch "$AG_BRANCH" \
             https://github.com/skaiworldwide-oss/agensgraph.git ~/agensgraph_source
           cd ~/agensgraph_source
           ./configure --prefix=$HOME/agensgraph_build
@@ -228,16 +242,18 @@ jobs:
             "SELECT extname || ' ' || extversion FROM pg_extension WHERE extname = 'vector'"
 
       # Every version gate in the suite reads `agversion`, so a build of the wrong branch would
-      # test the wrong thing without saying so -- a cache key that collided, or a branch that
-      # moved. A release branch has to report its own number; `main` may report anything.
+      # test the wrong thing without saying so -- a cache key that collided, or a line resolved to
+      # a branch belonging to another one. A release branch has to report its own line; `main` may
+      # report anything. Only the line is asserted: 2.17 reports `2.17.0` and 2.18 reports
+      # `2.18.6.0` or `2.18.6.0-rcN` depending on where the branch stands against its release.
       - name: Which server this is
         run: |
           reported=$($HOME/agensgraph_build/bin/psql -d agensgraph_test -tAc \
             "SELECT current_setting('agversion')")
-          echo "branch ${{ matrix.engine }} reports agversion $reported"
+          echo "branch $AG_BRANCH reports agversion $reported"
           wanted=${{ matrix.engine }}
-          if [ "$wanted" != main ] && [ "${reported#"${wanted#v}"}" = "$reported" ]; then
-            echo "expected an agversion beginning ${wanted#v}"
+          if [ "$wanted" != main ] && [ "${reported#"$wanted"}" = "$reported" ]; then
+            echo "expected an agversion beginning $wanted"
             exit 1
           fi
 
