@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, Union
 from psycopg.conninfo import conninfo_to_dict as _conninfo_to_dict
 
 from ._protocol.labels import LabelCache
-from .adapters import graph_adapters, register_binary
+from .adapters import graph_adapters, register_binary, register_text
 from .capabilities import Capabilities
 from .cypher import check_bindable_positions, quote_identifier, writable_counters
 from .errors import (
@@ -276,10 +276,15 @@ class GraphMixin:
         return self._agens_labels
 
     def _accept_labels(self, graph: str, rows: Sequence[tuple[int, str]]) -> None:
-        """Take the label table for a graph, and make the composite loaders available."""
+        """Take the label table for a graph, and make the composite loaders available.
+
+        The text loaders for a path and an element array are replaced at the same time with
+        ones that check each label against the table.
+        """
         self.label_table.load(graph, list(rows))
         if not self._agens_binary_ready:
             register_binary(self, self.label_table)  # type: ignore[arg-type]
+            register_text(self, self.label_table)  # type: ignore[arg-type]
             self._agens_binary_ready = True
 
     # -- the graph the session is reading -------------------------------------------------

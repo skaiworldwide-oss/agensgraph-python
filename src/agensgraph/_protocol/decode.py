@@ -9,7 +9,8 @@ agree, and a disagreement is a defect in one of them.
 from __future__ import annotations
 
 import struct
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from typing import Protocol, TypeVar
 
 from ..types import Edge, Path, Vertex
 from . import composite, textfmt
@@ -68,9 +69,32 @@ class _LabelNames(dict[bytes, str]):
 _label_names = _LabelNames()
 
 
-def vertex_from_text(buf: bytes) -> Vertex:
-    """Build a vertex from ``label[labid.locid]{properties}``."""
-    parts = textfmt.parse_vertex(buf)
+class LabelNames(Protocol):
+    """What a connection knows the label ids of the graph it is reading to be called.
+
+    The label table. A table holding nothing is not asked.
+    """
+
+    def get(self, labid: int) -> str | None: ...
+
+    def __len__(self) -> int: ...
+
+
+class _Element(Protocol):
+    """The two fields every rendered element carries, whichever kind it is."""
+
+    @property
+    def label(self) -> bytes: ...
+
+    @property
+    def labid(self) -> int: ...
+
+
+_Parts = TypeVar("_Parts", bound=_Element)
+_Value = TypeVar("_Value")
+
+
+def _vertex(parts: textfmt.VertexParts) -> Vertex:
     return Vertex(
         GraphId(parts.labid, parts.locid),
         _label_names[parts.label],
@@ -78,9 +102,7 @@ def vertex_from_text(buf: bytes) -> Vertex:
     )
 
 
-def edge_from_text(buf: bytes) -> Edge:
-    """Build an edge from ``label[labid.locid][start,end]{properties}``."""
-    p = textfmt.parse_edge(buf)
+def _edge(p: textfmt.EdgeParts) -> Edge:
     return Edge(
         GraphId(p.labid, p.locid),
         _label_names[p.label],
@@ -90,48 +112,155 @@ def edge_from_text(buf: bytes) -> Edge:
     )
 
 
-def path_from_text(buf: bytes) -> Path:
-    """Build a path from ``[vertex,edge,vertex,...]``.
+def vertex_from_text(buf: bytes) -> Vertex:
+    """Build a vertex from ``label[labid.locid]{properties}``."""
+    return _vertex(textfmt.parse_vertex(buf))
 
-    An empty rendering is a legal path of no elements. A null slot is rejected here
-    rather than silently dropped, because a path with a hole in it is not a path.
+
+def edge_from_text(buf: bytes) -> Edge:
+    """Build an edge from ``label[labid.locid][start,end]{properties}``."""
+    return _edge(textfmt.parse_edge(buf))
+
+
+def _accounted(found: Sequence[_Element | None], names: LabelNames) -> bool:
+    """Whether the table holds every label of a reading, under the name the reading gives it."""
+    return all(
+        names.get(item.labid) == _label_names[item.label] for item in found if item is not None
+    )
+
+
+def _prefers(
+    parse: Callable[[bytes], _Parts], names: LabelNames
+) -> Callable[[int, bytes], bool]:
+    """A test for one element: it parses, and the table agrees what its label is called."""
+
+    def prefer(index: int, element: bytes) -> bool:
+        try:
+            parts = parse(element)
+        except ValueError:
+            return False
+        return names.get(parts.labid) == _label_names[parts.label]
+
+    return prefer
+
+
+def _prefers_in_a_path(names: LabelNames) -> Callable[[int, bytes], bool]:
+    """The same, with the kind of each element known from where it sits in the path."""
+    vertex = _prefers(textfmt.parse_vertex, names)
+    edge = _prefers(textfmt.parse_edge, names)
+
+    def prefer(index: int, element: bytes) -> bool:
+        return (vertex if index % 2 == 0 else edge)(index, element)
+
+    return prefer
+
+
+def _parsed(parts: list[bytes], parse: Callable[[bytes], _Parts]) -> list[_Parts | None] | None:
+    """Every element parsed, or ``None`` where one of them is not an element of this kind."""
+    found: list[_Parts | None] = []
+    for part in parts:
+        if part == textfmt.NULL_ELEMENT:
+            found.append(None)
+            continue
+        try:
+            found.append(parse(part))
+        except ValueError:
+            return None
+    return found
+
+
+def _array_from_text(
+    buf: bytes,
+    names: LabelNames | None,
+    parse: Callable[[bytes], _Parts],
+    build: Callable[[_Parts], _Value],
+) -> list[_Value | None]:
+    """An element array, read the way the label table accounts for.
+
+    The shortest reading first. Where the table does not account for it, the list is read
+    again element by element, preferring the labels the table holds.
     """
     parts = textfmt.split_elements(buf)
+    found = _parsed(parts, parse)
+    if names and (found is None or not _accounted(found, names)):
+        other = _parsed(textfmt.split_elements(buf, _prefers(parse, names)), parse)
+        if other is not None and _accounted(other, names):
+            found = other
+    if found is None:
+        # Parsed again, to fail on the element that cannot be read.
+        found = [None if part == textfmt.NULL_ELEMENT else parse(part) for part in parts]
+    return [None if item is None else build(item) for item in found]
+
+
+def _parsed_path(
+    parts: list[bytes],
+) -> tuple[list[textfmt.VertexParts], list[textfmt.EdgeParts]] | None:
+    """The vertices and the edges of a path, or ``None`` where this reading is not one."""
+    if not parts or len(parts) % 2 == 0 or textfmt.NULL_ELEMENT in parts:
+        return None
+    try:
+        return (
+            [textfmt.parse_vertex(part) for part in parts[0::2]],
+            [textfmt.parse_edge(part) for part in parts[1::2]],
+        )
+    except ValueError:
+        return None
+
+
+def _path_of(parts: list[bytes]) -> Path:
+    """A path built from one reading, refusing what a path cannot hold."""
     if not parts:
         return Path((), ())
     if len(parts) % 2 == 0:
         raise ValueError(f"a path must have an odd number of elements, got {len(parts)}")
-    vertices = []
-    edges = []
     for i, part in enumerate(parts):
         if part == textfmt.NULL_ELEMENT:
             raise ValueError(f"null element at position {i} of a path")
-        if i % 2 == 0:
-            vertices.append(vertex_from_text(part))
-        else:
-            edges.append(edge_from_text(part))
-    return Path(tuple(vertices), tuple(edges))
+    return Path(
+        tuple(vertex_from_text(part) for part in parts[0::2]),
+        tuple(edge_from_text(part) for part in parts[1::2]),
+    )
 
 
-def vertices_from_text(buf: bytes) -> list[Vertex | None]:
+def path_from_text(buf: bytes, names: LabelNames | None = None) -> Path:
+    """Build a path from ``[vertex,edge,vertex,...]``.
+
+    An empty rendering is a legal path of no elements. A null slot is rejected here
+    rather than silently dropped, because a path with a hole in it is not a path.
+
+    Read the way an array is, with the kind of each element known from where it sits: a
+    vertex at an even position and an edge at an odd one.
+    """
+    parts = textfmt.split_elements(buf)
+    read = _parsed_path(parts)
+    if names and (
+        read is None or not (_accounted(read[0], names) and _accounted(read[1], names))
+    ):
+        other = _parsed_path(textfmt.split_elements(buf, _prefers_in_a_path(names)))
+        if other is not None and _accounted(other[0], names) and _accounted(other[1], names):
+            read = other
+    if read is None:
+        return _path_of(parts)
+    return Path(tuple(_vertex(v) for v in read[0]), tuple(_edge(e) for e in read[1]))
+
+
+def vertices_from_text(buf: bytes, names: LabelNames | None = None) -> list[Vertex | None]:
     """Build a vertex array from ``[vertex,vertex,...]``.
 
     An array carries one kind of element and its type says which, so nothing here has to
     work that out from an element's shape. Unlike a path, an array may hold nulls, which
     are returned as ``None``.
+
+    *names* is the label table the connection filled. Where a label holds an element
+    rendering of its own the same bytes read as two elements or as four, and the table says
+    which labels exist. Without one the shortest reading is taken.
     """
-    return [
-        None if part == textfmt.NULL_ELEMENT else vertex_from_text(part)
-        for part in textfmt.split_elements(buf)
-    ]
+    return _array_from_text(buf, names, textfmt.parse_vertex, _vertex)
 
 
-def edges_from_text(buf: bytes) -> list[Edge | None]:
-    """Build an edge array from ``[edge,edge,...]``."""
-    return [
-        None if part == textfmt.NULL_ELEMENT else edge_from_text(part)
-        for part in textfmt.split_elements(buf)
-    ]
+def edges_from_text(buf: bytes, names: LabelNames | None = None) -> list[Edge | None]:
+    """Build an edge array from ``[edge,edge,...]``, read as :func:`vertices_from_text` is."""
+    return _array_from_text(buf, names, textfmt.parse_edge, _edge)
 
 
 # A vertex is always (graphid, jsonb, tid) and an edge always (graphid, graphid, graphid,

@@ -182,6 +182,114 @@ def test_the_map_is_not_decoded_until_it_is_read():
         numbers._decode = real
 
 
+# Two vertices of a label whose own name holds a vertex rendering and a comma. Measured from the
+# left this is four vertices of labels `x` and `y`, and nothing in the bytes says otherwise. A
+# label table is a dict here: `get` and `len` are all a reading asks of one.
+AMBIGUOUS_LIST = b"[x[3.1]{},y[9.1]{},x[3.1]{},y[9.1]{}]"
+AMBIGUOUS_PATH = b"[x[3.1]{},y[7.2]{},e[8.1][7.2,7.3]{},x[3.1]{},y[7.3]{}]"
+AMBIGUOUS_EDGES = b"[k[2.1][1.1,1.2]{},f[4.1][3.1,3.2]{},k[2.1][1.1,1.2]{},f[4.1][3.1,3.2]{}]"
+
+
+class TestALabelHoldingAnElementRendering:
+    def test_the_shortest_reading_stands_without_a_table(self):
+        assert [v.label for v in decode.vertices_from_text(AMBIGUOUS_LIST)] == [
+            "x",
+            "y",
+            "x",
+            "y",
+        ]
+
+    def test_the_table_settles_which_reading_it_is(self):
+        names = {9: "x[3.1]{},y", 3: "other"}
+        assert [v.label for v in decode.vertices_from_text(AMBIGUOUS_LIST, names)] == [
+            "x[3.1]{},y",
+            "x[3.1]{},y",
+        ]
+
+    def test_a_table_holding_nothing_is_not_asked(self):
+        """Which is the state after the session moves to another graph, and asking a table that
+        knows no labels would make every list read as one the labels are missing from."""
+        assert len(decode.vertices_from_text(AMBIGUOUS_LIST, {})) == 4
+
+    def test_a_table_without_the_label_leaves_the_shortest_reading(self):
+        """A label created after the table was filled. Nothing here can do better than the bytes."""
+        assert len(decode.vertices_from_text(AMBIGUOUS_LIST, {4: "other"})) == 4
+
+    def test_an_ordinary_list_is_read_the_same_either_way(self):
+        buf = b"[p[3.1]{},p[3.2]{}]"
+        plain = decode.vertices_from_text(buf)
+        assert [v.label for v in plain] == ["p", "p"]
+        assert decode.vertices_from_text(buf, {3: "p"}) == plain
+
+    def test_a_null_slot_survives_the_reading(self):
+        found = decode.vertices_from_text(b"[x[3.1]{},y[9.1]{},NULL]", {9: "x[3.1]{},y"})
+        assert [None if v is None else v.label for v in found] == ["x[3.1]{},y", None]
+
+    def test_edges_read_the_same_way(self):
+        assert len(decode.edges_from_text(AMBIGUOUS_EDGES)) == 4
+        names = {4: "k[2.1][1.1,1.2]{},f"}
+        assert [e.label for e in decode.edges_from_text(AMBIGUOUS_EDGES, names)] == [
+            "k[2.1][1.1,1.2]{},f"
+        ] * 2
+
+    def test_a_path_is_read_by_the_table_too(self):
+        names = {7: "x[3.1]{},y", 8: "e"}
+        path = decode.path_from_text(AMBIGUOUS_PATH, names)
+        assert [element.label for element in path.elements] == ["x[3.1]{},y", "e", "x[3.1]{},y"]
+        assert path.edges[0].start == path.vertices[0].id
+        assert path.edges[0].end == path.vertices[1].id
+
+    def test_a_path_without_a_table_is_refused_rather_than_misread(self):
+        """The reading the bytes give puts an edge where a vertex belongs, and says so."""
+        with pytest.raises(ValueError, match="not a vertex"):
+            decode.path_from_text(AMBIGUOUS_PATH)
+
+    def test_a_malformed_path_is_not_read_as_one_vertex(self):
+        """Even with a table: the one-element reading names a label the table does not hold."""
+        with pytest.raises(ValueError, match="odd number"):
+            decode.path_from_text(b"[v[5.1]{},v[5.5]{}]", {5: "person"})
+
+
+class TestPreferringOneElementOverAnother:
+    def test_the_element_the_test_takes_is_the_one_read(self):
+        buf = b"[a[3.1]{},b[3.2]{}]"
+        assert textfmt.split_elements(buf) == [b"a[3.1]{}", b"b[3.2]{}"]
+        assert textfmt.split_elements(buf, lambda index, element: b"," in element) == [
+            b"a[3.1]{},b[3.2]{}"
+        ]
+
+    def test_the_shortest_is_read_where_it_takes_none(self):
+        buf = b"[a[3.1]{},b[3.2]{}]"
+        assert textfmt.split_elements(buf, lambda index, element: False) == (
+            textfmt.split_elements(buf)
+        )
+
+    def test_the_test_is_told_where_the_element_sits(self):
+        buf = b"[a[3.1]{},b[3.2]{},c[3.3]{}]"
+        seen = []
+
+        def prefer(index, element):
+            seen.append((index, element))
+            return b"," not in element
+
+        assert len(textfmt.split_elements(buf, prefer)) == 3
+        assert [index for index, _ in seen] == [0, 1, 2]
+
+    def test_an_ordinary_list_costs_one_test_an_element(self):
+        """Every element of such a list also reads as the head of a longer one, so a reading
+        that had to try them all would be quadratic. The first element taken ends the search."""
+        asked = 0
+
+        def prefer(index, element):
+            nonlocal asked
+            asked += 1
+            return b"," not in element
+
+        buf = b"[" + b",".join(b"a[3.%d]{}" % i for i in range(1, 501)) + b"]"
+        assert len(textfmt.split_elements(buf, prefer)) == 500
+        assert asked == 500
+
+
 class TestTheLabelNameTable:
     """Label names are decoded once per distinct name rather than once per element."""
 

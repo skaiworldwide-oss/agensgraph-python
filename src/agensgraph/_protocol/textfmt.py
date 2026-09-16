@@ -21,14 +21,23 @@ end of the list.
 A map ends at the first ``}`` that is followed by a comma or the end of the buffer and
 that leaves a complete JSON object behind it. The check is ``msgspec`` against ``Raw``,
 which validates without building, so a map nobody reads is never decoded.
+
+A label may itself hold a whole element rendering followed by a comma, as ``v[1.1]{},w``.
+Two vertices of that label are written ``[v[1.1]{},w[7.1]{},v[1.1]{},w[7.1]{}]``, which
+also reads as four vertices of labels ``v`` and ``w``. A caller that knows what the labels
+are called hands :func:`split_elements` a test for one element, and each element is read
+as the first one that test takes.
 """
 
 from __future__ import annotations
 
 import re
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 import msgspec
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterator
 
 __all__ = [
     "NULL_ELEMENT",
@@ -174,22 +183,35 @@ def parse_edge(buf: bytes) -> EdgeParts:
 _ENDPOINTS = re.compile(rb"\[(\d+)\.(\d+),(\d+)\.(\d+)\]")
 
 
-def split_elements(buf: bytes) -> list[bytes]:
+def split_elements(
+    buf: bytes, prefer: Callable[[int, bytes], bool] | None = None
+) -> list[bytes]:
     """Split a path or element array into its elements.
 
     ``[]`` yields an empty list. A null slot is returned as the literal ``NULL``, for
     the caller to map onto ``None``; it is not an error, because the server emits it.
+
+    *prefer* judges one element, given how many elements come before it and the bytes of
+    this one. Where more than one element can be read at a position, the first one *prefer*
+    takes is the one read. Without it, and where it takes none, the shortest is read.
     """
     if not (buf.startswith(b"[") and buf.endswith(b"]")):
         raise ValueError(f"not an element list: {buf[:80]!r}")
     inner = buf[1:-1]
     if not inner:
         return []
+    if prefer is None:
+        return _split_exact(inner)
+    try:
+        return _split_exact(inner, prefer)
+    except ValueError:
+        # A preference that leaves the rest of the list unreadable is dropped.
+        return _split_exact(inner)
 
-    return _split_exact(inner)
 
-
-def _split_exact(inner: bytes) -> list[bytes]:
+def _split_exact(
+    inner: bytes, prefer: Callable[[int, bytes], bool] | None = None
+) -> list[bytes]:
     """Cut by measuring each element in turn.
 
     An element has a rigid interior: an id group written as ``[digits.digits]``, for an
@@ -201,7 +223,7 @@ def _split_exact(inner: bytes) -> list[bytes]:
     pos = 0
     end = len(inner)
     while True:
-        stop = _scan_element(inner, pos)
+        stop = _element_end(inner, pos, len(parts), prefer)
         if stop < 0:
             raise ValueError(f"cannot read an element at offset {pos}")
         parts.append(inner[pos:stop])
@@ -214,24 +236,44 @@ def _split_exact(inner: bytes) -> list[bytes]:
             raise ValueError("element list ends with a comma")
 
 
-def _scan_element(buf: bytes, pos: int) -> int:
-    """Measure one element starting at *pos*, returning the offset just past its end.
+def _element_end(
+    buf: bytes, pos: int, index: int, prefer: Callable[[int, bytes], bool] | None
+) -> int:
+    """Where the element starting at *pos* ends, or -1 when none can be read there.
 
-    Returns -1 when no element can be read there.
+    The shortest element, unless *prefer* takes a longer one.
+    """
+    shortest = -1
+    for stop in _element_ends(buf, pos):
+        if prefer is None:
+            return stop
+        if shortest < 0:
+            shortest = stop
+        if prefer(index, buf[pos:stop]):
+            return stop
+    return shortest
+
+
+def _element_ends(buf: bytes, pos: int) -> Iterator[int]:
+    """Every offset at which an element starting at *pos* could end, shortest first.
+
+    An element has a rigid interior: a label, an id group written as ``[digits.digits]``, for
+    an edge a second bracketed group of two ids, then a JSON object closing where a comma or the
+    end of the list follows. Each id group after *pos* is tried as the element's own. More than
+    one fits only when the label itself holds an element rendering.
     """
     if buf.startswith(NULL_ELEMENT, pos):
         after = pos + len(NULL_ELEMENT)
         if after == len(buf) or buf[after] == 0x2C:
-            return after
-
+            yield after
     search = pos
     while True:
         m = _ELEM_ID.search(buf, search)
         if m is None:
-            return -1
+            return
+        search = m.start() + 1
         if m.start() == pos:
             # An element always has a label before its id group.
-            search = m.start() + 1
             continue
         rest = m.end()
         ends = _ENDPOINTS.match(buf, rest)
@@ -240,8 +282,7 @@ def _scan_element(buf: bytes, pos: int) -> int:
         if rest < len(buf) and buf[rest] == 0x7B:  # {
             stop = _map_end(buf, rest)
             if stop > 0:
-                return stop
-        search = m.start() + 1
+                yield stop
 
 
 def _map_end(buf: bytes, start: int) -> int:

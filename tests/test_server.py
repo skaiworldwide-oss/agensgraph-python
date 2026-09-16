@@ -264,6 +264,101 @@ class TestValuesTheServerRarelyProduces:
         assert v.properties == {"a": "][1.1,2.2]"}
 
 
+@pytest.mark.server
+class TestALabelHoldingAnElementRendering:
+    """A label whose own name holds an element rendering and a comma is the one list the text
+    rendering cannot measure on its own: the same bytes read as two elements or as four. The
+    label table the connection fills settles it, and the composite rendering, which carries no
+    label text at all, never had the question.
+    """
+
+    VERTEX_LABEL = "v[1.1]{},w"
+    EDGE_LABEL = "k[2.1][1.1,1.2]{},f"
+
+    @pytest.fixture
+    def awkward(self, agens):  # type: ignore[no-untyped-def]
+        agens.execute(f'create vlabel "{self.VERTEX_LABEL}"')
+        agens.execute(f'create elabel "{self.EDGE_LABEL}"')
+        agens.refresh_labels()
+        agens.execute(
+            f'create (:"{self.VERTEX_LABEL}" {{n: 1}})'
+            f'-[:"{self.EDGE_LABEL}" {{m: 1}}]->'
+            f'(:"{self.VERTEX_LABEL}" {{n: 2}})'
+        )
+        return agens
+
+    def needs_element_lists(self, conn) -> None:  # type: ignore[no-untyped-def]
+        """Skip where a list cannot hold a graph element.
+
+        Tried rather than read off the version: before 2.18 made them native, ``[n, n]`` is
+        refused with ``graph object cannot be list element`` and ``collect(n)`` gives back
+        jsonb. A path is a type of its own and is unaffected either way.
+        """
+        try:
+            (pair,) = conn.execute_query(
+                f'match (n:"{self.VERTEX_LABEL}") return [n, n] limit 1'
+            ).records[0]
+        except agensgraph.errors.Error:
+            pytest.skip("this server cannot put a graph element in a list")
+        if not all(isinstance(value, Vertex) for value in pair):
+            pytest.skip("this server gives back a list of graph elements as jsonb")
+
+    @pytest.mark.parametrize("binary", [False, True], ids=["text", "composite"])
+    def test_a_list_of_vertices_reads_as_the_ones_that_were_written(
+        self, awkward, binary
+    ) -> None:  # type: ignore[no-untyped-def]
+        self.needs_element_lists(awkward)
+        (pair,) = awkward.execute_query(
+            f'match (n:"{self.VERTEX_LABEL}") return [n, n] limit 1', binary_=binary
+        ).records[0]
+        assert [v.label for v in pair] == [self.VERTEX_LABEL] * 2
+        assert pair[0].id == pair[1].id
+        (collected,) = awkward.execute_query(
+            f'match (n:"{self.VERTEX_LABEL}") return collect(n)', binary_=binary
+        ).records[0]
+        assert [v.label for v in collected] == [self.VERTEX_LABEL] * 2
+        assert len({v.id for v in collected}) == 2, "the two written, not one read twice"
+
+    @pytest.mark.parametrize("binary", [False, True], ids=["text", "composite"])
+    def test_a_list_of_edges_does_too(self, awkward, binary) -> None:  # type: ignore[no-untyped-def]
+        self.needs_element_lists(awkward)
+        (edges,) = awkward.execute_query(
+            f'match ()-[r:"{self.EDGE_LABEL}"]->() return collect(r)', binary_=binary
+        ).records[0]
+        assert [edge.label for edge in edges] == [self.EDGE_LABEL]
+        assert edges[0].properties == {"m": 1}
+
+    @pytest.mark.parametrize("binary", [False, True], ids=["text", "composite"])
+    def test_a_path_holds_its_three_elements(self, awkward, binary) -> None:  # type: ignore[no-untyped-def]
+        (path,) = awkward.execute_query("match p = ()-[]->() return p", binary_=binary).records[
+            0
+        ]
+        assert [element.label for element in path.elements] == [
+            self.VERTEX_LABEL,
+            self.EDGE_LABEL,
+            self.VERTEX_LABEL,
+        ]
+        assert path.edges[0].start == path.vertices[0].id
+        assert path.edges[0].end == path.vertices[1].id
+
+    def test_the_two_renderings_agree_on_all_of_it(self, awkward) -> None:  # type: ignore[no-untyped-def]
+        """The differential check, on the one shape where the two routes could disagree."""
+        self.needs_element_lists(awkward)
+        for query in (
+            f'match (n:"{self.VERTEX_LABEL}") return [n, n], collect(n)',
+            "match p = ()-[]->() return p",
+            f'match ()-[r:"{self.EDGE_LABEL}"]->() return [r], collect(r)',
+            f'match (n:"{self.VERTEX_LABEL}") return collect(n)',
+        ):
+            from_text = awkward.execute_query(query).records
+            from_binary = awkward.execute_query(query, binary_=True).records
+            for rows in (from_text, from_binary):
+                for row in rows:
+                    for value in row:
+                        touch(value)
+            assert same(from_text, from_binary), query
+
+
 class TestRefusalsTheServerReportsBadly:
     def test_plain_sql_writing_to_a_label_table(self, graph: Connection[object]) -> None:
         """Reported as an internal fault, with the message as the only thing naming it."""

@@ -378,13 +378,50 @@ class GraphIdBinaryDumper(Dumper):
         return pack(obj)
 
 
-def register_text(context: AdaptContext | AdaptersMap) -> None:
+def _text_list_loaders(
+    labels: LabelCache | None,
+) -> tuple[type[Loader], type[Loader], type[Loader]]:
+    """The loaders for a path and the two element arrays, reading labels against *labels*.
+
+    Built per call, since each closes over the table of one connection.
+    """
+    if labels is None:
+        return PathLoader, VertexArrayLoader, EdgeArrayLoader
+
+    class _PathLoader(Loader):
+        format = pq.Format.TEXT
+
+        def load(self, data: Buffer) -> object:
+            return decode.path_from_text(_decode_bytes(data), labels)
+
+    class _VertexArrayLoader(Loader):
+        format = pq.Format.TEXT
+
+        def load(self, data: Buffer) -> object:
+            return decode.vertices_from_text(_decode_bytes(data), labels)
+
+    class _EdgeArrayLoader(Loader):
+        format = pq.Format.TEXT
+
+        def load(self, data: Buffer) -> object:
+            return decode.edges_from_text(_decode_bytes(data), labels)
+
+    return _PathLoader, _VertexArrayLoader, _EdgeArrayLoader
+
+
+def register_text(
+    context: AdaptContext | AdaptersMap, labels: LabelCache | None = None
+) -> None:
     """Read the graph types in the text rendering, and write a graph id.
 
     This is everything a connection needs to read an ordinary query, and it needs nothing
     from the server to do it.
+
+    Given *labels*, a path or an element array is read against the table; see
+    :func:`agensgraph._protocol.decode.vertices_from_text`.
     """
     adapters = context if isinstance(context, AdaptersMap) else context.adapters
+    path_loader, vertex_array_loader, edge_array_loader = _text_list_loaders(labels)
     # The types are named first, and the loaders registered over the top of them.
     #
     # Naming them is what lets binary copying be told what a column is: it applies no
@@ -399,9 +436,9 @@ def register_text(context: AdaptContext | AdaptersMap) -> None:
     adapters.register_loader(OIDS["graphid"], GraphIdBinaryLoader)
     adapters.register_loader(OIDS["vertex"], VertexLoader)
     adapters.register_loader(OIDS["edge"], EdgeLoader)
-    adapters.register_loader(OIDS["graphpath"], PathLoader)
-    adapters.register_loader(OIDS["_vertex"], VertexArrayLoader)
-    adapters.register_loader(OIDS["_edge"], EdgeArrayLoader)
+    adapters.register_loader(OIDS["graphpath"], path_loader)
+    adapters.register_loader(OIDS["_vertex"], vertex_array_loader)
+    adapters.register_loader(OIDS["_edge"], edge_array_loader)
     adapters.register_loader(_JSONB_OID, JsonbLoader)
     adapters.register_loader(_JSONB_OID, JsonbBinaryLoader)
     adapters.register_dumper(GraphId, GraphIdDumper)
