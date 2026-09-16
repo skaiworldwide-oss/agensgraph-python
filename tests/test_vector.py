@@ -990,11 +990,17 @@ class TestBinaryQuantisation:
         ).records[0]
         assert value == "1010"
 
-    def test_but_the_bit_cast_is_not_something_cypher_can_spell(self, vectors) -> None:  # type: ignore[no-untyped-def]
-        """So the hamming and jaccard operators need plain SQL against the label's table."""
-        vectors.execute("create (:loose {v: [1,2,3,4]})")
-        with pytest.raises(agensgraph.errors.Error):
-            vectors.execute("match (n:loose) return binary_quantize(n.v::vector(4))::bit(4)")
+    def test_and_cypher_spells_the_bit_cast_where_the_server_has_it(self, vectors) -> None:  # type: ignore[no-untyped-def]
+        """From 2.18. Where it is refused, hamming and jaccard go through plain SQL instead,
+        which is what the next test does. Tried rather than read off the version, because the
+        cast is not one of the features the version gates."""
+        vectors.execute("create (:loose {v: [1,-2,3,-4]})")
+        statement = "match (n:loose) return binary_quantize(n.v::vector(4))::bit(4)"
+        try:
+            (value,) = vectors.execute_query(statement).records[0]
+        except agensgraph.errors.Error:
+            pytest.skip("this server cannot spell the bit cast in Cypher")
+        assert value == "1010"
 
     def test_and_it_works_in_sql_on_the_same_data(self, vectors) -> None:  # type: ignore[no-untyped-def]
         graph = vectors.label_table.graph

@@ -131,8 +131,10 @@ class TestReadingTheAnswersBack:
     def test_a_failure_names_the_statement_that_caused_it(self, loaded) -> None:  # type: ignore[no-untyped-def]
         """Which the batch helper cannot do, because it may not run a write a second time."""
         good = "match (n:person) where n.k = 1 return n.name"
+        # Malformed rather than merely wrong, so no later release can make it run.
+        bad = "match (n:person) return n.name +"
         with pytest.raises(agensgraph.errors.Error) as caught:
-            loaded.pipeline_query([good, "match (n:person) return n.nope::int", good])
+            loaded.pipeline_query([good, bad, good])
         assert not isinstance(caught.value, agensgraph.errors.BatchFailed)
         assert caught.value.sqlstate == "42601"
 
