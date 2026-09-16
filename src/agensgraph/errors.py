@@ -14,7 +14,7 @@ loop that already understands PostgreSQL's codes already understands a graph wri
 
 Three failures do not fit that, and each is named in :func:`translate`: two settings whose
 refusal arrives as an internal error carrying nothing but a message, and a read-only
-transaction refusing a graph write under a message with a literal ``???`` in it.
+transaction refusing a graph write under the command's tag rather than a description of it.
 
 Every class here takes the message as its only argument, with the rest of its fields
 class-level defaults assigned on the instance. Unpickling an exception calls the class
@@ -26,6 +26,7 @@ through, so fields assigned this way survive the round trip.
 from __future__ import annotations
 
 import enum
+import re
 from typing import TYPE_CHECKING
 
 import psycopg_pool as _pool
@@ -504,15 +505,20 @@ _CONFIGURATION_GATES: tuple[tuple[str, str, str], ...] = (
 )
 
 
+# The command tag in `cannot execute <tag> in a read-only transaction`. Up to 2.17 a graph write
+# had no tag and printed as `???`; from 2.18 it is `CYPHER`. Only the tag is matched, because the
+# sentence around it is translated when lc_messages is and the tag is not.
+_GRAPH_WRITE_REFUSED = re.compile(r"\?\?\?|\bCYPHER\b")
+
+
 def translate(exc: BaseException) -> _pg.Error | None:
     """A better exception for the failures the server describes badly, or ``None``.
 
     Three of them. Two settings refuse work through a path that attaches no SQLSTATE, so
     they arrive as an internal error and read as a driver or server fault when they are
     neither -- those become a :class:`ConfigurationError` naming the setting. And a graph
-    write in a read-only transaction is classified correctly but described as ``cannot
-    execute ??? in a read-only transaction``, because the server has no name for the
-    command; that message cannot be shown to anyone, so it is replaced.
+    write in a read-only transaction is classified correctly but named by a command tag
+    rather than by what it did, which is replaced with a sentence that says it.
 
     The replacement is always a subclass of what psycopg would have raised, so an
     ``except`` clause written against psycopg keeps matching.
@@ -530,11 +536,8 @@ def translate(exc: BaseException) -> _pg.Error | None:
                 return replacement
         return None
 
-    if state == "25006" and "???" in message:
-        return ReadOnlyGraphWrite(
-            "cannot write to a graph in a read-only transaction "
-            "(the server has no name for the command and reports it as '???')"
-        )
+    if state == "25006" and _GRAPH_WRITE_REFUSED.search(message) is not None:
+        return ReadOnlyGraphWrite("cannot write to a graph in a read-only transaction")
 
     return None
 

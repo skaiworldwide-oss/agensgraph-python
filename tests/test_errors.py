@@ -180,6 +180,11 @@ class TestRecoveryProperties:
         assert not R.SAFE.wants_longer_delay
 
 
+# The tag the server puts in a read-only refusal for a graph write. `???` up to 2.17, where the
+# command had no name, and `CYPHER` from 2.18. Servers on both are supported, so both classify.
+REFUSAL_TAGS = ["???", "CYPHER"]
+
+
 class TestTranslate:
     """The three failures the server reports in terms a caller cannot act on."""
 
@@ -203,16 +208,21 @@ class TestTranslate:
         exc.args = ("unrecognized node type: 703",)
         assert E.translate(exc) is None
 
-    def test_a_read_only_refusal_loses_the_question_marks(self) -> None:
+    @pytest.mark.parametrize("tag", REFUSAL_TAGS)
+    def test_a_read_only_refusal_is_said_in_terms_of_the_graph(self, tag: str) -> None:
         exc = error_for("25006")
-        exc.args = ("cannot execute ??? in a read-only transaction",)
+        exc.args = (f"cannot execute {tag} in a read-only transaction",)
         replacement = E.translate(exc)
         assert isinstance(replacement, E.ReadOnlyGraphWrite)
         assert "graph" in str(replacement)
+        assert tag not in str(replacement)
 
-    def test_the_replacement_still_matches_what_psycopg_would_have_raised(self) -> None:
+    @pytest.mark.parametrize("tag", REFUSAL_TAGS)
+    def test_the_replacement_still_matches_what_psycopg_would_have_raised(
+        self, tag: str
+    ) -> None:
         exc = error_for("25006")
-        exc.args = ("cannot execute ??? in a read-only transaction",)
+        exc.args = (f"cannot execute {tag} in a read-only transaction",)
         replacement = E.translate(exc)
         assert isinstance(replacement, pg.ReadOnlySqlTransaction)
 

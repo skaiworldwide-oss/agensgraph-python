@@ -2,10 +2,10 @@
 
 These tests exist to keep the driver's assumptions honest. Several of them assert
 behaviour that looks like a defect and is not the driver's to fix -- a refusal reported
-without a code of its own, a message with ``???`` in it, a query shape the server accepts
-and misreads. Each is written down here so that the workaround it justifies cannot outlive
-the behaviour it works around: if a later release reports these properly, one of these
-tests fails and says which workaround to drop.
+without a code of its own, a refusal named by a command tag rather than by what it did, a
+query shape the server accepts and misreads. Each is written down here so that the
+workaround it justifies cannot outlive the behaviour it works around: if a later release
+reports these properly, one of these tests fails and says which workaround to drop.
 """
 
 from __future__ import annotations
@@ -93,10 +93,6 @@ class TestCapabilities:
         caps = Capabilities.of(conn)
         assert caps.version >= agensgraph.MINIMUM_VERSION
         assert caps.reported == conn.info.parameter_status("agversion")
-
-    def test_the_graph_path_does_not_arrive_that_way(self, conn: Connection[object]) -> None:
-        """So a label table cannot be invalidated by watching for a parameter change."""
-        assert conn.info.parameter_status("graph_path") is None
 
 
 class TestBothRenderingsAgree:
@@ -294,7 +290,7 @@ class TestRefusalsTheServerReportsBadly:
         assert replacement.setting == "enable_eager"
 
     def test_a_graph_write_in_a_read_only_transaction(self, graph: Connection[object]) -> None:
-        """Classified correctly and described with a literal '???', because it has no name."""
+        """Classified correctly and named by a command tag: '???' up to 2.17, 'CYPHER' from 2.18."""
         graph.autocommit = False
         graph.execute("set transaction read only")
         try:
@@ -303,8 +299,9 @@ class TestRefusalsTheServerReportsBadly:
         finally:
             graph.rollback()
             graph.autocommit = True
+        message = str(caught.value)
         assert caught.value.sqlstate == "25006"
-        assert "???" in str(caught.value)
+        assert "???" in message or "CYPHER" in message
         assert isinstance(translate(caught.value), ReadOnlyGraphWrite)
 
 

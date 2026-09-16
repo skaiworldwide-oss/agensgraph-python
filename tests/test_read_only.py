@@ -84,10 +84,11 @@ class TestTheServerRefusesTheWrite:
         assert row[0].properties == {"a": 1}
 
     def test_the_refusal_says_what_happened(self, agens) -> None:  # type: ignore[no-untyped-def]
-        """The server has no name for a graph write and reports it as '???'.
+        """The server names the command that was refused, not what it was trying to do.
 
-        Which is unreadable, so the driver replaces it -- and that replacement is the one part of
-        this only a driver can supply.
+        A tag either way -- '???' up to 2.17, where a graph write had no name, and 'CYPHER' from
+        2.18 -- so the driver says it in terms of the graph, which is the one part of this only a
+        driver can supply.
         """
         agens.execute("create vlabel thing")
         agens.autocommit = False
