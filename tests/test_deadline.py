@@ -192,6 +192,23 @@ class TestABudgetOnAConnectionNobodyPooled:
         assert after == "0"
 
     @pytest.mark.asyncio
+    async def test_a_failure_inside_a_transaction_is_the_one_reported(self, dsn: str) -> None:
+        """Putting the limit back in a failed transaction would fail too, and that failure would
+        replace the one that matters, turning a retryable error into a fatal one. The rollback
+        puts the limit back instead."""
+        conn = await agensgraph.AsyncConnection.connect(dsn)
+        async with conn:
+            with pytest.raises(psycopg.Error) as caught:
+                async with conn.deadline(5.0):
+                    await conn.execute("select 1/0")
+            assert caught.value.sqlstate == "22012"
+            await conn.rollback()
+            cursor = await conn.execute("show statement_timeout")
+            (after,) = await cursor.fetchone()
+            await conn.rollback()
+        assert after == "0"
+
+    @pytest.mark.asyncio
     async def test_it_is_put_back_by_name_and_not_by_number(self, dsn: str) -> None:
         """A connection carrying its own limit returns to that one, not to none."""
         conn = await agensgraph.AsyncConnection.connect(

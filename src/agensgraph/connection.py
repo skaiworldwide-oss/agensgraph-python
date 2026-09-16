@@ -454,7 +454,8 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
         try:
             yield held
         finally:
-            self.execute("set statement_timeout = default")
+            if not self.closed and self.pgconn.transaction_status != TransactionStatus.INERROR:
+                self.execute("set statement_timeout = default")
             self._agens_statement_timeout = False
 
     @contextmanager

@@ -489,7 +489,10 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
         try:
             yield held
         finally:
-            await self.execute("set statement_timeout = default")
+            # Not in a failed transaction, where the statement would fail too and replace the
+            # error the caller has to see. The rollback owed puts the setting back.
+            if not self.closed and self.pgconn.transaction_status != TransactionStatus.INERROR:
+                await self.execute("set statement_timeout = default")
             self._agens_statement_timeout = False
 
     @asynccontextmanager
