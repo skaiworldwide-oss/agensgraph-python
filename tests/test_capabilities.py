@@ -19,22 +19,43 @@ GATED = [
 ]
 
 
+# Read off each release's own configure.ac, not imagined here.
+SHIPPED = [
+    ("2.16", (2, 16)),
+    ("2.17.0", (2, 17)),
+    ("2.18.4.0", (2, 18)),
+    ("2.18.6.0-rc1", (2, 18)),
+    ("2.18-devel", (2, 18)),
+]
+
+
+@pytest.mark.parametrize(("reported", "expected"), SHIPPED)
+def test_every_version_a_release_has_reported_is_read(
+    reported: str, expected: tuple[int, int]
+) -> None:
+    """Three numbers before 2.18 and four from it, and servers on both are in the field."""
+    assert parse_version(reported) == expected
+
+
+# Shapes no release has worn, kept apart from SHIPPED so that list stays a record of fact.
 @pytest.mark.parametrize(
     ("reported", "expected"),
     [
-        ("2.16", (2, 16)),
         ("2.17", (2, 17)),
         ("2.18", (2, 18)),
-        ("2.18-devel", (2, 18)),
         ("2.18.1", (2, 18)),
+        ("2.18.6.0", (2, 18)),
+        ("2.18.6.0-rc2", (2, 18)),
+        ("2.18.6.1-rc10", (2, 18)),
         ("2.19-beta2", (2, 19)),
+        ("2.19.0.0", (2, 19)),
         ("3.0", (3, 0)),
         ("  2.18-devel  ", (2, 18)),
         ("10.4", (10, 4)),
     ],
 )
 def test_a_reported_version_is_read_leniently(reported: str, expected: tuple[int, int]) -> None:
-    """A development build appends a suffix and a release does not, so both must be read."""
+    """Whatever follows the two leading numbers is the build, and none of it is read."""
     assert parse_version(reported) == expected
 
 
@@ -45,7 +66,7 @@ def test_something_that_is_not_a_version_is_refused(reported: str) -> None:
         parse_version(reported)
 
 
-@pytest.mark.parametrize("reported", ["2.16", "2.15", "2.0", "1.9", "2.16-devel"])
+@pytest.mark.parametrize("reported", ["2.16", "2.15.0", "2.15", "2.0", "1.9", "2.16-devel"])
 def test_a_server_below_the_minimum_is_refused_at_once(reported: str) -> None:
     """Rather than at whichever later query first wants a catalog it does not have."""
     with pytest.raises(CapabilityError, match=r"2\.17"):
@@ -57,7 +78,7 @@ def test_the_minimum_is_itself_accepted() -> None:
     assert Capabilities(reported).version == MINIMUM_VERSION
 
 
-@pytest.mark.parametrize("reported", ["2.17", "2.17.3"])
+@pytest.mark.parametrize("reported", ["2.17", "2.17.0", "2.17.3"])
 @pytest.mark.parametrize("feature", GATED)
 def test_the_older_servers_carry_none_of_the_gated_features(
     reported: str, feature: str
@@ -66,7 +87,9 @@ def test_the_older_servers_carry_none_of_the_gated_features(
     assert getattr(caps, feature)() is False
 
 
-@pytest.mark.parametrize("reported", ["2.18", "2.18-devel", "2.19", "3.0"])
+@pytest.mark.parametrize(
+    "reported", ["2.18", "2.18-devel", "2.18.4.0", "2.18.6.0", "2.18.6.0-rc1", "2.19", "3.0"]
+)
 @pytest.mark.parametrize("feature", GATED)
 def test_the_newer_servers_carry_all_of_them(reported: str, feature: str) -> None:
     caps = Capabilities(reported)
@@ -86,12 +109,13 @@ def test_a_checked_question_says_what_is_missing_and_what_would_carry_it(feature
     assert "2.17" in str(caught.value)
 
 
-def test_the_version_reported_is_kept_exactly_as_given() -> None:
-    """A development suffix is part of what a person needs to see in a refusal."""
-    caps = Capabilities("2.18-devel")
-    assert caps.reported == "2.18-devel"
+@pytest.mark.parametrize("reported", ["2.18-devel", "2.18.6.0", "2.18.6.0-rc1", "2.18.6.0-rc2"])
+def test_the_version_reported_is_kept_exactly_as_given(reported: str) -> None:
+    """Which build it was is part of what a person needs to see in a refusal."""
+    caps = Capabilities(reported)
+    assert caps.reported == reported
     assert caps.version == (2, 18)
-    assert "2.18-devel" in repr(caps)
+    assert reported in repr(caps)
 
 
 def test_capabilities_carry_no_dictionary() -> None:
