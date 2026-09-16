@@ -27,13 +27,19 @@ from agensgraph.cypher import quote_identifier
 from agensgraph.introspect import (
     Check,
     Constraint,
+    DeclaredProperty,
     DesiredIndex,
+    DesiredLabel,
     Index,
     IndexElement,
+    Label,
+    PromotedProperty,
     Unique,
+    add_property_statement,
     constraint_name,
     create_constraint_statement,
     create_index_statement,
+    create_label_statement,
     index_elements,
     index_is_partial,
     index_method,
@@ -41,6 +47,7 @@ from agensgraph.introspect import (
     parse_index_element,
     reconcile_constraints,
     reconcile_indexes,
+    reconcile_labels,
 )
 
 
@@ -184,19 +191,43 @@ class TestDiffingIndexes:
     @pytest.mark.parametrize(
         "definition",
         [
-            # A vector index over a property still in the map, as the catalog prints it.
-            "CREATE PROPERTY INDEX doc_v ON doc USING hnsw "
-            "(((v)::vector(4)) vector_cosine_ops)",
+            # A full-text index over a function of a property, as the catalog prints it.
+            "CREATE PROPERTY INDEX doc_v ON doc USING gin ((to_tsvector('simple', v)))",
             # One made as plain SQL over the jsonb arrow operator, likewise an expression.
             "CREATE PROPERTY INDEX doc_v ON doc USING btree ((properties ->> 'v'))",
         ],
     )
     def test_an_index_over_an_expression_survives_drop_extra(self, definition: str) -> None:
         """Nothing a desired index can say describes these, so they are neither matched nor
-        dropped -- otherwise reconciling a list of property names would take out a vector index."""
+        dropped -- otherwise reconciling a list of property names would take out such an index."""
         existing = Index("doc", "doc_v", False, definition)
         assert index_elements(definition) is None
         assert reconcile_indexes([], [existing], drop_extra=True) == []
+
+    def test_a_vector_index_over_a_cast_is_describable_and_so_matched(self) -> None:
+        """The cast the server prints in two pairs of parentheses is read back as the element's
+        cast, so a vector index over a property in the map reconciles like any other."""
+        definition = (
+            "CREATE PROPERTY INDEX doc_v ON doc USING hnsw (((v)::vector(4)) vector_cosine_ops)"
+        )
+        existing = Index("doc", "doc_v", False, definition)
+        assert index_elements(definition) == (
+            IndexElement("v", "vector_cosine_ops", False, False, "vector(4)"),
+        )
+        wanted = [
+            DesiredIndex(
+                "doc",
+                (IndexElement("v", "vector_cosine_ops", cast="vector(4)"),),
+                method="hnsw",
+            )
+        ]
+        assert reconcile_indexes(wanted, [existing], drop_extra=True) == []
+        assert reconcile_indexes(wanted, []) == [
+            "create property index on doc using hnsw ((v::vector(4)) vector_cosine_ops)"
+        ]
+        assert reconcile_indexes([], [existing], drop_extra=True) == [
+            "drop property index doc_v"
+        ]
 
     def test_a_vector_index_over_a_column_is_describable_and_so_is_dropped(self) -> None:
         """It keys a plain property with an operator class, which a desired index can say, so
@@ -233,6 +264,20 @@ class TestDiffingConstraints:
     def test_a_long_derived_name_is_truncated_as_the_server_would(self) -> None:
         name = constraint_name(Unique("d" * 40, "p" * 40))
         assert len(name) == 63
+
+    def test_and_two_long_names_alike_at_the_front_stay_two(self) -> None:
+        """Cut to fit alone they are one name, and the reconciler matches by name, so the second
+        label would read as already constrained and silently get no constraint."""
+        name = constraint_name(Unique("d" * 40, "p" * 40))
+        other = constraint_name(Unique("d" * 40, "p" * 39 + "q"))
+        assert name != other
+        assert len(other) == 63
+        assert name.startswith("d" * 40 + "_p")
+        assert name == constraint_name(Unique("d" * 40, "p" * 40)), "the same name every time"
+
+    def test_a_long_given_name_is_cut_and_nothing_else(self) -> None:
+        """A name somebody chose is theirs; only a derived one carries a digest."""
+        assert constraint_name(Unique("doc", "sku", name="n" * 70)) == "n" * 63
 
     def test_nothing_there_means_make_it(self) -> None:
         statements = reconcile_constraints([Unique("doc", "sku")], [])
@@ -459,6 +504,39 @@ class TestReadingHowAnIndexKeysItsProperties:
         assert parse_index_element(printed) == expected
 
     @pytest.mark.parametrize(
+        ("printed", "expected"),
+        [
+            (
+                "((v)::vector(4)) vector_cosine_ops",
+                IndexElement("v", "vector_cosine_ops", False, False, "vector(4)"),
+            ),
+            ("((v)::vector(4))", IndexElement("v", None, False, False, "vector(4)")),
+            (
+                "((e)::halfvec(1024)) halfvec_l2_ops DESC",
+                IndexElement("e", "halfvec_l2_ops", True, True, "halfvec(1024)"),
+            ),
+            # Parenthesised and not cast at all, which the server also prints.
+            ("((v))", IndexElement("v", None, False, False)),
+        ],
+    )
+    def test_an_element_keyed_on_a_cast(self, printed: str, expected: IndexElement) -> None:
+        """The shape a vector kept in the property map takes. The server writes the cast in two
+        pairs of parentheses, and it has to come back as the cast that was asked for."""
+        assert parse_index_element(printed) == expected
+
+    @pytest.mark.parametrize(
+        "printed",
+        [
+            "((a + b)::int)",
+            "((v)::)",
+            '((v)::vector(4)) COLLATE "C"',
+            "((v)::vector(4)) a b",
+        ],
+    )
+    def test_something_that_is_not_a_property_and_a_cast(self, printed: str) -> None:
+        assert parse_index_element(printed) is None
+
+    @pytest.mark.parametrize(
         "printed", ["", "((a) + (b))", "a.b.c", 'a COLLATE "C"', "a b c d"]
     )
     def test_something_that_is_not_a_plain_element(self, printed: str) -> None:
@@ -661,8 +739,118 @@ class TestDeclaringLabels:
             reconcile_labels([DesiredLabel("KNOWS", "v")], [Label(4, "KNOWS", "e", None)])
 
 
+class TestDeclaringPromotedColumns:
+    def test_the_columns_are_written_before_the_parent(self) -> None:
+        statement = create_label_statement(
+            "emb",
+            "v",
+            "base",
+            [PromotedProperty("v", "vector(4)"), PromotedProperty("n", "int")],
+        )
+        assert statement == (
+            "create vlabel if not exists emb (v vector(4) generated, n int generated) "
+            "inherits (base)"
+        )
+
+    def test_a_column_is_added_to_a_label_that_exists(self) -> None:
+        assert add_property_statement("doc", "v", PromotedProperty("Emb", "vector(4)")) == (
+            'alter vlabel doc add column "Emb" vector(4) generated'
+        )
+
+    def test_a_type_is_required(self) -> None:
+        with pytest.raises(ValueError, match="needs a type"):
+            PromotedProperty("v", " ").rendered()
+
+    def test_a_missing_column_is_added_and_a_present_one_left_alone(self) -> None:
+        want = [
+            DesiredLabel(
+                "emb",
+                properties=[PromotedProperty("v", "vector(4)"), PromotedProperty("w", "int")],
+            )
+        ]
+        have = [Label(3, "emb", "v", "ag_vertex")]
+        declared = [DeclaredProperty("emb", "v", "vector(4)", True)]
+        assert reconcile_labels(want, have, declared) == [
+            "alter vlabel emb add column w int generated"
+        ]
+
+    def test_an_inherited_column_counts_as_present(self) -> None:
+        """Adding it again would collide with the parent's, so it is left to the parent."""
+        want = [DesiredLabel("child", parent="emb", properties=[PromotedProperty("v", "int")])]
+        have = [Label(4, "child", "v", "emb")]
+        declared = [DeclaredProperty("child", "v", "integer", True, inherited=True)]
+        assert reconcile_labels(want, have, declared) == []
+
+    def test_a_new_label_carries_its_columns(self) -> None:
+        want = [DesiredLabel("emb", "e", properties=[PromotedProperty("w", "float8")])]
+        assert reconcile_labels(want, []) == [
+            "create elabel if not exists emb (w float8 generated)"
+        ]
+
+    def test_the_rendered_column_is_what_the_vector_module_writes(self) -> None:
+        from agensgraph.vector import generated_column
+
+        assert PromotedProperty("v", "vector(1024)").rendered() == generated_column("v", 1024)
+
+
 @pytest.mark.server
 class TestDeclaringLabelsAgainstTheServer:
+    def test_a_promoted_column_converges_across_inheritance(self, agens) -> None:  # type: ignore[no-untyped-def]
+        """Declared on the parent, the child has the column by inheritance and gets no ALTER;
+        a column added to the parent later reaches the child the same way."""
+        if not agens.can_promote_properties():
+            pytest.skip("this server cannot store a property in a column of its own")
+        want = [
+            DesiredLabel("base", properties=[PromotedProperty("age", "int")]),
+            DesiredLabel("kid", parent="base"),
+        ]
+        assert agens.ensure_labels(want) == [
+            "create vlabel if not exists base (age int generated)",
+            "create vlabel if not exists kid inherits (base)",
+        ]
+        again = [
+            DesiredLabel(
+                "base",
+                properties=[
+                    PromotedProperty("age", "int"),
+                    PromotedProperty("score", "float8"),
+                ],
+            ),
+            DesiredLabel("kid", parent="base", properties=[PromotedProperty("age", "int")]),
+        ]
+        assert agens.ensure_labels(again) == [
+            "alter vlabel base add column score float8 generated"
+        ]
+        assert agens.ensure_labels(again) == [], "the third run found work to do"
+        kid = {(d.name, d.type, d.inherited) for d in agens.declared_properties("kid")}
+        assert kid == {("age", "integer", True), ("score", "double precision", True)}
+        base = agens.declared_properties("base")
+        assert {d.name for d in base} == {"age", "score"}
+        assert not any(d.inherited for d in base)
+        agens.execute("create (:kid {age: 7, score: 1.5})")
+        (age,) = agens.execute_query("match (n:kid) return n.age").records[0]
+        assert age == 7
+
+    def test_an_index_casting_a_promoted_column_is_refused(self, agens) -> None:  # type: ignore[no-untyped-def]
+        """A search reads the column uncast, so an index over the cast would never be used."""
+        if not agens.can_promote_properties():
+            pytest.skip("this server cannot store a property in a column of its own")
+        agens.ensure_labels([DesiredLabel("emb", properties=[PromotedProperty("n", "int")])])
+        with pytest.raises(ValueError, match="columns of their own"):
+            agens.ensure_indexes([DesiredIndex("emb", [IndexElement("n", cast="integer")])])
+        # The same cast over a property still in the map is what the refusal is not about.
+        # Written rather than run, since which type names Cypher spells moved between releases.
+        assert agens.ensure_indexes(
+            [DesiredIndex("emb", [IndexElement("m", cast="integer")], name="emb_m")],
+            dry_run=True,
+        ) == ["create property index emb_m on emb ((m::integer))"]
+
+    def test_a_promoted_column_is_refused_where_the_server_cannot_promote(self, agens) -> None:  # type: ignore[no-untyped-def]
+        if agens.can_promote_properties():
+            pytest.skip("this server can store a property in a column of its own")
+        with pytest.raises(agensgraph.errors.CapabilityError, match=r"2\.18"):
+            agens.ensure_labels([DesiredLabel("x", properties=[PromotedProperty("n", "int")])])
+
     def test_it_converges_and_creates_both_kinds(self, agens) -> None:  # type: ignore[no-untyped-def]
         from agensgraph import DesiredLabel
 

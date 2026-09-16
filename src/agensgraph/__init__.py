@@ -39,6 +39,7 @@ from .introspect import GraphDescription as GraphDescription
 from .introspect import Index as Index
 from .introspect import IndexElement as IndexElement
 from .introspect import Label as LabelInfo
+from .introspect import PromotedProperty as PromotedProperty
 from .introspect import PropertyShape as PropertyShape
 from .introspect import Triple as Triple
 from .introspect import Unique as Unique
@@ -72,6 +73,7 @@ from .types import Vertex as Vertex
 from .vector import Distance as Distance
 from .vector import SparseVector as SparseVector
 from .vector import Vector as Vector
+from .vector import VectorIndex as VectorIndex
 
 __all__ = [
     "LABID_MAX",
@@ -107,6 +109,7 @@ __all__ = [
     "Notify",
     "NullConnectionPool",
     "Path",
+    "PromotedProperty",
     "PropertyShape",
     "QueryRecord",
     "Result",
@@ -118,6 +121,7 @@ __all__ = [
     "Unique",
     "Unspecified",
     "Vector",
+    "VectorIndex",
     "Vertex",
     "add_query_logger",
     "columnar",

@@ -360,6 +360,14 @@ Both renderings produce the same objects, and the suite asserts that against val
 produced, comparing them strictly rather than with `==`, which would pass on disagreement and fail on
 agreement in five separate ways.
 
+One shape of label the text rendering of a list cannot measure on its own: a name holding an element
+rendering followed by a comma, such as `v[1.1]{},w`. Two vertices of that label are written
+`[v[1.1]{},w[7.1]{},v[1.1]{},w[7.1]{}]`, which also reads as four. A path settles it by itself, since
+each edge has to join the two vertices beside it. A list of vertices or edges is settled by the label
+table: once `conn.graph()` or `refresh_labels()` has filled it, a reading is taken only if every label
+goes with its id, so such a list reads correctly on a connection with a table and falls back to the
+shortest reading without one. The composite rendering carries no label text and has no such shape.
+
 ## What a write changed
 
 ```python
@@ -605,6 +613,11 @@ The keys are looked up by name rather than read out of the label, so the cost fo
 not the graph. Both spellings of each key are asked for, because a key stored as the number `1` and
 one given as `"1"` are the same key here, and a lookup by property alone would treat them as two.
 
+**Write an element's properties in one `SET`.** A statement that sets the same element in more
+than one pass, as `MERGE (c {id: row.id}) SET c.text = row.text WITH c, row SET c += row.props`
+does, can be refused with `55000: attempted to delete invisible tuple` on a real corpus. One
+`SET c += row.props` writes one tuple version instead of three, and is not refused.
+
 ### Give an ingest key a column of its own
 
 **If a label is written to more than once, declare its key as a promoted column.** This matters more
@@ -666,7 +679,7 @@ in order, and the server's own error as its cause. Re run them one at a time to 
 ```python
 conn.graphs()                    # [Graph(name, schema, labels)]
 conn.labels()                    # [Label(id, name, kind, parent)]
-conn.declared_properties()       # [DeclaredProperty(label, name, type, nullable)]
+conn.declared_properties()       # [DeclaredProperty(label, name, type, nullable, inherited)]
 conn.indexes()                   # [Index(label, name, unique, definition)]
 conn.constraints()               # [Constraint(label, name, unique, definition)]
 conn.element_counts()            # {'Person': 2, 'KNOWS': 1}
@@ -751,6 +764,26 @@ conn.ensure_constraints([
 ])
 ```
 
+A label can declare the properties it keeps in columns of their own, which is the storage an
+embedding wants (see [Embedding vectors](#embedding-vectors)):
+
+```python
+from agensgraph import PromotedProperty
+
+conn.ensure_labels([
+    DesiredLabel("doc", properties=[PromotedProperty("embedding", "vector(1536)")]),
+    DesiredLabel("note", parent="doc"),
+])
+# create vlabel if not exists doc (embedding vector(1536) generated)
+# create vlabel if not exists note inherits (doc)
+```
+
+On a label already there the column is added with `ALTER VLABEL ... ADD COLUMN`; one the label has,
+declared on it or inherited from its parent, is left as it is, whatever its type. `note` above has
+`embedding` by inheritance, and `declared_properties("note")` reports it with `inherited=True`, so
+asking for the column on the child too changes nothing. A server that cannot promote a property
+refuses the declaration at once.
+
 **An edge's endpoints cannot be keyed through `DesiredIndex`, and asking is refused.** `start` and
 `end` are columns of the edge's own table, while a property index keys on the *property* of the name
 it is given. So a unique index naming them is built over `properties.'start'` and
@@ -798,9 +831,12 @@ together and agree.
 The matching is deliberately conservative, because of how the server stores these. A name is derived
 from the columns, truncated, then given a counter on collision, so names are not the key. A
 definition is printed with defaults omitted. A predicate is stored normalised, so `age > 0` comes
-back as something that does not look like what you wrote. Three consequences: name an operator class
-only when it differs from the default, expect a partial index to be compared on its normalised
-predicate, and let anything the reconciler cannot match confidently alone rather than dropping it.
+back as something that does not look like what you wrote. A type is stored by identity and printed
+under the server's own name for it, so a cast written `int` comes back `integer`. Four consequences:
+name an operator class only when it differs from the default, spell a cast the way the server prints
+it, expect a partial index to be compared on its normalised predicate, and let anything the
+reconciler cannot match confidently alone rather than dropping it. Where a desired index does not
+match what comes back, `ensure_indexes` says so after running rather than quietly making it twice.
 
 ## Embedding vectors
 
@@ -906,6 +942,35 @@ things: `L2` (`<->`), `INNER_PRODUCT` (`<#>`, negated so that smaller is nearer 
 others), `COSINE` (`<=>`), `L1` (`<+>`), and for bit strings `HAMMING` (`<~>`) and `JACCARD` (`<%>`).
 `hnsw` and `ivfflat` are both available, and `vector_index` takes `options=` for things like
 `WITH (lists=10)`.
+
+A vector index reconciles like any other, so a schema can declare it once and let `ensure_indexes`
+work out the difference. A property in the map is keyed through the cast, a promoted column
+uncast:
+
+```python
+from agensgraph import DesiredIndex, IndexElement
+
+conn.ensure_indexes([
+    DesiredIndex("doc", [IndexElement("embedding", "vector_cosine_ops", cast="vector(1024)")],
+                 method="hnsw"),
+    DesiredIndex("emb", [IndexElement("v", "vector_l2_ops")], method="hnsw"),
+])
+```
+
+Casting a property that has a column of its own is refused there: the search reads the column
+uncast, so an index over the cast is never used, and nothing in the plan says so. Measured on
+20,000 rows, the cast index left a filtered search at 568 ms against 1.8 ms on the column itself.
+`vector_index()` builds the same statements without a connection and cannot check, so leave
+`dimensions` out for a promoted column.
+
+`conn.vector_indexes()` reads the vector indexes back in parts, each a `VectorIndex` with the
+label, name, property, method, operator class, type, width and the options it was made with; the
+width of an index over a promoted column comes from the column's declared type.
+
+A `Vector` goes over the wire as its numbers. A plain Python list is sent as JSON and, cast with
+`::vector(4)` inside a Cypher statement, is accepted too; in plain SQL the same cast is refused,
+`cannot cast type jsonb to vector`. `Vector` is the better route either way: 1,536 numbers travel
+as 6 KB instead of 31 KB of decimal text.
 
 Writing the search by hand is fine too, and on an unpromoted property the cast is required rather
 than optional, since `jsonb <-> vector` is not an operator:
@@ -1561,7 +1626,7 @@ Everything exported from `agensgraph`. The submodules `agensgraph.columnar`, `ag
 | `Label` | a label or property name to be placed into a statement as an identifier |
 | `Unspecified` | a string sent with no type, which is psycopg's own default behaviour |
 | `Distance` | `L2`, `INNER_PRODUCT`, `COSINE`, `L1`, `HAMMING`, `JACCARD` |
-| `DesiredIndex`, `Unique`, `Check`, `DesiredLabel` | what you want to exist, for the reconcilers |
+| `DesiredIndex`, `Unique`, `Check`, `DesiredLabel`, `PromotedProperty` | what you want to exist, for the reconcilers |
 
 **What a statement gives back**
 
@@ -1577,9 +1642,10 @@ Everything exported from `agensgraph`. The submodules `agensgraph.columnar`, `ag
 |---|---|
 | `Graph` | `name`, `schema`, `labels` |
 | `LabelInfo` | `id`, `name`, `kind`, `parent` |
-| `DeclaredProperty` | `label`, `name`, `type`, `nullable` |
+| `DeclaredProperty` | `label`, `name`, `type`, `nullable`, `inherited` |
 | `Index`, `Constraint` | `label`, `name`, `unique`, `definition` |
-| `IndexElement` | one property an index is keyed on, with its operator class and order |
+| `IndexElement` | one property an index is keyed on, with its operator class, order and cast |
+| `VectorIndex`, `connection.vector_indexes()` | a vector index in parts: property, method, operator class, type, width, options |
 
 **Reliability**
 
@@ -1640,7 +1706,7 @@ Everything exported from `agensgraph`. The submodules `agensgraph.columnar`, `ag
 | | |
 |---|---|
 | `columnar` | `to_arrow`, `to_pandas`, `to_polars`, `batches`, `reader`, `columns`, `Layout`; `async_to_arrow`, `async_to_pandas`, `async_to_polars`, `async_batches` for a source that is awaited |
-| `vector` | `Vector`, `SparseVector`, `vector_index`, `nearest`, `generated_column`, `Distance`, `SEARCH_OPTIONS` |
+| `vector` | `Vector`, `SparseVector`, `VectorIndex`, `vector_index`, `describe_vector_index`, `nearest`, `generated_column`, `Distance`, `SEARCH_OPTIONS` |
 | `dbapi` | the PEP 249 surface |
 | `errors` | the exception hierarchy and the classification function |
 

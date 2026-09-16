@@ -71,7 +71,7 @@ from .cypher import (
     wrap_for_cursor,
 )
 from .deadline import Deadline
-from .errors import BatchFailed, ConfigurationError, NoEnclosingTransaction
+from .errors import BatchFailed, CapabilityError, ConfigurationError, NoEnclosingTransaction
 from .introspect import (
     CONSTRAINTS_FOR_LABEL,
     CONSTRAINTS_QUERY,
@@ -119,7 +119,7 @@ from .summary import (
     GraphWriteCounts,
     read_outcome,
 )
-from .vector import search_option_statements
+from .vector import VectorIndex, describe_vector_index, search_option_statements
 
 if TYPE_CHECKING:
     from collections.abc import Generator, Iterable, Iterator, Mapping, Sequence
@@ -1201,6 +1201,21 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
         params = (name,) if label is None else (name, label)
         return [Index(*row) for row in self._fetch(query, params)]
 
+    def vector_indexes(
+        self, label: str | None = None, *, graph: str | None = None
+    ) -> list[VectorIndex]:
+        """Every vector index in its parts: property, method, operator class, type, width and
+        the options it was made with.
+
+        The width of an index over a property in the map is the cast's. The width of one over a
+        promoted column is the column's, read from :meth:`declared_properties`.
+        """
+        name = self._graph_of(graph)
+        found = self.indexes(label, graph=name)
+        types = {(d.label, d.name): d.type for d in self.declared_properties(graph=name)}
+        described = (describe_vector_index(index, types) for index in found)
+        return [index for index in described if index is not None]
+
     def constraints(
         self, label: str | None = None, *, graph: str | None = None
     ) -> list[Constraint]:
@@ -1411,8 +1426,24 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
         The state is read again afterwards and anything still outstanding is raised. Naming an
         operator class that is already the default does this, since the server omits a default when
         printing a definition.
+
+        An element cast to a type is refused on a property that has a column of its own. A
+        search reads that column uncast, and never uses such an index.
         """
         name = self._graph_of(graph)
+        cast = {
+            (want.label, element.property)
+            for want in desired
+            for element in want.elements
+            if element.cast is not None
+        }
+        if cast:
+            declared = {(d.label, d.name) for d in self.declared_properties(graph=name)}
+            promoted = sorted(cast & declared)
+            if promoted:
+                raise ValueError(
+                    f"{promoted} have columns of their own, and an index over a cast of the property is never used by a search on the column. Leave the cast out."
+                )
         statements = reconcile_indexes(
             desired,
             for_labels(self.indexes(graph=name), desired, drop_extra),
@@ -1445,9 +1476,22 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
         makes one, which puts DDL inside the write's transaction -- and two writers arriving
         together report ``42P07`` from each other's label. The label table is reloaded afterwards,
         since what it holds is exactly what these statements changed.
+
+        A label declaring :class:`~agensgraph.PromotedProperty` columns is refused where the
+        server cannot promote one. On a label already there the columns it lacks are added;
+        one it has, its own or inherited, is left as it is.
         """
         name = self._graph_of(graph)
-        statements = reconcile_labels(desired, self.labels(graph=name))
+        declared: list[DeclaredProperty] = []
+        if any(want.properties for want in desired):
+            if not self.can_promote_properties():
+                raise CapabilityError.for_feature(
+                    "a property with a column of its own",
+                    required="2.18",
+                    found=self.capabilities.reported,
+                )
+            declared = self.declared_properties(graph=name)
+        statements = reconcile_labels(desired, self.labels(graph=name), declared)
         if dry_run:
             return statements
         for statement in statements:

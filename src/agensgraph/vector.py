@@ -38,11 +38,12 @@ instead. The operator class serves the operator being searched with: ``vector_co
 from __future__ import annotations
 
 import enum
+import re
 import struct
 import sys
 from array import array
 from collections.abc import Mapping, Sequence
-from typing import TYPE_CHECKING, overload
+from typing import TYPE_CHECKING, NamedTuple, overload
 
 import msgspec
 from psycopg.adapt import Dumper, Loader
@@ -54,14 +55,18 @@ if TYPE_CHECKING:
     from psycopg.abc import AdaptContext, Buffer
     from psycopg.types import TypeInfo
 
+    from .introspect import Index
+
 __all__ = [
     "SEARCH_OPTIONS",
     "TYPES",
     "Distance",
     "SparseVector",
     "Vector",
+    "VectorIndex",
     "accept",
     "dense_dumper",
+    "describe_vector_index",
     "generated_column",
     "nearest",
     "parse_vector_text",
@@ -867,3 +872,78 @@ def dense_dumper(oid: int) -> type[Dumper]:
 
     _DenseVectorBinaryDumper.oid = oid
     return _DenseVectorBinaryDumper
+
+
+class VectorIndex(NamedTuple):
+    """A vector index in its parts, read off the definition the server printed.
+
+    ``type`` and ``dimensions`` come from the cast for a property kept in the map, and from the
+    column's declared type for one with a column of its own; ``None`` where neither says.
+    """
+
+    label: str
+    name: str
+    property: str
+    method: str
+    """``hnsw`` or ``ivfflat``, which is what makes an index one of these."""
+    operator_class: str | None
+    """``None`` where it is the default for the type and method, which the server omits."""
+    type: str | None
+    dimensions: int | None
+    options: dict[str, str]
+    """What the index was made ``WITH``, as ``{"m": "8"}``; empty for the defaults."""
+
+
+_VECTOR_METHODS = frozenset({"hnsw", "ivfflat"})
+_TYPE_WIDTH = re.compile(r"(vector|halfvec|sparsevec)(?:\((\d+)\))?")
+_WITH_OPTIONS = re.compile(r"\bWITH \(([^)]*)\)")
+
+
+def _type_and_width(spelling: str | None) -> tuple[str | None, int | None]:
+    if spelling is None:
+        return None, None
+    found = _TYPE_WIDTH.fullmatch(spelling.strip().lower())
+    if found is None:
+        return None, None
+    return found.group(1), int(found.group(2)) if found.group(2) else None
+
+
+def describe_vector_index(
+    index: Index, column_types: Mapping[tuple[str, str], str] | None = None
+) -> VectorIndex | None:
+    """Read a vector index into its parts, or ``None`` for an index that is not one.
+
+    *column_types* maps ``(label, property)`` to a declared column type, which gives the width
+    of an index over a promoted column. :meth:`Connection.vector_indexes` fills it from
+    :meth:`Connection.declared_properties`.
+    """
+    from .introspect import index_elements, index_method
+
+    method = index_method(index.definition)
+    if method not in _VECTOR_METHODS:
+        return None
+    elements = index_elements(index.definition)
+    if elements is None or len(elements) != 1:
+        return None
+    element = elements[0]
+    spelling = element.cast
+    if spelling is None and column_types is not None:
+        spelling = column_types.get((index.label, element.property))
+    type_, width = _type_and_width(spelling)
+    options: dict[str, str] = {}
+    found = _WITH_OPTIONS.search(index.definition)
+    if found is not None:
+        for item in found.group(1).split(","):
+            key, sep, value = item.partition("=")
+            if sep:
+                options[key.strip()] = value.strip().strip("'")
+    return VectorIndex(
+        index.label,
+        index.name,
+        element.property,
+        method,
+        element.operator_class,
+        type_,
+        width,
+        options,
+    )

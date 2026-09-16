@@ -19,6 +19,8 @@ those reports an invalid constraint type rather than returning nothing. Both are
 
 from __future__ import annotations
 
+import hashlib
+import re
 from typing import TYPE_CHECKING, NamedTuple, TypeVar
 
 from .cypher import quote_identifier
@@ -59,9 +61,11 @@ __all__ = [
     "Index",
     "IndexElement",
     "Label",
+    "PromotedProperty",
     "PropertyShape",
     "Triple",
     "Unique",
+    "add_property_statement",
     "constraint_name",
     "create_constraint_statement",
     "create_index_statement",
@@ -119,20 +123,46 @@ order by l.labid
 # Only a property with a column of its own is listed, because only that is declared anywhere.
 # A property living in the JSON map is not declared at all, so nothing can be read about it.
 #
+# Read off the label's relation rather than off ag_label_property, which records a declaration
+# where it was made: a label inheriting a promoted parent has the column and no row of its own.
+# A promoted column is the one generated column a label carries. The property name comes from
+# the declaring ancestor, found by walking up the inheritance.
+#
 # The label is cast in both places it appears. Left uncast, a null in a comparison against
 # nothing else typed gives the server nothing to infer from, and it says so rather than
 # guessing -- which is the same refusal a bare parameter gets as an argument to concat.
 _DECLARED_PROPERTIES = """
+with recursive lineage as (
+  select l.relid as leaf, l.relid as rel, 0 as depth
+  from pg_catalog.ag_label l
+  join pg_catalog.ag_graph g on g.oid = l.graphid
+  where g.graphname = %s{label}
+  union all
+  select x.leaf, i.inhparent, x.depth + 1
+  from lineage x
+  join pg_catalog.pg_inherits i on i.inhrelid = x.rel
+)
 select l.labname::text,
-       p.propname::text,
+       coalesce(p.propname, a.attname)::text,
        format_type(a.atttypid, a.atttypmod),
-       not a.attnotnull
-from pg_catalog.ag_label_property p
-join pg_catalog.ag_label l on l.oid = p.laboid
-join pg_catalog.ag_graph g on g.oid = l.graphid
-join pg_catalog.pg_attribute a on a.attrelid = l.relid and a.attnum = p.attnum
-where g.graphname = %s{label}
-order by l.labname, p.propname
+       not a.attnotnull,
+       a.attinhcount > 0
+from lineage base
+join pg_catalog.ag_label l on l.relid = base.leaf
+join pg_catalog.pg_attribute a
+  on a.attrelid = l.relid and a.attnum > 0 and not a.attisdropped and a.attgenerated <> ''
+left join lateral (
+  select pp.propname
+  from lineage x
+  join pg_catalog.pg_attribute pa on pa.attrelid = x.rel and pa.attname = a.attname
+  join pg_catalog.ag_label al on al.relid = x.rel
+  join pg_catalog.ag_label_property pp on pp.laboid = al.oid and pp.attnum = pa.attnum
+  where x.leaf = base.leaf
+  order by x.depth
+  limit 1
+) p on true
+where base.depth = 0
+order by l.labname, 2
 """
 
 PROMOTION_CATALOG_QUERY = """
@@ -308,13 +338,15 @@ class DeclaredProperty(NamedTuple):
 
     Only a promoted property appears. Before 2.18 nothing can be promoted, so this is always
     empty there -- which is not the same as a label having no properties, and does not read
-    like it.
+    like it. A label inheriting a promoted parent lists the column too, marked inherited.
     """
 
     label: str
     name: str
     type: str
     nullable: bool
+    inherited: bool = False
+    """Whether the column comes from a parent label rather than a declaration on this one."""
 
 
 class Index(NamedTuple):
@@ -342,6 +374,10 @@ class IndexElement(NamedTuple):
     The server omits every default when it prints a definition: ``ASC`` never appears, ``NULLS
     LAST`` only with ``DESC``, ``NULLS FIRST`` only without it, and an operator class only when it
     is not the default for the type. Name an operator class only when it differs from the default.
+
+    ``cast`` keys the index on the property cast to a type, which is how a vector kept in the
+    property map is indexed: ``IndexElement("embedding", "vector_cosine_ops", cast="vector(1024)")``
+    with ``method="hnsw"``. A property with a column of its own is keyed uncast.
     """
 
     property: str
@@ -349,6 +385,12 @@ class IndexElement(NamedTuple):
     descending: bool = False
     nulls_first: bool | None = None
     """``None`` for whichever way round the sort order implies: last ascending, first descending."""
+    cast: str | None = None
+    """A type the property is cast to in the index, as ``vector(1024)``, or ``None`` for none.
+
+    Spelled the way the server prints it: a type is printed under the server's own name, so
+    ``int`` comes back ``integer``.
+    """
 
     def nulls_come_first(self) -> bool:
         """Where nulls go, with the default resolved."""
@@ -360,7 +402,11 @@ class IndexElement(NamedTuple):
 
     def rendered(self) -> str:
         """How this element is written into a statement."""
-        parts = [quote_identifier(self.property)]
+        parts = [
+            f"({quote_identifier(self.property)}::{self.cast})"
+            if self.cast is not None
+            else quote_identifier(self.property)
+        ]
         if self.operator_class is not None:
             parts.append(quote_identifier(self.operator_class))
         if self.descending:
@@ -370,6 +416,25 @@ class IndexElement(NamedTuple):
         return " ".join(parts)
 
 
+class PromotedProperty(NamedTuple):
+    """A property to keep in a column of its own, of the type given.
+
+    Written as ``name type generated``, the one form a label takes: a write still puts the
+    property in the map, and the server fills the column from it, refusing a value the type does
+    not take. The column and the property share the name. ``type`` is written as given, as
+    ``vector(1536)`` or ``int``.
+    """
+
+    name: str
+    type: str
+
+    def rendered(self) -> str:
+        """How this column is written into a statement."""
+        if not self.type.strip():
+            raise ValueError(f"a promoted property needs a type, got none for {self.name!r}")
+        return f"{quote_identifier(self.name)} {self.type.strip()} generated"
+
+
 class DesiredLabel(NamedTuple):
     """A label somebody wants to exist, so that writing to it does not have to make it.
 
@@ -377,6 +442,10 @@ class DesiredLabel(NamedTuple):
     transaction the write is in. Two writers doing it at once is a race the server reports as
     ``42P07``, from the label the other one created underneath this one. Declaring the labels a
     server writes to at startup takes the DDL out of the writes.
+
+    ``properties`` are the ones to keep in columns of their own. On a label that exists they are
+    added with ``ALTER``; one the label already has, declared on it or inherited, is left as it
+    is, whatever its type.
     """
 
     name: str
@@ -384,6 +453,8 @@ class DesiredLabel(NamedTuple):
     """``'v'`` for a vertex label, ``'e'`` for an edge label."""
     parent: str | None = None
     """The label this one inherits, for a graph that groups its labels that way."""
+    properties: Sequence[PromotedProperty] = ()
+    """Properties to give a column of their own; see :class:`PromotedProperty`."""
 
 
 class DesiredIndex(NamedTuple):
@@ -596,10 +667,40 @@ def parse_index_element(token: str) -> IndexElement | None:
         words = words[:-1]
     if len(words) != 1:
         return None
-    name = _bare_property(words[0])
+    name, cast = _cast_element(words[0])
     if name is None:
         return None
-    return IndexElement(name, operator_class, descending, nulls_first).resolved()
+    return IndexElement(name, operator_class, descending, nulls_first, cast).resolved()
+
+
+_TYPE_SPELLING = re.compile(r'[A-Za-z_"][\w\s"().,\[\]]*')
+
+
+def _cast_element(token: str) -> tuple[str | None, str | None]:
+    """A property and the type it is cast to, or a bare property and ``None``.
+
+    The server prints a cast element in two pairs of parentheses, ``((v)::vector(4))``, and an
+    expression that is only a property in one. Anything else is not a property read plainly.
+    """
+    name = _bare_property(token)
+    if name is not None:
+        return name, None
+    inner = token.strip()
+    if not (inner.startswith("(") and inner.endswith(")")):
+        return None, None
+    head, sep, cast = inner[1:-1].strip().partition("::")
+    head = head.strip()
+    if head.startswith("(") and head.endswith(")"):
+        head = head[1:-1]
+    name = _bare_property(head)
+    if name is None:
+        return None, None
+    if not sep:
+        return name, None
+    cast = cast.strip()
+    if not cast or _TYPE_SPELLING.fullmatch(cast) is None:
+        return None, None
+    return name, cast
 
 
 def index_elements(definition: str) -> tuple[IndexElement, ...] | None:
@@ -624,12 +725,20 @@ def index_properties(definition: str) -> tuple[str, ...] | None:
 
 
 def constraint_name(desired: Unique | Check) -> str:
-    """The name a constraint is given, and matched by."""
+    """The name a constraint is given, and matched by.
+
+    A derived name longer than the server keeps is cut to fit and ends in a digest of the
+    whole. A given name is cut the way the server cuts it.
+    """
     if desired.name is not None:
         return desired.name[:MAX_IDENTIFIER]
     if isinstance(desired, Check):  # unreachable: Check requires a name
         raise ValueError("a check constraint needs a name")
-    return f"{desired.label}_{desired.property}_unique"[:MAX_IDENTIFIER]
+    derived = f"{desired.label}_{desired.property}_unique"
+    if len(derived) <= MAX_IDENTIFIER:
+        return derived
+    digest = hashlib.blake2b(derived.encode(), digest_size=4).hexdigest()
+    return f"{derived[: MAX_IDENTIFIER - len(digest) - 1]}_{digest}"
 
 
 ENDPOINT_COLUMNS = frozenset({"start", "end"})
@@ -797,18 +906,37 @@ def constraint_name_of_index(desired: DesiredIndex) -> str:
     return desired.name[:MAX_IDENTIFIER]
 
 
-def create_label_statement(name: str, kind: str, parent: str | None = None) -> str:
-    """The statement that makes a label of the kind given."""
+def _label_word(kind: str) -> str:
     if kind not in ("v", "e"):
         raise ValueError(f"a label is a vertex or an edge label, got {kind!r}")
-    word = "vlabel" if kind == "v" else "elabel"
-    statement = f"create {word} if not exists {quote_identifier(name)}"
+    return "vlabel" if kind == "v" else "elabel"
+
+
+def create_label_statement(
+    name: str,
+    kind: str,
+    parent: str | None = None,
+    properties: Sequence[PromotedProperty] = (),
+) -> str:
+    """The statement that makes a label of the kind given, with the columns it declares."""
+    statement = f"create {_label_word(kind)} if not exists {quote_identifier(name)}"
+    if properties:
+        statement += f" ({', '.join(prop.rendered() for prop in properties)})"
     if parent is not None:
         statement += f" inherits ({quote_identifier(parent)})"
     return statement
 
 
-def reconcile_labels(desired: Sequence[DesiredLabel], actual: Sequence[Label]) -> list[str]:
+def add_property_statement(label: str, kind: str, prop: PromotedProperty) -> str:
+    """The statement that gives a property of a label that exists a column of its own."""
+    return f"alter {_label_word(kind)} {quote_identifier(label)} add column {prop.rendered()}"
+
+
+def reconcile_labels(
+    desired: Sequence[DesiredLabel],
+    actual: Sequence[Label],
+    declared: Sequence[DeclaredProperty] = (),
+) -> list[str]:
     """The statements that make the labels asked for, for the ones that are not there.
 
     Nothing is ever dropped. A label holds the elements written to it, so removing one is a
@@ -817,19 +945,33 @@ def reconcile_labels(desired: Sequence[DesiredLabel], actual: Sequence[Label]) -
 
     A label already there under the other kind is refused rather than remade, since the server
     would refuse it too and the message is clearer from here.
+
+    A promoted property asked for on a label already there is added with ``ALTER``, unless
+    *declared* lists a column of that name on the label, its own or inherited.
     """
     have = {label.name: label for label in actual}
+    columns: dict[str, set[str]] = {}
+    for prop in declared:
+        columns.setdefault(prop.label, set()).add(prop.name)
     statements: list[str] = []
     for want in desired:
         found = have.get(want.name)
         if found is None:
-            statements.append(create_label_statement(want.name, want.kind, want.parent))
+            statements.append(
+                create_label_statement(want.name, want.kind, want.parent, want.properties)
+            )
         elif found.kind != want.kind:
             wanted, has = (
                 ("a vertex", "an edge") if want.kind == "v" else ("an edge", "a vertex")
             )
             raise ValueError(
                 f"{want.name!r} is asked for as {wanted} label and the graph has it as {has} one"
+            )
+        else:
+            statements.extend(
+                add_property_statement(want.name, want.kind, prop)
+                for prop in want.properties
+                if prop.name not in columns.get(want.name, ())
             )
     return statements
 

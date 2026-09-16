@@ -294,6 +294,61 @@ class TestIndexing:
         )
         assert "Index Scan" in plan, f"the index was not used:\n{plan}"
 
+    def test_both_kinds_of_vector_index_reconcile_and_read_back_in_parts(self, vectors) -> None:  # type: ignore[no-untyped-def]
+        """A cast element for the property in the map, a plain one for the column; the server
+        prints them differently and both are read back as what was asked for."""
+        from agensgraph import DesiredIndex, IndexElement
+
+        wanted = [
+            DesiredIndex(
+                "emb", [IndexElement("v", "vector_l2_ops")], method="hnsw", name="emb_v"
+            ),
+            DesiredIndex(
+                "loose",
+                [IndexElement("v", "vector_cosine_ops", cast="vector(4)")],
+                method="hnsw",
+                name="loose_v",
+            ),
+        ]
+        assert len(vectors.ensure_indexes(wanted)) == 2
+        assert vectors.ensure_indexes(wanted) == [], "the second run found work to do"
+        found = {index.name: index for index in vectors.vector_indexes()}
+        assert found["emb_v"].property == "v"
+        assert (found["emb_v"].type, found["emb_v"].dimensions) == ("vector", 4)
+        assert found["emb_v"].operator_class == "vector_l2_ops"
+        assert (found["loose_v"].type, found["loose_v"].dimensions) == ("vector", 4)
+        assert found["loose_v"].operator_class == "vector_cosine_ops"
+        assert {index.method for index in found.values()} == {"hnsw"}
+        assert vectors.vector_indexes("loose") == [found["loose_v"]]
+
+    def test_the_options_and_an_omitted_operator_class_read_back(self, vectors) -> None:  # type: ignore[no-untyped-def]
+        """The server prints an operator class only where it is not the default for the type and
+        the method, so a vector index may name none. The access method is what makes it one."""
+        vectors.execute(
+            vector_index(
+                "loose",
+                "v",
+                dimensions=4,
+                method="ivfflat",
+                operator_class="vector_l2_ops",
+                options={"lists": 10},
+                name="loose_iv",
+            )
+        )
+        (found,) = [
+            index for index in vectors.vector_indexes("loose") if index.name == "loose_iv"
+        ]
+        assert found.method == "ivfflat"
+        assert found.options == {"lists": "10"}
+        assert (found.type, found.dimensions) == ("vector", 4)
+        printed = next(i for i in vectors.indexes("loose") if i.name == "loose_iv").definition
+        assert "vector_l2_ops" not in printed, "the default was printed after all"
+        assert found.operator_class is None
+
+    def test_an_ordinary_index_is_not_a_vector_index(self, vectors) -> None:  # type: ignore[no-untyped-def]
+        vectors.execute("create property index on loose (name)")
+        assert vectors.vector_indexes("loose") == []
+
     def test_the_sql_spelling_of_the_same_index_is_never_matched(self, vectors) -> None:  # type: ignore[no-untyped-def]
         """Why :func:`vector_index` builds a property index and not a plain one.
 
