@@ -1745,8 +1745,7 @@ that test fails and names the workaround to drop.
 
 A release is a tag. Date this version's section of `CHANGELOG.md`, tag the commit `v<version>` and
 push the tag: the release workflow builds both distributions from it, checks that they carry the
-tag's version and that the README renders, runs the offline suite, publishes to PyPI through trusted
-publishing, and makes the GitHub release.
+tag's version, runs the offline suite, and makes the GitHub release with them attached.
 
 The notes on that release are `docs/release-notes/<version>.md` where somebody wrote them, and that
 version's changelog section otherwise, so a routine release needs nothing written.

@@ -1,17 +1,10 @@
 name: Release
 
-# A tag `v<version>` builds both distributions from that commit and publishes them to PyPI, then
-# makes the GitHub release carrying the notes and the files.
+# A tag `v<version>` builds both distributions from that commit and makes the GitHub release
+# carrying the notes and the files.
 #
 # The notes are `docs/release-notes/<version>.md` where somebody wrote them, and that version's
-# changelog section otherwise. A changelog entry is a list of what changed; a release is read by
-# somebody deciding whether to upgrade, and for a release that is worth explaining the two are
-# not the same document.
-#
-# Publishing uses PyPI's trusted publishing, so no token is stored here. The `skaiworldwide`
-# account owns https://pypi.org/project/agensgraph-python/ and adds this workflow as a publisher
-# once, under that project's publishing settings: owner `skaiworldwide-oss`, repository
-# `agensgraph-python`, workflow `release.yaml`, environment `pypi`.
+# changelog section otherwise.
 
 on:
   push:
@@ -37,10 +30,6 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           ls "dist/agensgraph_python-${version}.tar.gz" "dist/agensgraph_python-${version}-py3-none-any.whl"
 
-      # The README is the long description PyPI shows, and a rendering mistake is refused at upload.
-      - name: The metadata renders
-        run: uvx twine check --strict dist/*
-
       - name: Install
         run: uv sync --group tests
       - name: The offline suite, on what is being published
@@ -51,21 +40,8 @@ jobs:
           name: dist
           path: dist/
 
-  pypi:
-    needs: build
-    runs-on: ubuntu-latest
-    environment: pypi
-    permissions:
-      id-token: write
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: dist
-          path: dist/
-      - uses: pypa/gh-action-pypi-publish@release/v1
-
   github:
-    needs: pypi
+    needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: write
