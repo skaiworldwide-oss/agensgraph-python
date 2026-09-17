@@ -1,6 +1,6 @@
 # Changelog
 
-## 2.0.0 (unreleased)
+## 2.0.0 (2026-09-18)
 
 A rewrite on [psycopg 3](https://www.psycopg.org/psycopg3/). Nothing from 1.x is carried over: the
 distribution name and the import name are the same, and no code written against 1.x runs against
@@ -130,4 +130,4 @@ Each of these was demonstrated against output the engine legitimately produces:
 
 ## 1.0.2 and earlier
 
-A psycopg2 type-extension module. See the [`v1.0` branch](https://github.com/skaiworldwide-oss/agensgraph-python/tree/v1.0).
+A psycopg2 type-extension module.

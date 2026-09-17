@@ -1758,8 +1758,7 @@ raised, `NULL` elements had no representation, a label containing `{` collapsed 
 token, an unanchored graph id match turned `7.9.5` into `(7,9)`, every returned value was unhashable,
 and `len(path)` made a valid single-vertex path falsy.
 
-The distribution name and the import name are unchanged. 1.x remains on a maintenance branch for
-security only, and the psycopg2 line does not migrate.
+The distribution name and the import name are unchanged.
 
 One habit does not carry over. Importing 1.x registered its casters into psycopg2's global map, so
 every psycopg2 connection in the process read graph types without asking. This driver keeps its
