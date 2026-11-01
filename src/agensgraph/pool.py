@@ -55,7 +55,7 @@ from .deadline import Deadline
 from .errors import InterruptedConnection, StaleGeneration
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Generator
+    from collections.abc import Callable, Generator
 
     from psycopg.abc import Params
 
@@ -97,9 +97,9 @@ class ConnectionPool:
         min_size: int = DEFAULT_MIN_SIZE,
         max_size: int | None = DEFAULT_MAX_SIZE,
         kwargs: dict[str, Any] | None = None,
-        configure: Callable[[Connection[Any]], Awaitable[None]] | None = None,
-        setup: Callable[[Connection[Any]], Awaitable[None]] | None = None,
-        reset: Callable[[Connection[Any]], Awaitable[None]] | None = None,
+        configure: Callable[[Connection[Any]], None] | None = None,
+        setup: Callable[[Connection[Any]], None] | None = None,
+        reset: Callable[[Connection[Any]], None] | None = None,
         timeout: float = 30.0,
         max_waiting: int = 0,
         max_lifetime: float = 3600.0,
@@ -467,9 +467,9 @@ class NullConnectionPool(ConnectionPool):
         min_size: int = 0,
         max_size: int | None = None,
         kwargs: dict[str, Any] | None = None,
-        configure: Callable[[Connection[Any]], Awaitable[None]] | None = None,
-        setup: Callable[[Connection[Any]], Awaitable[None]] | None = None,
-        reset: Callable[[Connection[Any]], Awaitable[None]] | None = None,
+        configure: Callable[[Connection[Any]], None] | None = None,
+        setup: Callable[[Connection[Any]], None] | None = None,
+        reset: Callable[[Connection[Any]], None] | None = None,
         timeout: float = 30.0,
         max_waiting: int = 0,
         max_lifetime: float = 3600.0,

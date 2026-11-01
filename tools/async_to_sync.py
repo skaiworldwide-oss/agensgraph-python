@@ -24,6 +24,7 @@ import argparse
 import ast
 import difflib
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -165,6 +166,17 @@ class Blocking(ast.NodeTransformer):
             return kept or [ast.copy_location(ast.Pass(), node)]
         return self.generic_visit(node)
 
+    def visit_Subscript(self, node: ast.Subscript) -> ast.AST:
+        """``Awaitable[X]`` is what a blocking callable returns ``X`` as.
+
+        So a blocking pool's ``configure``, ``setup``, ``reset`` and the work ``run_transaction``
+        takes are annotated as returning their value, and a type checker accepts the plain
+        function a blocking caller passes.
+        """
+        if isinstance(node.value, ast.Name) and node.value.id == "Awaitable":
+            return self.visit(node.slice)
+        return self.generic_visit(node)
+
     def visit_Name(self, node: ast.Name) -> ast.AST:
         node.id = _rename(node.id)
         return node
@@ -248,17 +260,31 @@ def convert(source: Path, target_name: str) -> str:
     return _formatted(text, target_name)
 
 
+def _ruff() -> list[str]:
+    """The formatter to run: the one installed beside this interpreter, else one on PATH.
+
+    A virtual environment that was never activated has ruff beside its interpreter but not on
+    PATH, which is how the suite is usually run, so that one is looked for first.
+    """
+    beside = Path(sys.executable).with_name("ruff")
+    if beside.is_file():
+        return [str(beside)]
+    found = shutil.which("ruff")
+    return [found] if found else [sys.executable, "-m", "ruff"]
+
+
 def _formatted(text: str, name: str) -> str:
     """Run the tree's own formatter over the output, so a diff is never about layout."""
+    ruff = _ruff()
     for command in (
-        ["ruff", "check", "--fix-only", "--quiet", "--stdin-filename", name, "-"],
-        ["ruff", "format", "--quiet", "--stdin-filename", name, "-"],
+        [*ruff, "check", "--fix-only", "--quiet", "--stdin-filename", name, "-"],
+        [*ruff, "format", "--quiet", "--stdin-filename", name, "-"],
     ):
         result = subprocess.run(
             command, input=text, capture_output=True, text=True, cwd=ROOT, check=False
         )
         if result.returncode != 0:
-            raise SystemExit(f"{command[0]} failed on the generated {name}:\n{result.stderr}")
+            raise SystemExit(f"ruff failed on the generated {name}:\n{result.stderr}")
         text = result.stdout
     return text
 
