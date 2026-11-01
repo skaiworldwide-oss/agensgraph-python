@@ -474,8 +474,10 @@ class TestTheAwaitingInterface:
         graph = "vector_async"
         conn = await agensgraph.AsyncConnection.connect(dsn, autocommit=True)
         async with conn:
-            if not await conn.can_promote_properties() or not await conn.has_vectors():
+            if not await conn.has_vectors():
                 pytest.skip("the vector extension is not created in this database")
+            if not await conn.can_promote_properties():
+                pytest.skip("this server cannot store a property in a column of its own")
             await conn.execute(f'drop graph if exists "{graph}" cascade')
             await conn.execute(f'create graph "{graph}"')
             await conn.graph(graph)

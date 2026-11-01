@@ -224,9 +224,9 @@ class TestItLeavesTheSessionAsItFoundIt:
 def reaching(agens, dsn):  # type: ignore[no-untyped-def]
     """A connection as a role that can *reach* the privilege without holding it.
 
-    A membership granted ``with inherit false`` carries nothing until ``set role`` names it. Such a
-    role is as dangerous as one that holds the privilege outright, because naming a membership moves
-    no rows and a read-only transaction has no reason to refuse it.
+    A ``noinherit`` role's memberships carry nothing until ``set role`` names one. Such a role is as
+    dangerous as one that holds the privilege outright, because naming a membership moves no rows and
+    a read-only transaction has no reason to refuse it.
     """
     holder, name = "agens_program_holder", "agens_program_reacher"
     for role in (name, holder):
@@ -237,8 +237,8 @@ def reaching(agens, dsn):  # type: ignore[no-untyped-def]
         agens.execute(f'drop role if exists "{holder}"')
         agens.execute(f'create role "{holder}"')
         agens.execute(f'grant pg_execute_server_program to "{holder}"')
-        agens.execute(f"create role \"{name}\" login password '{PROBE_PASSWORD}'")
-        agens.execute(f'grant "{holder}" to "{name}" with inherit false')
+        agens.execute(f"create role \"{name}\" login noinherit password '{PROBE_PASSWORD}'")
+        agens.execute(f'grant "{holder}" to "{name}"')
     except psycopg.Error:
         pytest.skip("this role cannot grant a membership, so the reach cannot be tested")
     theirs = psycopg.conninfo.make_conninfo(dsn, user=name, password=PROBE_PASSWORD)

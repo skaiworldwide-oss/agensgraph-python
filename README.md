@@ -1762,8 +1762,10 @@ read the same way everywhere:
 | `ORDER BY` an expression the `RETURN` does not project | no | no | no | yes | yes | yes |
 | `enable_graph_dml`, for plain SQL writes to a label's table | no | no | no | yes | yes | yes |
 | a property kept in a column of its own; GQL clauses; comparing elements | no | no | no | no | yes | yes |
+| a vertex or an edge inside a list, as `return [n, n]` | no | no | no | no | yes | yes |
 | `graphmeta` reports whether it is current | no | no | no | no | yes | yes |
 | an unlabelled read checks each label's privileges | no | no | no | no | no | yes |
+| the server reports a change of `graph_path`, so the driver follows it without asking | no | no | no | no | no | yes |
 
 ```python
 caps = conn.capabilities
@@ -1995,6 +1997,9 @@ lowest declared versions; and an install of the built wheel and source distribut
 environments. A fuzzer over the text reader runs on amd64, the only platform atheris ships for. A
 server job fails if a test skipped for a reason that means the job was set up wrong: no second role
 to connect as, or no vectors.
+
+A test of a feature a release does not have skips on that release; see
+[Server versions](#server-versions).
 
 To run the server suite as CI does:
 
