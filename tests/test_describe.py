@@ -53,6 +53,24 @@ class TestWhatItFinds:
         assert "Spaced Label" in described_graph.properties
         assert described_graph.counts["Spaced Label"] == 1
 
+    def test_counts_are_left_out_when_not_asked_for(self, agens) -> None:  # type: ignore[no-untyped-def]
+        """Counting reads every element; a schema for a prompt does not need the numbers."""
+        agens.execute("create vlabel person")
+        agens.execute("create (:person {name: 'a'})")
+        sent: list[str] = []
+
+        def record(record) -> None:  # type: ignore[no-untyped-def]
+            sent.append(record.statement)
+
+        agensgraph.add_query_logger(record)
+        try:
+            found = agens.describe(counts=False)
+        finally:
+            agensgraph.remove_query_logger(record)
+        assert found.counts == {}
+        assert [shape.name for shape in found.properties["person"]] == ["name"]
+        assert not any("graphid_labid(id)" in text for text in sent), "no label was counted"
+
     def test_how_many_elements_each_label_has(self, described) -> None:  # type: ignore[no-untyped-def]
         counts = described.describe().counts
         assert counts["person"] == 2
@@ -170,6 +188,36 @@ class TestItIsWorthDoing:
         agens.execute_query("match (s)-[r]->(e) return distinct label(s), type(r), label(e)")
         scanning = time.monotonic() - started
         assert describing < scanning
+
+
+class TestKnowingTheCatalogIsCurrent:
+    """On every release: from the flag on 2.18, and by counting the edges before it."""
+
+    def test_an_edge_written_after_a_gather_makes_it_stale(self, agens) -> None:  # type: ignore[no-untyped-def]
+        if agens.execute(
+            "select current_setting('auto_gather_graphmeta', true)"
+        ).fetchone() == ("on",):
+            pytest.skip("this server gathers the catalog itself, so it is never stale")
+        agens.execute("create vlabel person")
+        agens.execute("create elabel knows")
+        agens.execute("create (:person {k: 1})-[:knows]->(:person {k: 2})")
+        agens.execute("select regather_graphmeta()")
+        assert agens.meta_is_current() is True
+        before = agens.label_positions()
+
+        agens.execute("match (a:person {k: 1}), (b:person {k: 2}) create (b)-[:knows]->(a)")
+        assert agens.meta_is_current() is False
+        assert agens.label_positions()["knows"] > before["knows"]
+
+        agens.execute("select regather_graphmeta()")
+        assert agens.meta_is_current() is True
+
+    def test_a_read_moves_nothing(self, agens) -> None:  # type: ignore[no-untyped-def]
+        agens.execute("create vlabel person")
+        agens.execute("create (:person {k: 1})")
+        before = agens.label_positions()
+        agens.execute("match (n:person) return n").fetchall()
+        assert agens.label_positions() == before
 
 
 class TestTheAwaitingInterface:

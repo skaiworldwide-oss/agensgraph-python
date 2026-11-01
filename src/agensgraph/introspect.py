@@ -23,6 +23,7 @@ import hashlib
 import re
 from typing import TYPE_CHECKING, NamedTuple, TypeVar
 
+from ._protocol.labels import LABEL_SEQUENCES
 from .cypher import quote_identifier
 
 if TYPE_CHECKING:
@@ -40,12 +41,14 @@ _Labelled = TypeVar("_Labelled", bound="_HasLabel")
 """What a narrowing hands back, which is whatever kind it was given."""
 
 __all__ = [
+    "AUTO_GATHER_QUERY",
     "CONSTRAINTS_QUERY",
     "DECLARED_PROPERTIES_QUERY",
     "ENDPOINT_COLUMNS",
     "GRAPHS_QUERY",
     "INDEXES_QUERY",
     "LABELS_QUERY",
+    "LABEL_POSITIONS_QUERY",
     "META_FLAG_QUERY",
     "META_VALID_QUERY",
     "PROMOTION_CATALOG_QUERY",
@@ -77,6 +80,7 @@ __all__ = [
     "index_is_partial",
     "index_method",
     "index_properties",
+    "meta_count_check_query",
     "parse_index_element",
     "property_sample_query",
     "reconcile_constraints",
@@ -1057,6 +1061,51 @@ GATHER_META = "select pg_catalog.regather_graphmeta()"
 """Fill in the catalog :data:`TRIPLES_QUERY` reads.
 
 A write, and not a cheap one on a large graph, which is why nothing calls it without being asked.
+It covers every graph in the database, not only the one it is called for.
+"""
+
+AUTO_GATHER_QUERY = "select current_setting('auto_gather_graphmeta', true)"
+"""Whether the server keeps the triple catalog current by itself, or ``None`` where it cannot."""
+
+LABEL_POSITIONS_QUERY = f"""
+select l.labname::text, s.last_value
+{LABEL_SEQUENCES}
+join pg_catalog.pg_namespace sn on sn.oid = seq.relnamespace
+join pg_catalog.pg_sequences s on s.schemaname = sn.nspname and s.sequencename = seq.relname
+where g.graphname = %s
+"""
+"""How far each label's id sequence has gone: the cheap sign that something was written.
+
+Every element a label gains draws the next value of the sequence its id default names, found
+through ``pg_depend`` because that default names the label by a string that goes stale when the
+label is renamed. A caller that kept these from its last look at the graph and finds them unmoved
+knows nothing was added since; a new label appears as a new key. Deletes do not move a sequence,
+so a catalog read this way can describe a few edges that are gone, never miss one that is there.
+"""
+
+
+def meta_count_check_query(graph: str) -> str:
+    """Whether the triple catalog's edge counts match the edges the graph holds, label by label.
+
+    Exact, and it reads every edge, which is why it is the fallback where the server keeps no
+    flag rather than what is asked first. Bound as ``%(g)s`` for the graph's name.
+    """
+    return f"""
+with meta as (
+  select edge::text as edge, sum(edgecount)::bigint as n
+  from pg_catalog.ag_graphmeta_view
+  where graphname = %(g)s
+  group by 1
+), actual as (
+  select l.labname::text as edge, count(*)::bigint as n
+  from {quote_identifier(graph)}.ag_edge e
+  join pg_catalog.ag_label l
+    on l.labid = graphid_labid(e.id)
+   and l.graphid = (select oid from pg_catalog.ag_graph where graphname = %(g)s)
+  group by 1
+)
+select coalesce(bool_and(meta.n is not distinct from actual.n), true)
+from meta full join actual using (edge)
 """
 
 

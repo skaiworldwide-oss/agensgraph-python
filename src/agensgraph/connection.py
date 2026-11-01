@@ -87,6 +87,7 @@ from .errors import (
     retryability,
 )
 from .introspect import (
+    AUTO_GATHER_QUERY,
     CONSTRAINTS_FOR_LABEL,
     CONSTRAINTS_QUERY,
     DECLARED_PROPERTIES_FOR_LABEL,
@@ -95,6 +96,7 @@ from .introspect import (
     GRAPHS_QUERY,
     INDEXES_FOR_LABEL,
     INDEXES_QUERY,
+    LABEL_POSITIONS_QUERY,
     LABELS_QUERY,
     META_FLAG_QUERY,
     META_VALID_QUERY,
@@ -117,6 +119,7 @@ from .introspect import (
     element_count_query,
     for_labels,
     index_properties,
+    meta_count_check_query,
     property_sample_query,
     reconcile_constraints,
     reconcile_indexes,
@@ -1731,7 +1734,12 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
         return held
 
     def describe(
-        self, *, sample: int = 100, refresh: bool = False, graph: str | None = None
+        self,
+        *,
+        sample: int = 100,
+        refresh: bool = False,
+        counts: bool = True,
+        graph: str | None = None,
     ) -> GraphDescription:
         """What is in a graph: its labels, what they hold, and what joins what.
 
@@ -1754,12 +1762,20 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
         so on a server where nobody has gathered there are no triples and ``meta_gathered`` is
         false. ``refresh`` gathers first. It is not the default because it is a write, and a
         description is not a thing that should write.
+
+        ``counts=False`` leaves the element counts out, which a schema for a prompt does not
+        need: counting is the one part here that reads every element of the graph. ``counts``
+        on the result is then empty.
+
+        ``meta_gathered`` is the flag where the server keeps one. Before 2.18 it says only that
+        the catalog holds triples, or that the graph has no edges to gather; whether it is still
+        current is :meth:`meta_is_current`, which counts the edges to say so.
         """
         name = self._graph_of(graph)
         if refresh and (not self.meta_is_current(graph=name)):
             self._run(GATHER_META)
         labels = self.labels(graph=name)
-        counts = self.element_counts(graph=name)
+        element_counts = self.element_counts(graph=name) if counts else {}
         triples = tuple(
             (
                 Triple(start, edge, end, seen)
@@ -1783,13 +1799,17 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
             for key, kind in declared.get(label, {}).items():
                 found[key] = PropertyShape(key, kind, True)
             properties[label] = tuple(found[key] for key in sorted(found))
+        gathered = self._meta_flag(name)
+        if gathered is None:
+            edges = sum(element_counts.get(label.name, 0) for label in labels if label.is_edge)
+            gathered = bool(triples) or (counts and edges == 0)
         return GraphDescription(
             graph=name,
             labels=tuple(labels),
             properties=properties,
             triples=triples,
-            counts=counts,
-            meta_gathered=self.meta_is_current(graph=name),
+            counts=element_counts,
+            meta_gathered=gathered,
         )
 
     def meta_is_current(self, *, graph: str | None = None) -> bool:
@@ -1799,29 +1819,46 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
         at commit, and a read leaves it alone. So this separates a catalog nobody has gathered
         from one that is current and from one that was gathered and has since been written to.
 
-        The flag arrived with 2.18. Before it, those three cannot be told apart, and the answer
-        comes from what the catalog holds: triples for a graph that has edges is as much as can be
-        established, and a graph with no edges has nothing to gather.
+        The flag arrived with 2.18. Before it, a server with ``auto_gather_graphmeta`` on keeps
+        the catalog current itself; otherwise the catalog's edge counts are compared with the
+        edges the graph holds, label by label. That comparison is exact and reads every edge
+        (about 30 ms for 300,000), so a caller that asks often keeps :meth:`label_positions`
+        from its last look and asks this only when those have moved.
         """
         name = self._graph_of(graph)
-        if self._has_meta_flag():
-            rows = self._fetch(META_VALID_QUERY, (name,))
-            return bool(rows) and bool(rows[0][0])
-        triples = self._fetch(TRIPLES_QUERY, (name,))
-        if triples:
+        flagged = self._meta_flag(name)
+        if flagged is not None:
+            return flagged
+        auto = self._fetch(AUTO_GATHER_QUERY, ())
+        if auto and auto[0][0] == "on":
             return True
-        counts = self.element_counts(graph=name)
-        labels = self.labels(graph=name)
-        return sum(counts.get(label.name, 0) for label in labels if label.is_edge) == 0
+        rows = self._fetch(meta_count_check_query(name), {"g": name})
+        return bool(rows[0][0])
 
-    def _has_meta_flag(self) -> bool:
-        """Whether this server records whether the triple catalog is current. Asked once."""
+    def label_positions(self, *, graph: str | None = None) -> dict[str, int]:
+        """How far each label's id sequence has gone, by label.
+
+        One catalog read, under a millisecond. Unmoved positions mean nothing was added since
+        they were taken, which is the cheap way to decide whether :meth:`meta_is_current` is
+        worth asking. A label whose sequence has never been used is missing from the answer.
+        """
+        name = self._graph_of(graph)
+        rows = self._fetch(LABEL_POSITIONS_QUERY, (name,))
+        return {label: int(position) for label, position in rows if position is not None}
+
+    def _meta_flag(self, graph: str) -> bool | None:
+        """The server's own word on whether *graph*'s triple catalog is current; ``None`` before 2.18.
+
+        Whether the server keeps that flag at all is asked once per connection.
+        """
         held = self._agens_has_meta_flag
         if held is None:
             rows = self._fetch(META_FLAG_QUERY, ())
-            held = bool(rows[0][0])
-            self._agens_has_meta_flag = held
-        return held
+            held = self._agens_has_meta_flag = bool(rows[0][0])
+        if not held:
+            return None
+        rows = self._fetch(META_VALID_QUERY, (graph,))
+        return bool(rows) and bool(rows[0][0])
 
     def declared_properties(
         self, label: str | None = None, *, graph: str | None = None
