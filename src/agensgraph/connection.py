@@ -138,6 +138,14 @@ from .summary import (
     GraphWriteCounts,
     read_outcome,
 )
+from .untrusted import (
+    UNTRUSTED_ROLE_QUERY,
+    CheckedText,
+    UntrustedResult,
+    check_columns,
+    check_untrusted,
+    role_problems,
+)
 from .vector import VectorIndex, check_search_option, describe_vector_index
 
 if TYPE_CHECKING:
@@ -155,6 +163,9 @@ __all__ = ["Connection", "Cursor"]
 _RV = TypeVar("_RV")
 _READ_ONLY_PROBE_READ = "match (n) where false return n"
 _READ_ONLY_PROBE_WRITE = "match (n) where false set n.agensgraph_probe = 1"
+_UNTRUSTED_CURSOR = "agensgraph_untrusted"
+_UNTRUSTED_TAGS = ("BEGIN", "SELECT 1", "DECLARE CURSOR", "FETCH", "ROLLBACK", "SELECT 1")
+_TOP_LEVEL_ONLY = frozenset({"filter", "next"})
 
 
 class Cursor(psycopg.Cursor[Row]):
@@ -841,6 +852,217 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
         if enforced is not None:
             self._agens_read_only_enforced = enforced
         return bool(enforced)
+
+    def untrusted_role_problems(
+        self, *, app_role: str | None = None, schemas: Sequence[str] = ()
+    ) -> tuple[str, ...]:
+        """What makes this connection's role unfit to run model-written Cypher, if anything.
+
+        Membership is what is asked about, not what is held at this moment: a role can take on
+        any role it belongs to with ``SET ROLE``, inside a read-only transaction. ``app_role``
+        names the application's role, which the model's role must neither be nor belong to.
+        ``schemas`` are the graph's schema and any other the caller keeps data in; where the
+        server lets Cypher writes skip privileges, 2.14 and 2.15, the role must hold no write
+        privilege on them.
+
+        Asked once per connection for a given role and schemas, and kept.
+        """
+        key = (app_role, tuple(schemas))
+        cached = self._agens_untrusted_role
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        rows = self._fetch(UNTRUSTED_ROLE_QUERY, {"app": app_role, "schemas": list(schemas)})
+        problems = role_problems(
+            tuple(bool(value) for value in rows[0]), writes_enforced=self._read_only_gate()
+        )
+        self._agens_untrusted_role = (key, problems)
+        return problems
+
+    def run_untrusted(
+        self,
+        text: str,
+        *,
+        max_rows: int = 100,
+        timeout: float = 10.0,
+        allow_writes: bool = False,
+        app_role: str | None = None,
+        schemas: Sequence[str] = (),
+        unsafe_shared_role: bool = False,
+    ) -> UntrustedResult:
+        """Run one statement a model wrote, and nothing it could not have meant to.
+
+        The text is read first and refused before it is sent if it is not plainly a Cypher read:
+        see :func:`~agensgraph.untrusted.check_untrusted`. Then it runs in a transaction of its
+        own that is read-only and always rolled back, under ``timeout`` seconds, and at most
+        ``max_rows`` rows are read.
+
+        One round trip in the usual case: the statement is read through a cursor declared over
+        ``SELECT * FROM (<text>) AS t`` in a single pipeline that also opens, limits and rolls
+        back the transaction and releases any advisory lock. A statement that wrap cannot hold
+        -- one starting with ``WITH``, and on 2.18 one using ``FILTER`` or ``NEXT`` -- is
+        streamed as it is instead, in three round trips, inside the same kind of transaction.
+        Either way the result must have the columns the statement's ``RETURN`` declares.
+
+        The connection's role must be fit for this: not a superuser, not able to reach the
+        server's files, programs or other sessions, and not the application's role or a member
+        of it (:meth:`untrusted_role_problems`). On 2.14 and 2.15 that is required; from 2.16
+        ``unsafe_shared_role`` accepts the risk.
+
+        ``allow_writes`` runs Cypher write clauses in a read-write transaction that commits. It
+        needs a server that checks those writes against privileges itself -- a 2.16 or later
+        release, confirmed by :meth:`read_only_is_enforced` -- and a role allowed exactly the
+        writes the model may make. It is never retried.
+        """
+        if max_rows < 1:
+            raise ValueError(f"at least one row has to be readable, got {max_rows}")
+        checked = check_untrusted(text, allow_writes=allow_writes)
+        self._check_lent()
+        if self.pgconn.transaction_status != TransactionStatus.IDLE:
+            raise psycopg.ProgrammingError(
+                "model-written Cypher runs in a transaction of its own, and this connection has one open; commit or roll it back first"
+            )
+        problems = self.untrusted_role_problems(app_role=app_role, schemas=schemas)
+        if problems and (not (unsafe_shared_role and self._read_only_gate())):
+            raise ConfigurationError(
+                "this role must not run model-written Cypher: "
+                + "; ".join(problems)
+                + ". Connect as a role made for it: one that can log in and read the graph, and holds nothing else"
+                + (
+                    ", or pass unsafe_shared_role=True to accept the risk"
+                    if self._read_only_gate()
+                    else ""
+                )
+            )
+        if allow_writes and (
+            not (
+                self.capabilities.has("cypher_write_enforced") and self.read_only_is_enforced()
+            )
+        ):
+            raise CapabilityError(
+                f"model-written writes need a server that checks Cypher writes against privileges and READ ONLY itself: an AgensGraph 2.16 or later release, confirmed by read_only_is_enforced(); this server is {self.capabilities.reported}"
+            )
+        timeout_ms = str(max(1, int(timeout * 1000)))
+        was_autocommit = self.autocommit
+        if not was_autocommit:
+            self.set_autocommit(True)
+        try:
+            if allow_writes:
+                result = self._untrusted_write(checked, max_rows, timeout_ms)
+            else:
+                result = self._untrusted_read(checked, max_rows, timeout_ms)
+        finally:
+            if not was_autocommit:
+                self.set_autocommit(False)
+        try:
+            check_columns(checked.columns, result.columns)
+        except ValueError as exc:
+            raise self._boundary_lost(
+                f"model-written Cypher returned unexpected columns: {exc}"
+            ) from None
+        return result
+
+    def _untrusted_read(
+        self, checked: CheckedText, max_rows: int, timeout_ms: str
+    ) -> UntrustedResult:
+        """A read, through the cursor wrap where its grammar takes the text, streamed otherwise."""
+        gql = self.capabilities.has("gql_clauses")
+        if checked.wrappable and (
+            not (gql and (checked.limits_mid_statement or checked.words & _TOP_LEVEL_ONLY))
+        ):
+            wrapped = self._untrusted_wrapped(checked, max_rows, timeout_ms)
+            if wrapped is not None:
+                return wrapped
+        return self._untrusted_streamed(checked, max_rows, timeout_ms)
+
+    def _untrusted_wrapped(
+        self, checked: CheckedText, max_rows: int, timeout_ms: str
+    ) -> UntrustedResult | None:
+        """The one-round-trip read, or ``None`` where the wrap's grammar refuses the statement."""
+        statements: tuple[tuple[str, tuple[str, ...] | None], ...] = (
+            ("begin read only", None),
+            settings_statement([("statement_timeout", timeout_ms)]),
+            (
+                f"declare {_UNTRUSTED_CURSOR} no scroll cursor for {wrap_for_cursor(checked.text)}",
+                None,
+            ),
+            (f"fetch {max_rows + 1} from {_UNTRUSTED_CURSOR}", None),
+            ("rollback", None),
+            ("select pg_advisory_unlock_all()", None),
+        )
+        cursors = [self.cursor(row_factory=tuple_row) for _ in statements]
+        try:
+            try:
+                with self.pipeline():
+                    for cursor, (statement, params) in zip(cursors, statements, strict=True):
+                        cursor.execute(statement, params, prepare=False)
+            except psycopg.Error as exc:
+                self._roll_back_and_unlock()
+                if exc.sqlstate == "42601":
+                    return None
+                raise self._translated(exc) from None
+            tags = tuple(cursor.statusmessage or "" for cursor in cursors)
+            if (
+                tuple(tag.split(" ")[0] if tag.startswith("FETCH") else tag for tag in tags)
+                != _UNTRUSTED_TAGS
+            ):
+                raise self._boundary_lost(
+                    f"model-written Cypher answered with {tags}, not the expected sequence"
+                )
+            fetched = cursors[3]
+            rows = fetched.fetchall()
+            names = tuple(column.name for column in fetched.description or ())
+        finally:
+            for cursor in cursors:
+                cursor.close()
+        return UntrustedResult.capped(names, rows, max_rows)
+
+    def _untrusted_streamed(
+        self, checked: CheckedText, max_rows: int, timeout_ms: str
+    ) -> UntrustedResult:
+        """The read the wrap cannot hold, streamed as written, in three round trips."""
+        size = 100 if psycopg.pq.version() >= 170000 else 1
+        rows: list[tuple[Any, ...]] = []
+        names: tuple[str, ...] = ()
+        self._run(
+            f"begin read only; select set_config('statement_timeout', '{timeout_ms}', true)"
+        )
+        try:
+            with self.cursor(row_factory=tuple_row) as cursor:
+                try:
+                    for row in cursor.stream(checked.text, size=size):
+                        rows.append(row)
+                        if len(rows) > max_rows:
+                            break
+                except psycopg.Error as exc:
+                    raise self._translated(exc) from None
+                names = tuple(column.name for column in cursor.description or ())
+            if self.pgconn.transaction_status == TransactionStatus.IDLE:
+                raise self._boundary_lost(
+                    "the read-only transaction model-written Cypher ran in ended under it"
+                )
+        finally:
+            self._roll_back_and_unlock()
+        return UntrustedResult.capped(names, rows, max_rows)
+
+    def _untrusted_write(
+        self, checked: CheckedText, max_rows: int, timeout_ms: str
+    ) -> UntrustedResult:
+        """A model-written write, committed once, after checking it stayed in its transaction."""
+        rows: list[tuple[Any, ...]] = []
+        names: tuple[str, ...] = ()
+        with self.transaction():
+            self._run(*settings_statement([("statement_timeout", timeout_ms)]))
+            with self.cursor(row_factory=tuple_row) as cursor:
+                with self.pipeline():
+                    cursor.execute(checked.text, prepare=False)
+                if cursor.description is not None:
+                    rows = list(cursor.fetchmany(max_rows + 1))
+                    names = tuple(column.name for column in cursor.description)
+            if self.pgconn.transaction_status != TransactionStatus.INTRANS:
+                raise self._boundary_lost(
+                    "the transaction model-written Cypher ran in ended before it was committed"
+                )
+        return UntrustedResult.capped(names, rows, max_rows)
 
     def _roll_back_and_unlock(self) -> None:
         """Roll back whatever text from elsewhere left open, and release every session advisory
