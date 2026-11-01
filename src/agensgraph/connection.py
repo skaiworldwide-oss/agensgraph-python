@@ -101,6 +101,7 @@ from .introspect import (
     META_FLAG_QUERY,
     META_VALID_QUERY,
     PROMOTION_CATALOG_QUERY,
+    SCHEMA_LOCK_QUERY,
     SERVER_PROGRAM_QUERY,
     TRIPLES_QUERY,
     Check,
@@ -155,7 +156,14 @@ from .untrusted import (
 from .vector import VectorIndex, check_search_option, describe_vector_index
 
 if TYPE_CHECKING:
-    from collections.abc import Generator, Iterable, Iterator, Mapping, Sequence
+    from collections.abc import (
+        Callable,
+        Generator,
+        Iterable,
+        Iterator,
+        Mapping,
+        Sequence,
+    )
     from typing import Self
 
     from psycopg._queries import PostgresQuery
@@ -2186,18 +2194,55 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
                 raise ValueError(
                     f"{promoted} have columns of their own, and an index over a cast of the property is never used by a search on the column. Leave the cast out."
                 )
-        statements = reconcile_indexes(
-            desired,
-            for_labels(self.indexes(graph=name), desired, drop_extra),
-            drop_extra=drop_extra,
-        )
-        if dry_run:
-            return statements
-        for statement in statements:
-            self._run(statement)
-        if statements:
+
+        def planned() -> list[str]:
+            found = for_labels(self.indexes(graph=name), desired, drop_extra)
+            return reconcile_indexes(desired, found, drop_extra=drop_extra)
+
+        def settled() -> None:
             self._settled(reconcile_indexes(desired, self.indexes(graph=name)), "indexes")
+
+        return self._reconciled(name, planned, settled, dry_run=dry_run)
+
+    def _reconciled(
+        self,
+        graph: str,
+        planned: Callable[[], list[str]],
+        settled: Callable[[], None],
+        *,
+        dry_run: bool,
+    ) -> list[str]:
+        """What reconciling asks for, run unless this is a dry run; the statements either way.
+
+        Worked out first without the graph's schema lock, so a graph that already matches costs
+        the reading alone and takes no lock. Otherwise worked out again under the lock -- another
+        process may have done some of it meanwhile -- run, and checked by *settled*.
+        """
+        statements = planned()
+        if dry_run or not statements:
+            return statements
+        with self.schema_lock(graph=graph):
+            statements = planned()
+            for statement in statements:
+                self._run(statement)
+            if statements:
+                settled()
         return statements
+
+    @contextmanager
+    def schema_lock(self, *, graph: str | None = None) -> Generator[None]:
+        """Hold this graph's schema lock in a transaction, for changing what the graph declares.
+
+        Every ``ensure_*`` method runs under it, so two processes reconciling one graph at once
+        run one after the other: the second reads what the first left and has nothing to do,
+        rather than both creating the same label and one failing with ``42P07``. A caller making
+        DDL of its own takes it the same way. It lasts until the transaction ends, so a failure or a
+        lost connection releases it; inside an open transaction it lasts until that one ends.
+        """
+        name = self._graph_of(graph)
+        with self.transaction():
+            self._fetch(SCHEMA_LOCK_QUERY, (f"agensgraph:schema:{name}",))
+            yield
 
     def ensure_labels(
         self,
@@ -2233,14 +2278,11 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
                     found=self.capabilities.reported,
                 )
             declared = self.declared_properties(graph=name)
-        statements = reconcile_labels(desired, self.labels(graph=name), declared)
-        if dry_run:
-            return statements
-        for statement in statements:
-            self._run(statement)
-        if statements:
-            self.refresh_labels()
-        return statements
+
+        def planned() -> list[str]:
+            return reconcile_labels(desired, self.labels(graph=name), declared)
+
+        return self._reconciled(name, planned, self.refresh_labels, dry_run=dry_run)
 
     def ensure_constraints(
         self,
@@ -2259,20 +2301,17 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
         :meth:`ensure_indexes`.
         """
         name = self._graph_of(graph)
-        statements = reconcile_constraints(
-            desired,
-            for_labels(self.constraints(graph=name), desired, drop_extra),
-            drop_extra=drop_extra,
-        )
-        if dry_run:
-            return statements
-        for statement in statements:
-            self._run(statement)
-        if statements:
+
+        def planned() -> list[str]:
+            found = for_labels(self.constraints(graph=name), desired, drop_extra)
+            return reconcile_constraints(desired, found, drop_extra=drop_extra)
+
+        def settled() -> None:
             self._settled(
                 reconcile_constraints(desired, self.constraints(graph=name)), "constraints"
             )
-        return statements
+
+        return self._reconciled(name, planned, settled, dry_run=dry_run)
 
     def _settled(self, outstanding: list[str], what: str) -> None:
         """Raise if the state still differs from what was asked for."""

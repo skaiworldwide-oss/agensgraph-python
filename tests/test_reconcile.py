@@ -243,7 +243,8 @@ class TestDiffingIndexes:
 
     def test_a_name_is_used_when_one_is_given(self) -> None:
         statements = reconcile_indexes([DesiredIndex("doc", ("name",), name="my_idx")], [])
-        assert statements == ["create property index my_idx on doc (name)"]
+        # Named, so another writer making it first is skipped rather than refused.
+        assert statements == ["create property index if not exists my_idx on doc (name)"]
 
     def test_a_label_or_property_needing_quotes_gets_them(self) -> None:
         statement = create_index_statement(DesiredIndex("a b", ("order",)))
@@ -843,7 +844,7 @@ class TestDeclaringLabelsAgainstTheServer:
         assert agens.ensure_indexes(
             [DesiredIndex("emb", [IndexElement("m", cast="integer")], name="emb_m")],
             dry_run=True,
-        ) == ["create property index emb_m on emb ((m::integer))"]
+        ) == ["create property index if not exists emb_m on emb ((m::integer))"]
 
     def test_a_promoted_column_is_refused_where_the_server_cannot_promote(self, agens) -> None:  # type: ignore[no-untyped-def]
         if agens.can_promote_properties():
@@ -1037,3 +1038,35 @@ class TestWhatDoesGuaranteeAnEdgesEndpoints:
         assert caught.value.sqlstate == "23505"
         (count,) = agens.execute("match ()-[r:links]->() return count(*)").fetchone()
         assert count == 1
+
+
+@pytest.mark.server
+class TestTwoProcessesReconcilingAtOnce:
+    """The schema lock makes the second wait for the first, then find nothing left to do."""
+
+    def test_the_second_waits_and_then_has_nothing_to_do(self, agens, dsn: str) -> None:  # type: ignore[no-untyped-def]
+        import threading
+
+        from agensgraph.introspect import DesiredIndex, DesiredLabel
+
+        graph = agens.execute("select current_setting('graph_path')").fetchone()[0]
+        wanted_labels = [DesiredLabel("thing")]
+        wanted_indexes = [DesiredIndex("thing", ("k",), name="thing_k")]
+        second_ran: list[list[str]] = []
+
+        def second() -> None:
+            with agensgraph.connect(dsn, autocommit=True) as other:
+                other.graph(graph)
+                second_ran.append(other.ensure_labels(wanted_labels))
+                second_ran.append(other.ensure_indexes(wanted_indexes))
+
+        agens.autocommit = True
+        with agens.schema_lock():
+            assert agens.ensure_labels(wanted_labels)
+            assert agens.ensure_indexes(wanted_indexes)
+            waiting = threading.Thread(target=second)
+            waiting.start()
+            waiting.join(timeout=0.5)
+            assert waiting.is_alive(), "the second reconcile did not wait for the lock"
+        waiting.join(timeout=10)
+        assert second_ran == [[], []], "the second found everything already made"

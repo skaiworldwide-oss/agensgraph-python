@@ -98,6 +98,7 @@ from .introspect import (
     META_FLAG_QUERY,
     META_VALID_QUERY,
     PROMOTION_CATALOG_QUERY,
+    SCHEMA_LOCK_QUERY,
     SERVER_PROGRAM_QUERY,
     TRIPLES_QUERY,
     Check,
@@ -157,7 +158,15 @@ from .untrusted import (
 from .vector import VectorIndex, check_search_option, describe_vector_index
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, AsyncIterator, Iterable, Mapping, Sequence
+    from collections.abc import (
+        AsyncGenerator,
+        AsyncIterator,
+        Awaitable,
+        Callable,
+        Iterable,
+        Mapping,
+        Sequence,
+    )
     from typing import Self
 
     from psycopg._queries import PostgresQuery
@@ -2346,20 +2355,57 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
                     f"{promoted} have columns of their own, and an index over a cast of the "
                     f"property is never used by a search on the column. Leave the cast out."
                 )
-        statements = reconcile_indexes(
-            desired,
-            for_labels(await self.indexes(graph=name), desired, drop_extra),
-            drop_extra=drop_extra,
-        )
-        if dry_run:
-            return statements
-        for statement in statements:
-            await self._run(statement)
-        if statements:
+
+        async def planned() -> list[str]:
+            found = for_labels(await self.indexes(graph=name), desired, drop_extra)
+            return reconcile_indexes(desired, found, drop_extra=drop_extra)
+
+        async def settled() -> None:
             await self._settled(
                 reconcile_indexes(desired, await self.indexes(graph=name)), "indexes"
             )
+
+        return await self._reconciled(name, planned, settled, dry_run=dry_run)
+
+    async def _reconciled(
+        self,
+        graph: str,
+        planned: Callable[[], Awaitable[list[str]]],
+        settled: Callable[[], Awaitable[None]],
+        *,
+        dry_run: bool,
+    ) -> list[str]:
+        """What reconciling asks for, run unless this is a dry run; the statements either way.
+
+        Worked out first without the graph's schema lock, so a graph that already matches costs
+        the reading alone and takes no lock. Otherwise worked out again under the lock -- another
+        process may have done some of it meanwhile -- run, and checked by *settled*.
+        """
+        statements = await planned()
+        if dry_run or not statements:
+            return statements
+        async with self.schema_lock(graph=graph):
+            statements = await planned()
+            for statement in statements:
+                await self._run(statement)
+            if statements:
+                await settled()
         return statements
+
+    @asynccontextmanager
+    async def schema_lock(self, *, graph: str | None = None) -> AsyncGenerator[None]:
+        """Hold this graph's schema lock in a transaction, for changing what the graph declares.
+
+        Every ``ensure_*`` method runs under it, so two processes reconciling one graph at once
+        run one after the other: the second reads what the first left and has nothing to do,
+        rather than both creating the same label and one failing with ``42P07``. A caller making
+        DDL of its own takes it the same way. It lasts until the transaction ends, so a failure or a
+        lost connection releases it; inside an open transaction it lasts until that one ends.
+        """
+        name = await self._graph_of(graph)
+        async with self.transaction():
+            await self._fetch(SCHEMA_LOCK_QUERY, (f"agensgraph:schema:{name}",))
+            yield
 
     async def ensure_labels(
         self,
@@ -2395,14 +2441,11 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
                     found=self.capabilities.reported,
                 )
             declared = await self.declared_properties(graph=name)
-        statements = reconcile_labels(desired, await self.labels(graph=name), declared)
-        if dry_run:
-            return statements
-        for statement in statements:
-            await self._run(statement)
-        if statements:
-            await self.refresh_labels()
-        return statements
+
+        async def planned() -> list[str]:
+            return reconcile_labels(desired, await self.labels(graph=name), declared)
+
+        return await self._reconciled(name, planned, self.refresh_labels, dry_run=dry_run)
 
     async def ensure_constraints(
         self,
@@ -2421,21 +2464,18 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
         :meth:`ensure_indexes`.
         """
         name = await self._graph_of(graph)
-        statements = reconcile_constraints(
-            desired,
-            for_labels(await self.constraints(graph=name), desired, drop_extra),
-            drop_extra=drop_extra,
-        )
-        if dry_run:
-            return statements
-        for statement in statements:
-            await self._run(statement)
-        if statements:
+
+        async def planned() -> list[str]:
+            found = for_labels(await self.constraints(graph=name), desired, drop_extra)
+            return reconcile_constraints(desired, found, drop_extra=drop_extra)
+
+        async def settled() -> None:
             await self._settled(
                 reconcile_constraints(desired, await self.constraints(graph=name)),
                 "constraints",
             )
-        return statements
+
+        return await self._reconciled(name, planned, settled, dry_run=dry_run)
 
     async def _settled(self, outstanding: list[str], what: str) -> None:
         """Raise if the state still differs from what was asked for."""

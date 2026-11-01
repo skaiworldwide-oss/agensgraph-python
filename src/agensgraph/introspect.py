@@ -52,6 +52,7 @@ __all__ = [
     "META_FLAG_QUERY",
     "META_VALID_QUERY",
     "PROMOTION_CATALOG_QUERY",
+    "SCHEMA_LOCK_QUERY",
     "SERVER_PROGRAM_QUERY",
     "TRIPLES_QUERY",
     "Check",
@@ -890,7 +891,8 @@ def reconcile_indexes(
             continue
         found = by_key.get(want.key())
         if found is None:
-            statements.append(create_index_statement(want))
+            # A named index another writer has just made is skipped rather than refused.
+            statements.append(create_index_statement(want, if_not_exists=want.name is not None))
             continue
         matched.add(found.name)
         if found.unique != want.unique:
@@ -1062,6 +1064,14 @@ GATHER_META = "select pg_catalog.regather_graphmeta()"
 
 A write, and not a cheap one on a large graph, which is why nothing calls it without being asked.
 It covers every graph in the database, not only the one it is called for.
+"""
+
+SCHEMA_LOCK_QUERY = "select pg_advisory_xact_lock(hashtextextended(%s, 0))"
+"""Take a graph's schema lock for the rest of the transaction; bound with ``agensgraph:schema:<graph>``.
+
+A transaction-scoped advisory lock, so a failure or a lost connection releases it. The key is a
+64-bit hash of a name that says whose lock it is, so it does not collide with an application's own
+advisory locks.
 """
 
 AUTO_GATHER_QUERY = "select current_setting('auto_gather_graphmeta', true)"
