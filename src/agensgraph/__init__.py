@@ -71,6 +71,7 @@ from .types import GraphId as GraphId
 from .types import Label as Label
 from .types import Path as Path
 from .types import Vertex as Vertex
+from .vector import Bits as Bits
 from .vector import Distance as Distance
 from .vector import SparseVector as SparseVector
 from .vector import Vector as Vector
@@ -84,6 +85,7 @@ __all__ = [
     "AsyncConnectionPool",
     "AsyncNullConnectionPool",
     "BatchFailed",
+    "Bits",
     "Capabilities",
     "Check",
     "CommitOutcome",

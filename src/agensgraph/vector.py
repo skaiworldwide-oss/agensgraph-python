@@ -38,12 +38,13 @@ instead. The operator class serves the operator being searched with: ``vector_co
 from __future__ import annotations
 
 import enum
+import functools
 import re
 import struct
 import sys
 from array import array
 from collections.abc import Mapping, Sequence
-from typing import TYPE_CHECKING, NamedTuple, overload
+from typing import TYPE_CHECKING, Any, NamedTuple, overload
 
 import msgspec
 from psycopg.adapt import Dumper, Loader
@@ -59,13 +60,18 @@ if TYPE_CHECKING:
     from .introspect import Index
 
 __all__ = [
+    "BIT_OID",
     "SEARCH_OPTIONS",
     "TYPES",
+    "VARBIT_OID",
+    "VECTOR_TYPES_QUERY",
+    "Bits",
     "Distance",
     "SparseVector",
     "Vector",
     "VectorIndex",
     "accept",
+    "accept_bits",
     "check_search_option",
     "dense_dumper",
     "describe_vector_index",
@@ -75,6 +81,7 @@ __all__ = [
     "parse_vector_values",
     "search_option_statements",
     "vector_index",
+    "vector_type_infos",
 ]
 
 TYPES = ("vector", "halfvec", "sparsevec")
@@ -163,6 +170,71 @@ def parse_vector_text(text: str | bytes, *, half: bool = False) -> list[float]:
     return parse_vector_values(text, half=half).tolist()
 
 
+def _single_precision(values: Iterable[float]) -> array[float]:
+    """The numbers as singles, copied in C when they arrive already packed.
+
+    A numpy array, an ``array.array`` and anything else with the buffer protocol hold their numbers
+    packed. Copying that buffer is one ``memcpy``; iterating it makes a Python float of every
+    number first. Measured on 1536 dimensions from a numpy array of singles: 51.8 µs iterated, about
+    a microsecond copied. Doubles are copied and then narrowed in C. Halves and integers are read
+    through the buffer's own ``tolist``, which is still C; a byte order other than the machine's,
+    which that cannot read, is iterated like any other sequence.
+    """
+    if isinstance(values, array):
+        return array("f", values)
+    try:
+        view = memoryview(values)  # type: ignore[arg-type]
+    except TypeError:
+        return array("f", values)
+    with view:
+        if view.ndim != 1:
+            raise ValueError(f"a vector has one dimension, got a buffer of {view.ndim}")
+        packed = view.cast("B") if view.c_contiguous else view.tobytes()
+        if view.format == "f":
+            singles = array("f")
+            singles.frombytes(packed)
+            return singles
+        if view.format == "d":
+            doubles = array("d")
+            doubles.frombytes(packed)
+            return array("f", doubles)
+        try:
+            return array("f", view.tolist())
+        except NotImplementedError:
+            pass
+    return array("f", values)
+
+
+_encode_numbers = msgspec.json.Encoder().encode
+
+
+def _vector_text(obj: Vector) -> bytes:
+    """``[1.0,2.5]``, which is JSON and so written by the same C encoder the property map is.
+
+    Each single widens to a double exactly, and the shortest decimal for that double reads back to
+    the same single, so nothing is lost on the way to the server.
+    """
+    return _encode_numbers(obj.values.tolist())
+
+
+def _half_bytes(obj: Vector) -> bytes:
+    """The half-precision wire form: the dimension, two unused bytes, then two bytes a number."""
+    values = obj.values
+    return struct.pack(f">HH{len(values)}e", len(values), 0, *values)
+
+
+def _sparse_bytes(obj: SparseVector) -> bytes:
+    """The sparse wire form: dimension, count, an unused word, the indices, then the values.
+
+    The indices go as this driver holds them, counted from zero, which is what the binary form
+    counts from too.
+    """
+    stored = len(obj.indices)
+    return _SPARSE_HEADER.pack(obj.dimensions, stored, 0) + struct.pack(
+        f">{stored}i{stored}f", *obj.indices, *obj.values
+    )
+
+
 class VectorLoader(Loader):
     """Read ``[1,2,3]``, without parsing it yet."""
 
@@ -205,25 +277,41 @@ class HalfVectorBinaryLoader(Loader):
 
 
 def accept(context: AdaptContext, info: TypeInfo) -> None:
-    """Read one vector type, whose oid has just been looked up.
+    """Read and send one vector type, whose oid has just been looked up.
 
     Looking it up is what has to be awaited on an awaiting connection, so that half lives on the
     connection and this half -- which waits for nothing -- lives here in one copy.
+
+    Of two dumpers registered for one class, the later answers ``%s``; both answer the
+    placeholder naming their format, ``%t`` or ``%b``. A dumper registered for no class answers
+    only a ``COPY`` told its column types with ``set_types``.
     """
     info.register(context)
     adapters = context.adapters
     if info.name == "sparsevec":
         adapters.register_loader(info.oid, SparseVectorLoader)
         adapters.register_loader(info.oid, SparseVectorBinaryLoader)
+        # The type itself for %b, which a SQL column of the type needs; text last, so that %s
+        # stays text, which a Cypher property position needs. See SparseVectorDumper.
+        adapters.register_dumper(SparseVector, _typed(_SparseVectorBinaryDumper, info.oid))
         adapters.register_dumper(SparseVector, SparseVectorDumper)
+        adapters.register_dumper(None, _typed(_SparseVectorTextDumper, info.oid))
         return
     half = info.name == "halfvec"
     adapters.register_loader(info.oid, HalfVectorLoader if half else VectorLoader)
     adapters.register_loader(info.oid, HalfVectorBinaryLoader if half else VectorBinaryLoader)
-    if not half:
-        # Sending is where the cost is, so the one type most things send gets a dumper that
-        # packs rather than formats. Built here because the oid is only known now.
-        adapters.register_dumper(Vector, dense_dumper(info.oid))
+    if half:
+        # For COPY alone. A Vector sent with %s stays a vector, half or not: pgvector casts a
+        # vector to halfvec implicitly but not back, so a half value compared with a vector column
+        # would turn the column into halves and leave its index unused.
+        adapters.register_dumper(None, _typed(_VectorTextDumper, info.oid))
+        adapters.register_dumper(None, _typed(_HalfVectorBinaryDumper, info.oid))
+        return
+    # Text first and binary last, so that %s sends the bytes. Sending is where the cost is, so
+    # the type most things send packs rather than formats. Built here because the oid is only
+    # known now.
+    adapters.register_dumper(Vector, _typed(_VectorTextDumper, info.oid))
+    adapters.register_dumper(Vector, dense_dumper(info.oid))
 
 
 class Distance(enum.StrEnum):
@@ -324,7 +412,9 @@ class Vector:
         object.__setattr__(self, "_half", half)
         object.__setattr__(self, "_raw", None)
         object.__setattr__(self, "_text", None)
-        object.__setattr__(self, "_values", None if values is None else array("f", values))
+        object.__setattr__(
+            self, "_values", None if values is None else _single_precision(values)
+        )
 
     @classmethod
     def from_wire(cls, raw: bytes, *, half: bool = False) -> Vector:
@@ -881,32 +971,191 @@ class SparseVectorDumper(Dumper):
     reason. Left untyped it would be worked out as jsonb in a Cypher property position and parsed
     as JSON, which it is not. Declared text it goes both ways: a SQL position casts it explicitly,
     and a property position converts it to a JSON string that the generated column then casts --
-    which is exactly what a hand-written literal does.
+    which is exactly what a hand-written literal does. A SQL column of the type itself takes
+    ``%b``, which sends the type, or ``%s::sparsevec``.
+
+    The text type is declared on each dumper rather than on the class. On the class it would also
+    make this the dumper for every ``text`` column of a ``COPY`` told its types, and a string sent
+    there would be handed to this.
     """
 
     format = Format.TEXT
-    oid = TEXT_OID
+
+    def __init__(self, cls: type, context: AdaptContext | None = None) -> None:
+        super().__init__(cls, context)
+        self.oid = TEXT_OID
 
     def dump(self, obj: SparseVector) -> bytes:
         return obj.to_text().encode()
 
 
-def dense_dumper(oid: int) -> type[Dumper]:
-    """A dumper that sends a :class:`Vector` as bytes, for the oid this database gave it.
+class _VectorTextDumper(Dumper):
+    """``[1.0,2.5]``, for ``%t``, a list of vectors, and a text ``COPY``."""
+
+    format = Format.TEXT
+
+    def dump(self, obj: Vector) -> bytes:
+        return _vector_text(obj)
+
+
+class _VectorBinaryDumper(Dumper):
+    format = Format.BINARY
+
+    def dump(self, obj: Vector) -> bytes:
+        return obj.to_bytes()
+
+
+class _HalfVectorBinaryDumper(Dumper):
+    format = Format.BINARY
+
+    def dump(self, obj: Vector) -> bytes:
+        return _half_bytes(obj)
+
+
+class _SparseVectorBinaryDumper(Dumper):
+    format = Format.BINARY
+
+    def dump(self, obj: SparseVector) -> bytes:
+        return _sparse_bytes(obj)
+
+
+class _SparseVectorTextDumper(Dumper):
+    format = Format.TEXT
+
+    def dump(self, obj: SparseVector) -> bytes:
+        return obj.to_text().encode()
+
+
+@functools.cache
+def _typed(base: type[Dumper], oid: int) -> type[Dumper]:
+    """A dumper declaring the oid this database gave a vector type.
 
     Built per registration rather than written out, because the type's oid belongs to the extension
     and is not known until it has been looked up -- the same reason the composite loaders for the
     graph types are built per connection.
+    graph types are built per connection. Kept once made: a database's oids do not change, and the
+    dumpers hold nothing of their own, so every connection to it can share them.
+    """
+    return type(base.__name__, (base,), {"oid": oid})
+
+
+def dense_dumper(oid: int) -> type[Dumper]:
+    """A dumper that sends a :class:`Vector` as bytes, for the oid this database gave it."""
+    return _typed(_VectorBinaryDumper, oid)
+
+
+BIT_OID = 1560
+VARBIT_OID = 1562
+"""PostgreSQL's own bit string types, whose oids, unlike the vector types', are fixed."""
+
+_BIT_LENGTH = struct.Struct(">i")
+
+
+class Bits(str):
+    """A bit string: what binary quantisation produces and :attr:`Distance.HAMMING` and
+    :attr:`Distance.JACCARD` measure.
+
+    A string of ``0`` and ``1`` -- so it is equal to the text the server prints, and to a bit
+    string read without :func:`accept_bits` -- sent as the ``bit`` type rather than as
+    text, so ``binary_quantize(embedding) <~> %s`` needs no cast. Its length is its own: ``bit``
+    with no length declared takes any.
     """
 
-    class _DenseVectorBinaryDumper(Dumper):
-        format = Format.BINARY
+    __slots__ = ()
 
-        def dump(self, obj: Vector) -> bytes:
-            return obj.to_bytes()
+    def __new__(cls, value: str | Iterable[bool | int] = "") -> Bits:
+        text = (
+            value if isinstance(value, str) else "".join("1" if bit else "0" for bit in value)
+        )
+        if text.strip("01"):
+            raise ValueError(f"a bit string holds only 0 and 1, got {text!r}")
+        return super().__new__(cls, text)
 
-    _DenseVectorBinaryDumper.oid = oid
-    return _DenseVectorBinaryDumper
+    @classmethod
+    def from_bytes(cls, data: bytes, length: int) -> Bits:
+        """The first *length* bits of *data*, most significant first, as the server sends them."""
+        if length < 0 or length > len(data) * 8:
+            raise ValueError(f"{length} bits do not fit in {len(data)} bytes")
+        whole = format(int.from_bytes(data, "big"), f"0{len(data) * 8}b") if data else ""
+        return cls(whole[:length])
+
+    def to_bytes(self) -> bytes:
+        """The bits packed most significant first, the last byte padded with zeros."""
+        if not self:
+            return b""
+        return (int(self, 2) << (-len(self) % 8)).to_bytes((len(self) + 7) // 8, "big")
+
+    def __repr__(self) -> str:
+        return f"Bits({str(self)!r})"
+
+
+class _BitsLoader(Loader):
+    format = Format.TEXT
+
+    def load(self, data: Buffer) -> Bits:
+        return Bits(bytes(data).decode())
+
+
+class _BitsBinaryLoader(Loader):
+    """The length in bits, then the bits packed most significant first."""
+
+    format = Format.BINARY
+
+    def load(self, data: Buffer) -> Bits:
+        raw = bytes(data)
+        (length,) = _BIT_LENGTH.unpack_from(raw, 0)
+        return Bits.from_bytes(raw[_BIT_LENGTH.size :], length)
+
+
+class _BitsDumper(Dumper):
+    format = Format.TEXT
+    oid = BIT_OID
+
+    def dump(self, obj: Bits) -> bytes:
+        return str(obj).encode()
+
+
+class _BitsBinaryDumper(Dumper):
+    format = Format.BINARY
+    oid = BIT_OID
+
+    def dump(self, obj: Bits) -> bytes:
+        return _BIT_LENGTH.pack(len(obj)) + obj.to_bytes()
+
+
+def accept_bits(context: AdaptContext) -> None:
+    """Read ``bit`` and ``bit varying`` as :class:`Bits`, and send a :class:`Bits` as ``bit``.
+
+    Done by :meth:`~agensgraph.Connection.register_vectors`, with the types a bit string is
+    measured against, rather than on every connection, so a connection that never asked reads a
+    bit string as text.
+    """
+    adapters = context.adapters
+    for oid in (BIT_OID, VARBIT_OID):
+        adapters.register_loader(oid, _BitsLoader)
+        adapters.register_loader(oid, _BitsBinaryLoader)
+    # Text first and binary last, so %s sends the packed form.
+    adapters.register_dumper(Bits, _BitsDumper)
+    adapters.register_dumper(Bits, _BitsBinaryDumper)
+
+
+VECTOR_TYPES_QUERY = """
+select t.typname, t.oid, t.typarray, t.oid::regtype::text, t.typdelim
+from unnest(%s::text[]) with ordinality as n(name, position)
+join pg_catalog.pg_type t on t.oid = pg_catalog.to_regtype(n.name)
+order by n.position
+"""
+"""Every vector type created here, in one round trip rather than one per type."""
+
+
+def vector_type_infos(rows: Iterable[Sequence[Any]]) -> list[TypeInfo]:
+    """The rows of :data:`VECTOR_TYPES_QUERY` as psycopg describes a type."""
+    from psycopg.types import TypeInfo
+
+    return [
+        TypeInfo(name, int(oid), int(array_oid), regtype=regtype, delimiter=delim)
+        for name, oid, array_oid, regtype, delim in rows
+    ]
 
 
 class VectorIndex(NamedTuple):

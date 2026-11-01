@@ -1312,18 +1312,19 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
         Worth doing when a property has been given a column of its own. Such a property arrives as
         that column's type, and with no loader for it a vector arrives as the *string* it prints
         as -- where the same property left in the property map arrives as a list of numbers.
-        """
-        from psycopg.types import TypeInfo
 
-        from .vector import TYPES, accept
+        Every type is looked up in one statement. Where any is found, ``bit`` is read and sent as
+        :class:`~agensgraph.vector.Bits` as well, since that is what a quantised vector is and
+        what its Hamming and Jaccard distances measure.
+        """
+        from .vector import TYPES, VECTOR_TYPES_QUERY, accept, accept_bits, vector_type_infos
 
         found: list[str] = []
-        for name in TYPES:
-            info = await TypeInfo.fetch(self, name)
-            if info is None:
-                continue
+        for info in vector_type_infos(await self._fetch(VECTOR_TYPES_QUERY, (list(TYPES),))):
             accept(self, info)
-            found.append(name)
+            found.append(info.name)
+        if found:
+            accept_bits(self)
         return tuple(found)
 
     async def has_vectors(self) -> bool:
