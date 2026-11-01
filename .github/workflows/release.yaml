@@ -1,10 +1,16 @@
 name: Release
 
-# A tag `v<version>` builds both distributions from that commit and makes the GitHub release
-# carrying the notes and the files.
+# A tag `v<version>` builds both distributions from that commit, publishes them to TestPyPI and then
+# PyPI, and makes the GitHub release carrying the notes and the files. A release candidate
+# (`v2.1.0rc1`, or an `a` or `b`) is published the same way and marked a prerelease on GitHub; pip
+# installs it only when asked for by version or with --pre.
+#
+# Publishing is trusted publishing: no token is stored. Each index needs this repository, this
+# workflow and the environment named below registered once as a trusted publisher -- `testpypi` on
+# test.pypi.org and `pypi` on pypi.org -- and the environments created in the repository's settings.
 #
 # The notes are `docs/release-notes/<version>.md` where somebody wrote them, and that version's
-# changelog section otherwise.
+# changelog section otherwise -- the final version's, for a candidate.
 
 on:
   push:
@@ -40,8 +46,38 @@ jobs:
           name: dist
           path: dist/
 
-  github:
+  # The same files to TestPyPI first, so a broken upload -- metadata the index refuses, a name
+  # taken -- is found before anything is on the real index, where a version can never be reused.
+  testpypi:
     needs: build
+    runs-on: ubuntu-latest
+    environment: testpypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+
+  pypi:
+    needs: testpypi
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  github:
+    needs: pypi
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -53,18 +89,21 @@ jobs:
           path: dist/
 
       # Written notes if there are any, else this version's section of the changelog, from its
-      # heading to the next one.
+      # heading to the next one. A candidate has no section of its own and is described by the
+      # section of the version it is a candidate for.
       - name: Release notes
         run: |
           version="${GITHUB_REF_NAME#v}"
+          final=$(echo "$version" | sed -E 's/(a|b|rc)[0-9]+$//')
           written="docs/release-notes/${version}.md"
+          [ -f "$written" ] || written="docs/release-notes/${final}.md"
           if [ -f "$written" ]; then
             echo "notes from $written"
             cp "$written" notes.md
           else
-            echo "notes from the ${version} section of CHANGELOG.md"
-            awk -v v="$version" '
-              /^## / { printing = index($0, "## " v) == 1 }
+            echo "notes from the ${final} section of CHANGELOG.md"
+            awk -v v="$final" '
+              /^## / { printing = index($0, "## " v " ") == 1 }
               printing { print }
             ' CHANGELOG.md > notes.md
           fi
@@ -73,4 +112,9 @@ jobs:
       - name: GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --notes-file notes.md
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          prerelease=""
+          if echo "$version" | grep -qE '(a|b|rc)[0-9]+$'; then prerelease="--prerelease"; fi
+          gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" \
+            --notes-file notes.md $prerelease

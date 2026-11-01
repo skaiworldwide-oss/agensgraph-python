@@ -45,12 +45,19 @@ registry.register("postgresql.agensgraph", __name__, "AgensGraphDialect")
 
 @pytest.fixture
 def engine(dsn: str):  # type: ignore[no-untyped-def]
-    """An engine over this driver, from the same connection string the tests use."""
+    """An engine over this driver, from the same connection string the tests use.
+
+    The password goes into the URL too: a server that asks for one refuses the engine otherwise,
+    which only a server trusting every local connection would hide.
+    """
+    from urllib.parse import quote
+
     from psycopg.conninfo import conninfo_to_dict
 
     parts = conninfo_to_dict(dsn)
+    secret = f":{quote(str(parts['password']), safe='')}" if parts.get("password") else ""
     url = (
-        f"postgresql+agensgraph://{parts.get('user', '')}@"
+        f"postgresql+agensgraph://{quote(str(parts.get('user', '')), safe='')}{secret}@"
         f"{parts.get('host', 'localhost')}:{parts.get('port', 5432)}/{parts.get('dbname', '')}"
     )
     made = create_engine(url)

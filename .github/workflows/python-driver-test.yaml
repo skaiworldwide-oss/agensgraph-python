@@ -11,17 +11,19 @@ on:
     paths-ignore:
       - 'README.md'
       - 'VERSION.md'
+  workflow_dispatch:
 
 jobs:
-  # Everything that needs no server, on every version claimed to be supported. Kept apart from
-  # the job below so a lint or typing failure is reported in seconds rather than after a
-  # half-hour server build.
+  # Everything that needs no server, on every version claimed to be supported, on amd64 and arm64
+  # natively. Kept apart from the server suites so a lint or typing failure is reported in seconds.
   checks:
-    runs-on: ubuntu-latest
+    name: checks (${{ matrix.python-version }}, ${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         python-version: ['3.11', '3.12', '3.13', '3.14']
+        runner: ['ubuntu-latest', 'ubuntu-24.04-arm']
 
     steps:
       - uses: actions/checkout@v4
@@ -89,9 +91,14 @@ jobs:
             timeout-*
             oom-*
 
-  # A declared floor is only a claim until something resolves to it.
+  # A declared floor is only a claim until something resolves to it, on each architecture.
   lowest-versions:
-    runs-on: ubuntu-latest
+    name: lowest-versions (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ['ubuntu-latest', 'ubuntu-24.04-arm']
     steps:
       - uses: actions/checkout@v4
         with:
@@ -106,7 +113,12 @@ jobs:
   # source distribution built away from the tags can still carry a wrong version. Neither is found
   # except by installing what would actually be published.
   package:
-    runs-on: ubuntu-latest
+    name: package (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ['ubuntu-latest', 'ubuntu-24.04-arm']
     steps:
       - uses: actions/checkout@v4
         with:
@@ -137,156 +149,98 @@ jobs:
           VIRTUAL_ENV=/tmp/from-sdist uv pip install dist/*.tar.gz
           VIRTUAL_ENV=/tmp/from-sdist uv run python -c "import agensgraph; print(agensgraph.__version__)"
 
-  # The full suite, against a server built from the engine's own tree.
-  against-a-server:
-    runs-on: ubuntu-latest
+  # The full suite against every release the driver supports, each from its published image plus
+  # pgvector. Running the same suite against all of them is what checks the version gates: a test
+  # that needs something only the newest has, and does not say so, fails on the older ones instead
+  # of passing everywhere by accident.
+  #
+  # Each release runs on amd64 and arm64. The image is built in every run, for the runner's own
+  # architecture -- every base is multi-arch, so there is no emulation -- and never published. The
+  # build cache makes a warm build a few seconds; a cold one is about 35, almost all of it
+  # installing a compiler.
+  against-a-release:
+    name: against ${{ matrix.release }} (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
-        # Every server the driver says it reads, each on its own PostgreSQL base. Running the same
-        # suite against all of them is what checks the version gates: a test that needs something
-        # only the newest has, and does not say so, fails on the older ones instead of passing
-        # everywhere by accident.
-        #
-        # A line, not a branch: the engine names a release branch after the PostgreSQL minor it
-        # carries (v2.17.10, v2.18.6), so the branch for a line moves at every minor merge.
-        engine: ["2.17", "2.18", "main"]
-    name: against-a-server (${{ matrix.engine }})
+        release: ['2.14.1', '2.15.0', '2.16.0', '2.17.0', '2.18.4.0', '2.18.6.1']
+        runner: ['ubuntu-latest', 'ubuntu-24.04-arm']
+        include:
+          - {release: '2.14.1', python: '3.11'}
+          - {release: '2.15.0', python: '3.13'}
+          - {release: '2.16.0', python: '3.13'}
+          - {release: '2.17.0', python: '3.13'}
+          - {release: '2.18.4.0', python: '3.13'}
+          - {release: '2.18.6.1', python: '3.14'}
+    env:
+      # The image's superuser: postgres up to 2.17, agens from 2.18.
+      AG_USER: ${{ startsWith(matrix.release, '2.18') && 'agens' || 'postgres' }}
     steps:
-      - name: Find the engine's latest commit
-        run: |
-          repo=https://github.com/skaiworldwide-oss/agensgraph.git
-          if [ "${{ matrix.engine }}" = main ]; then
-            branch=main
-          else
-            # sort -V and not sort, so v2.18.10 lands above v2.18.6 rather than below it.
-            branch=$(git ls-remote --heads "$repo" "refs/heads/v${{ matrix.engine }}.*" \
-                       | sed 's#.*refs/heads/##' | sort -V | tail -1)
-            test -n "$branch" || {
-              echo "no release branch for AgensGraph ${{ matrix.engine }}"; exit 1; }
-          fi
-          hash=$(git ls-remote "$repo" "refs/heads/$branch" | awk '{print $1}')
-          test -n "$hash" || { echo "no branch $branch"; exit 1; }
-          echo "AgensGraph ${{ matrix.engine }} is branch $branch at $hash"
-          echo "AG_BRANCH=$branch" >> $GITHUB_ENV
-          echo "AG_COMMIT_HASH=$hash" >> $GITHUB_ENV
-
-      # Resolved rather than pinned, so the build tracks pgvector's releases the way it already
-      # tracks the engine's commits. Both go in the cache key: the extension is installed into the
-      # engine's prefix, so a cached prefix built before either moved is the wrong prefix.
-      - name: Find pgvector's latest release
-        run: |
-          tag=$(git ls-remote --tags --refs --sort=-v:refname \
-                  https://github.com/pgvector/pgvector.git | head -1 | sed 's#.*/##')
-          test -n "$tag"
-          echo "PGVECTOR_TAG=$tag" >> $GITHUB_ENV
-
-      - name: Cache the build
-        uses: actions/cache@v4
-        id: agcache
-        with:
-          path: ~/agensgraph_build
-          key: ${{ runner.os }}-v3-agensgraph-${{ matrix.engine }}-${{ env.AG_COMMIT_HASH }}-pgvector-${{ env.PGVECTOR_TAG }}
-
-      - name: System dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential libreadline-dev zlib1g-dev flex bison \
-            python3-dev libpq-dev git
-
-      - name: Build the engine
-        if: steps.agcache.outputs.cache-hit != 'true'
-        run: |
-          git clone --depth 1 --branch "$AG_BRANCH" \
-            https://github.com/skaiworldwide-oss/agensgraph.git ~/agensgraph_source
-          cd ~/agensgraph_source
-          ./configure --prefix=$HOME/agensgraph_build
-          make -j$(nproc)
-          make install
-
-      # Built against the engine that was just installed, not against a system PostgreSQL, so the
-      # extension links to the server it will be loaded into. OPTFLAGS is emptied because pgvector
-      # compiles with -march=native by default, which builds for whichever runner happened to run
-      # the build and can then fault on the one that restores the cache.
-      - name: Build pgvector against it
-        if: steps.agcache.outputs.cache-hit != 'true'
-        run: |
-          git clone --depth 1 --branch "$PGVECTOR_TAG" \
-            https://github.com/pgvector/pgvector.git ~/pgvector_source
-          cd ~/pgvector_source
-          make -j$(nproc) OPTFLAGS="" PG_CONFIG="$HOME/agensgraph_build/bin/pg_config"
-          make install OPTFLAGS="" PG_CONFIG="$HOME/agensgraph_build/bin/pg_config"
-
-      - name: Start it
-        run: |
-          echo "LD_LIBRARY_PATH=$HOME/agensgraph_build/lib:$LD_LIBRARY_PATH" >> $GITHUB_ENV
-          echo "PATH=$HOME/agensgraph_build/bin:$PATH" >> $GITHUB_ENV
-          mkdir -p "$HOME/agens_data"
-          $HOME/agensgraph_build/bin/initdb -D "$HOME/agens_data" -A trust
-          $HOME/agensgraph_build/bin/ag_ctl start -D "$HOME/agens_data" \
-            -l "$HOME/agens_data/server.log"
-          for _ in $(seq 30); do
-            $HOME/agensgraph_build/bin/pg_isready -q && break
-            sleep 1
-          done
-          $HOME/agensgraph_build/bin/createdb agensgraph_test
-
-      # The extension is created per database, so this runs on every build and not only on a cache
-      # miss. Asserted afterwards for the same reason the DSN is: the vector suite asks the server
-      # whether the type is there and skips itself when it is not, so an extension that failed to
-      # install would turn that whole half of the file into a silent pass.
-      - name: Vectors, in the database the suite uses
-        run: |
-          $HOME/agensgraph_build/bin/psql -d agensgraph_test -c "CREATE EXTENSION vector"
-          found=$($HOME/agensgraph_build/bin/psql -d agensgraph_test -tAc \
-            "SELECT count(*) FROM pg_type WHERE typname IN ('vector', 'sparsevec')")
-          test "$found" = "2" || { echo "expected the vector and sparsevec types, found $found"; exit 1; }
-          $HOME/agensgraph_build/bin/psql -d agensgraph_test -tAc \
-            "SELECT extname || ' ' || extversion FROM pg_extension WHERE extname = 'vector'"
-
-      # Every version gate in the suite reads `agversion`, so a build of the wrong branch would
-      # test the wrong thing without saying so -- a cache key that collided, or a line resolved to
-      # a branch belonging to another one. A release branch has to report its own line; `main` may
-      # report anything. Only the line is asserted: 2.17 reports `2.17.0` and 2.18 reports
-      # `2.18.6.0` or `2.18.6.0-rcN` depending on where the branch stands against its release.
-      - name: Which server this is
-        run: |
-          reported=$($HOME/agensgraph_build/bin/psql -d agensgraph_test -tAc \
-            "SELECT current_setting('agversion')")
-          echo "branch $AG_BRANCH reports agversion $reported"
-          wanted=${{ matrix.engine }}
-          if [ "$wanted" != main ] && [ "${reported#"$wanted"}" = "$reported" ]; then
-            echo "expected an agversion beginning $wanted"
-            exit 1
-          fi
-
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build the test image
+        uses: docker/build-push-action@v6
+        with:
+          context: tests/images
+          build-args: |
+            BASE=skaiworldwide/agensgraph:v${{ matrix.release }}-bookworm
+            AGVERSION=${{ matrix.release }}
+          tags: agensgraph-test:${{ matrix.release }}
+          load: true
+          push: false
+          cache-from: type=gha,scope=agensgraph-test-${{ matrix.release }}-${{ runner.arch }}
+          cache-to: type=gha,mode=max,scope=agensgraph-test-${{ matrix.release }}-${{ runner.arch }}
+
+      # Healthy means the server answers *and* reports the release the image was built for, so a
+      # mislabelled base fails here instead of testing the wrong line.
+      - name: Start it
+        run: |
+          docker run -d --name agensgraph -e POSTGRES_PASSWORD=agens -p 5432:5432 \
+            agensgraph-test:${{ matrix.release }}
+          for _ in $(seq 90); do
+            status=$(docker inspect -f '{{.State.Health.Status}}' agensgraph)
+            [ "$status" = healthy ] && break
+            sleep 1
+          done
+          [ "$status" = healthy ] || { docker logs agensgraph | tail -50; exit 1; }
+          docker exec agensgraph psql -U "$AG_USER" -d postgres -qc 'CREATE DATABASE drv_test'
+          found=$(docker exec agensgraph psql -U "$AG_USER" -d drv_test -tAc \
+            "SELECT count(*) FROM pg_type WHERE typname IN ('vector', 'halfvec', 'sparsevec')")
+          test "$found" = "3" || { echo "expected the three vector types, found $found"; exit 1; }
 
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
 
       - name: Install
-        run: uv sync --group dev --all-extras
+        run: uv sync --group dev --all-extras --python ${{ matrix.python }}
 
       # A test needing a server skips itself when this variable is absent, so a job that lost it
       # would report a clean pass over the half of the suite that matters. Reaching the server is
-      # therefore checked before the suite runs -- an unset variable and an unreachable server
-      # both stop the job here rather than turning into several hundred quiet skips.
+      # checked first, and afterwards no test may have skipped for a reason that means the job
+      # itself was set up wrong: no second role, or no vectors.
       - name: The full suite, against the server
         env:
-          AGENSGRAPH_TEST_DSN: host=localhost dbname=agensgraph_test
+          AGENSGRAPH_TEST_DSN: host=127.0.0.1 port=5432 user=${{ env.AG_USER }} password=agens dbname=drv_test
         run: |
           uv run python - <<'EOF'
           import os
           import agensgraph
           with agensgraph.connect(os.environ["AGENSGRAPH_TEST_DSN"]) as conn:
-              print("reached", conn.capabilities.reported, "with", len(agensgraph.__all__), "names")
+              print("reached", conn.capabilities.reported)
           EOF
-          uv run python -X dev -W error -m pytest -q
+          # pipefail: the default shell is bash -e without it, and tee would hide a failure.
+          set -o pipefail
+          uv run python -X dev -W error -m pytest -q -rs | tee pytest.log
+          if grep -E "connect as another role|vector extension is not created" pytest.log; then
+            echo "tests skipped because this job was set up wrong"; exit 1
+          fi
 
       - name: The server's own log, if anything failed
         if: failure()
-        run: tail -100 "$HOME/agens_data/server.log"
+        run: docker logs agensgraph 2>&1 | tail -100
