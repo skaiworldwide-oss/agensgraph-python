@@ -130,7 +130,16 @@ class Retryability(enum.Enum):
     """The server is short of something. Run it again, later than usual."""
 
     RESET_STATE = "reset_state"
-    """Session state the statement relied on is gone. Clear it and keep the connection."""
+    """A prepared statement the server no longer has. Empty the statement cache, keep the
+    connection."""
+
+    REFRESH_LABELS = "refresh_labels"
+    """The label table no longer describes the graph. Read it again, keep the connection.
+
+    Apart from :attr:`RESET_STATE` because emptying the statement cache does nothing for a label
+    made since the table was read, and reading the labels again does nothing for a lost prepared
+    statement. :meth:`~agensgraph.Connection.recover` does whichever is asked.
+    """
 
     UNKNOWN = "unknown"
     """Whether the transaction committed is not known. Resolve it before deciding."""
@@ -159,6 +168,11 @@ class Retryability(enum.Enum):
         return self is Retryability.RESET_STATE
 
     @property
+    def refreshes_labels(self) -> bool:
+        """Whether the label table has to be read again first."""
+        return self is Retryability.REFRESH_LABELS
+
+    @property
     def wants_longer_delay(self) -> bool:
         """Whether the usual delay is too short, because the server is the constraint."""
         return self is Retryability.BACKPRESSURE
@@ -170,10 +184,16 @@ _RETRYABLE = frozenset(
         Retryability.RECONNECT,
         Retryability.BACKPRESSURE,
         Retryability.RESET_STATE,
+        Retryability.REFRESH_LABELS,
     }
 )
 _KEEPS_CONNECTION = frozenset(
-    {Retryability.SAFE, Retryability.BACKPRESSURE, Retryability.RESET_STATE}
+    {
+        Retryability.SAFE,
+        Retryability.BACKPRESSURE,
+        Retryability.RESET_STATE,
+        Retryability.REFRESH_LABELS,
+    }
 )
 
 _BY_STATE: dict[str, Retryability] = {
@@ -507,7 +527,7 @@ _OURS: tuple[tuple[type[BaseException], Retryability], ...] = (
     # unknown: nothing was done. Whether there is budget left for another attempt is the
     # caller's loop to answer and not this.
     (_Expired, Retryability.SAFE),
-    (StaleLabelCache, Retryability.RESET_STATE),
+    (StaleLabelCache, Retryability.REFRESH_LABELS),
     (StaleGeneration, Retryability.RECONNECT),
     (UnresolvedCommit, Retryability.UNKNOWN),
     (ConfigurationError, Retryability.FATAL),

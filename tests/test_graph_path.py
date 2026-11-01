@@ -177,9 +177,8 @@ class TestTheTableFollowsTheSession:
 class TestABinaryReadAfterTheSessionMoves:
     """The defect this exists to prevent: a vertex of one graph named from another's table."""
 
-    def test_it_refuses_rather_than_naming_the_wrong_label(
-        self, agens, second_graph: str
-    ) -> None:  # type: ignore[no-untyped-def]
+    def test_it_names_the_label_from_the_graph_it_read(self, agens, second_graph: str) -> None:  # type: ignore[no-untyped-def]
+        """The table the driver held is for the first graph; it reads the second's, not guesses."""
         agens.execute("create vlabel person")
         agens.refresh_labels()
         agens.execute(f'set graph_path = "{second_graph}"')
@@ -187,8 +186,9 @@ class TestABinaryReadAfterTheSessionMoves:
         assert [r[0].label for r in agens.execute_query("match (n) return n").records] == [
             "account"
         ]
-        with pytest.raises(StaleLabelCache, match="refresh_labels"):
-            agens.execute_query("match (n) return n", binary_=True)
+        found = agens.execute_query("match (n) return n", binary_=True).records
+        assert [r[0].label for r in found] == ["account"]
+        assert agens.label_table.graph == second_graph
 
     def test_refresh_labels_is_the_way_back_without_naming_the_graph(
         self, agens, second_graph: str
@@ -295,11 +295,10 @@ class TestRollingBackTheGraphPath:
                 assert conn.label_table.graph == second_graph
                 raise psycopg.Rollback
             assert conn.label_table.graph is None
-            with pytest.raises(StaleLabelCache, match="refresh_labels"):
-                conn.execute_query("match (n) return n", binary_=True)
-            conn.refresh_labels()
+            # The table is read again for the graph the rollback put back, so the rows decode.
             (vertex,) = conn.execute_query("match (n) return n", binary_=True).records[0]
             assert vertex.label == "person"
+            assert conn.label_table.graph == first
             conn.rollback()
 
     def test_a_block_rolled_back_to_a_savepoint_drops_the_table_too(

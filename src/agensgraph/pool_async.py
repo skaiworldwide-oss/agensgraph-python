@@ -38,6 +38,7 @@ that could not finish in what is left is turned away before a connection is take
 
 from __future__ import annotations
 
+import contextlib
 import inspect
 import threading
 from contextlib import asynccontextmanager
@@ -442,11 +443,22 @@ class AsyncConnectionPool:
             committing = False
             transaction_id: int | None = None
             try:
-                async with self.connection(deadline=budget) as conn, conn.transaction():
-                    done.append(await work(conn))
-                    if track_commit:
-                        transaction_id = await conn.transaction_id()
-                    committing = True
+                async with self.connection(deadline=budget) as conn:
+                    try:
+                        async with conn.transaction():
+                            done.append(await work(conn))
+                            if track_commit:
+                                transaction_id = await conn.transaction_id()
+                            committing = True
+                    except Exception as exc:
+                        # Before the connection goes back to the pool, which may hand it to the
+                        # next attempt: what the failure asks of it, such as a lost prepared
+                        # statement or a label table out of date. A connection that cannot be
+                        # helped is the next attempt's to replace.
+                        if not conn.closed:
+                            with contextlib.suppress(psycopg.Error):
+                                await conn.recover(exc)
+                        raise
                 policy.succeeded()
                 return done[0]
             except Exception as exc:

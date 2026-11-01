@@ -72,7 +72,15 @@ from .cypher import (
     wrap_for_cursor,
 )
 from .deadline import Deadline
-from .errors import BatchFailed, CapabilityError, ConfigurationError, NoEnclosingTransaction
+from .errors import (
+    BatchFailed,
+    CapabilityError,
+    ConfigurationError,
+    NoEnclosingTransaction,
+    Retryability,
+    StaleLabelCache,
+    retryability,
+)
 from .introspect import (
     CONSTRAINTS_FOR_LABEL,
     CONSTRAINTS_QUERY,
@@ -383,6 +391,24 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
         rows = self._fetch(self._label_statement(), (name,))
         self._accept_labels(name, rows)
 
+    def recover(self, failure: BaseException) -> Retryability:
+        """Do on this connection what a failure's category asks before another attempt.
+
+        :func:`~agensgraph.errors.retryability` names the category; this carries out the part of
+        it that belongs to the connection, so a caller running its own retry loop does the right
+        thing for each without knowing which is which. A prepared statement the server lost
+        (``RESET_STATE``, ``26000``) has the statement cache emptied, here and on the server, by
+        ``DEALLOCATE ALL``; a label table that no longer describes the graph (``REFRESH_LABELS``)
+        is read again. Any other category asks nothing of this connection, and nothing is sent.
+        The category is returned, so the loop can go on to the rest of what it says.
+        """
+        recovery = retryability(failure)
+        if recovery.clears_prepared_statements:
+            self.execute("deallocate all")
+        if recovery.refreshes_labels:
+            self.refresh_labels()
+        return recovery
+
     def refresh_labels(self) -> None:
         """Fill the label table again, for whichever graph the session is reading.
 
@@ -517,11 +543,28 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
                     before = self._counters()
                 cursor.execute(query, params, prepare=prepare_)
                 described = cursor.description
-                records = cursor.fetchall() if described is not None else []
+                records = self._read_all(cursor) if described is not None else []
                 keys = [column.name for column in described or ()]
                 oids = tuple(int(column.type_code) for column in described or ())
         after = self._counters() if counts_ else None
         return Result(records, keys, self._counts_for(text, before, after), oids)
+
+    def _read_all(self, cursor: psycopg.Cursor[Any]) -> list[Any]:
+        """Every row a cursor holds, decoded again once if it names a label the table lacks.
+
+        A label made by another session after the table was read, or a graph the session moved to
+        without the driver, leaves the composite rendering naming an id the table does not have.
+        The rows are already here, so the table is read again for the graph the session is on --
+        the one the statement read from -- and they are decoded again. The statement is not run a
+        second time. Rows that still name an unknown id raise
+        :class:`~agensgraph.errors.StaleLabelCache`.
+        """
+        try:
+            return cursor.fetchall()
+        except StaleLabelCache:
+            self.refresh_labels()
+            cursor.scroll(0, mode="absolute")
+            return cursor.fetchall()
 
     def can_run_server_programs(self) -> bool:
         """Whether this role could run a command on the server's host through ``COPY``.
@@ -1500,7 +1543,7 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
         gathered = []
         for cursor in cursors:
             described = cursor.description
-            records = cursor.fetchall() if described is not None else []
+            records = self._read_all(cursor) if described is not None else []
             keys = [column.name for column in described or ()]
             oids = tuple(int(column.type_code) for column in described or ())
             gathered.append(Result(records, keys, GraphWriteCounts.unknown(), oids))

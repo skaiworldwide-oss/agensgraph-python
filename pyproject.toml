@@ -11,7 +11,9 @@ license = "Apache-2.0"
 license-files = ["LICENSE"]
 dynamic = ["version"]
 dependencies = [
-    "psycopg[binary]>=3.3.4",
+    # 3.3.6 is the first to empty its statement cache when it sees DEALLOCATE ALL go past, which is
+    # how recover() gets a connection past a prepared statement the server lost.
+    "psycopg[binary]>=3.3.6",
     "psycopg-pool>=3.3.1",
     "msgspec>=0.19",
 ]

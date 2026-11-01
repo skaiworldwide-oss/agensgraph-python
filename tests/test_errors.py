@@ -144,7 +144,7 @@ def test_classification_of_failures_that_are_not_the_servers(
 @pytest.mark.parametrize(
     ("exc", "expected"),
     [
-        (E.StaleLabelCache.for_label(9, graph="g"), R.RESET_STATE),
+        (E.StaleLabelCache.for_label(9, graph="g"), R.REFRESH_LABELS),
         (E.UnresolvedCommit.for_transaction(7, reason="lost"), R.UNKNOWN),
         (E.ConfigurationError("a setting refused it"), R.FATAL),
         (E.CapabilityError.for_feature("x", required="2.18", found="2.17"), R.FATAL),
@@ -161,19 +161,25 @@ class TestRecoveryProperties:
     def test_only_the_undecided_and_the_hopeless_are_not_retryable(self) -> None:
         assert not R.UNKNOWN.is_retryable
         assert not R.FATAL.is_retryable
-        assert all(r.is_retryable for r in (R.SAFE, R.RECONNECT, R.BACKPRESSURE, R.RESET_STATE))
+        assert all(
+            r.is_retryable
+            for r in (R.SAFE, R.RECONNECT, R.BACKPRESSURE, R.RESET_STATE, R.REFRESH_LABELS)
+        )
 
     def test_exactly_one_recovery_replaces_the_connection(self) -> None:
         assert R.RECONNECT.needs_new_connection
         assert not R.RECONNECT.keeps_connection
         assert all(
             r.keeps_connection and not r.needs_new_connection
-            for r in (R.SAFE, R.BACKPRESSURE, R.RESET_STATE)
+            for r in (R.SAFE, R.BACKPRESSURE, R.RESET_STATE, R.REFRESH_LABELS)
         )
 
     def test_exactly_one_recovery_empties_the_statement_cache(self) -> None:
-        assert R.RESET_STATE.clears_prepared_statements
-        assert not R.SAFE.clears_prepared_statements
+        assert [r for r in R if r.clears_prepared_statements] == [R.RESET_STATE]
+
+    def test_exactly_one_recovery_reads_the_labels_again(self) -> None:
+        """Apart from emptying the statement cache: each recovery does nothing for the other."""
+        assert [r for r in R if r.refreshes_labels] == [R.REFRESH_LABELS]
 
     def test_exactly_one_recovery_waits_longer(self) -> None:
         assert R.BACKPRESSURE.wants_longer_delay

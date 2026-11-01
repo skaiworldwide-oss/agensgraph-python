@@ -41,6 +41,7 @@ that could not finish in what is left is turned away before a connection is take
 
 from __future__ import annotations
 
+import contextlib
 import inspect
 import threading
 from contextlib import contextmanager
@@ -400,11 +401,18 @@ class ConnectionPool:
             committing = False
             transaction_id: int | None = None
             try:
-                with self.connection(deadline=budget) as conn, conn.transaction():
-                    done.append(work(conn))
-                    if track_commit:
-                        transaction_id = conn.transaction_id()
-                    committing = True
+                with self.connection(deadline=budget) as conn:
+                    try:
+                        with conn.transaction():
+                            done.append(work(conn))
+                            if track_commit:
+                                transaction_id = conn.transaction_id()
+                            committing = True
+                    except Exception as exc:
+                        if not conn.closed:
+                            with contextlib.suppress(psycopg.Error):
+                                conn.recover(exc)
+                        raise
                 policy.succeeded()
                 return done[0]
             except Exception as exc:

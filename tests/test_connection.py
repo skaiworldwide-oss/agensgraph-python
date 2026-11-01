@@ -13,7 +13,7 @@ import pytest
 import pytest_asyncio
 
 import agensgraph
-from agensgraph.errors import ConfigurationError, StaleLabelCache
+from agensgraph.errors import ConfigurationError
 
 pytestmark = pytest.mark.server
 
@@ -186,12 +186,22 @@ class TestTheLabelTableGoingStale:
         (v,) = conn.execute_query("match (n:later) return n").records[0]
         assert v.label == "later"
 
-    def test_and_reported_in_the_composite_one(self, conn) -> None:  # type: ignore[no-untyped-def]
+    def test_and_in_the_composite_one_once_the_table_is_read_again(self, conn) -> None:  # type: ignore[no-untyped-def]
+        """The rows already read are decoded again; the statement is not run twice."""
         conn.execute("create vlabel later")
         conn.execute("create (:later)")
-        with pytest.raises(StaleLabelCache) as caught:
-            conn.execute_query("match (n:later) return n", binary_=True)
-        assert caught.value.labid is not None
+        sent: list[str] = []
+
+        def record(record) -> None:  # type: ignore[no-untyped-def]
+            sent.append(record.statement)
+
+        agensgraph.add_query_logger(record)
+        try:
+            (v,) = conn.execute_query("match (n:later) return n", binary_=True).records[0]
+        finally:
+            agensgraph.remove_query_logger(record)
+        assert v.label == "later"
+        assert sum("match (n:later)" in text for text in sent) == 1
 
     def test_until_the_table_is_filled_again(self, conn) -> None:  # type: ignore[no-untyped-def]
         conn.execute("create vlabel later")
@@ -266,9 +276,6 @@ class TestTheAwaitingInterface:
     async def test_the_label_table_going_stale(self, aconn) -> None:  # type: ignore[no-untyped-def]
         await aconn.execute("create vlabel later")
         await aconn.execute("create (:later)")
-        with pytest.raises(StaleLabelCache):
-            await aconn.execute_query("match (n:later) return n", binary_=True)
-        await aconn.refresh_labels()
         result = await aconn.execute_query("match (n:later) return n", binary_=True)
         assert result.records[0][0].label == "later"
 
