@@ -32,6 +32,9 @@ __all__ = [
     "check_bindable_positions",
     "check_can_wrap",
     "check_single_statement",
+    "check_transaction_kept",
+    "first_write_clause",
+    "is_session_command",
     "needs_a_reading_first",
     "quote_identifier",
     "quote_string",
@@ -400,6 +403,39 @@ def _second_statement(blanked: str) -> int:
     return body.find(";")
 
 
+# A statement that ends, restarts or splits the transaction it is sent in. Read at the start of
+# the statement once literals and comments are blanked, so a comment cannot hide one.
+_TRANSACTION_CONTROL = re.compile(
+    r"\s*\(?\s*(begin|start|commit|end|rollback|abort|savepoint|release|prepare\s+transaction)\b",
+    re.IGNORECASE,
+)
+
+
+def check_transaction_kept(statement: str) -> None:
+    """Refuse a statement that would end the transaction it is sent in, for text from elsewhere.
+
+    One statement is enough to leave a read-only transaction: a bare ``COMMIT`` ends it even over
+    the extended protocol, and whatever the caller sends next runs outside it. The server has no
+    reason to refuse that, so it is refused here, before it is sent.
+    """
+    found = _TRANSACTION_CONTROL.match(without_literals(statement))
+    if found is not None:
+        raise ValueError(
+            f"this statement ({found.group(1).upper()}) would end or split the transaction it is "
+            f"sent in, so a statement from somewhere else cannot run it here."
+        )
+
+
+# A session command. No Cypher statement starts with one of these words, so a SET here is the
+# SQL command that changes a setting, not the Cypher clause that writes a property.
+_SESSION_COMMAND = re.compile(r"\s*(set|reset|show)\b", re.IGNORECASE)
+
+
+def is_session_command(statement: str) -> bool:
+    """Whether a statement is SQL ``SET``, ``RESET`` or ``SHOW`` rather than Cypher."""
+    return _SESSION_COMMAND.match(without_literals(statement)) is not None
+
+
 # A clause that changes something. A statement holding one cannot be read in chunks, because
 # the wrap a server-side cursor needs takes only the read-only subset.
 #
@@ -555,16 +591,28 @@ def check_can_wrap(statement: str) -> None:
     the same statement -- so a driver predicting it would have to keep a copy of every version's
     grammar in step with it, and be wrong about whichever server it guessed at.
     """
+    clause = first_write_clause(statement)
+    if clause is not None:
+        raise ValueError(
+            f"a statement that writes cannot be read in chunks: it holds {clause}, and reading "
+            f"in chunks needs the statement placed where a subquery goes, which takes only the "
+            f"read-only subset. Read it whole instead."
+        )
+
+
+def first_write_clause(statement: str) -> str | None:
+    """The first Cypher clause in a statement that changes something, upper-cased, or ``None``.
+
+    A word inside a string, a quoted name or a comment is not a clause, and neither is one
+    given as a name by ``AS``. Reading the text this way misses nothing the server would run as
+    a Cypher write: those all start with one of these words.
+    """
     blanked = without_literals(statement)
     # One search for the statement that holds none of the words, which is what an ordinary read
     # is; the walk below is entered only once a word has been found.
     found = _WRITE_CLAUSE.search(blanked)
     while found is not None:
         if not _names_a_column(blanked, found.start()):
-            raise ValueError(
-                f"a statement that writes cannot be read in chunks: it holds "
-                f"{found.group(1).upper()}, and reading in chunks needs the statement placed "
-                f"where a subquery goes, which takes only the read-only subset. Read it whole "
-                f"instead."
-            )
+            return found.group(1).upper()
         found = _WRITE_CLAUSE.search(blanked, found.end())
+    return None

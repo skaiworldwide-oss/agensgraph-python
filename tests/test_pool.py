@@ -532,6 +532,26 @@ class TestAStatementTimeoutBelongsToOneBorrow:
 
 
 @pytest.mark.server
+class TestALockTakenByOthersTextStaysWithIt:
+    def test_the_next_borrower_does_not_inherit_it(self, dsn: str) -> None:
+        """A read may take a session lock, which a read-only block's rollback leaves in place."""
+        with agensgraph.ConnectionPool(
+            dsn, min_size=1, max_size=1, timeout=5.0, kwargs={"autocommit": True}
+        ) as pool:
+            with (
+                pool.connection() as conn,
+                conn.read_only_transaction(allow_server_programs=True),
+            ):
+                conn.execute("select pg_advisory_lock(424242)")
+            with pool.connection() as conn:
+                held = conn.execute(
+                    "select count(*) from pg_locks where locktype = 'advisory' "
+                    "and pid = pg_backend_pid()"
+                ).fetchone()[0]
+        assert held == 0
+
+
+@pytest.mark.server
 class TestARetiredConnectionIsNeverLent:
     """Retiring one only as it comes back lets each of them serve one more caller first, which
     is the failure-per-caller the epoch bump replaces."""

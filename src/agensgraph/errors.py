@@ -84,6 +84,7 @@ __all__ = [
     "NotSupportedError",
     "OperationalError",
     "ProgrammingError",
+    "ReadOnlyBoundaryLost",
     "ReadOnlyGraphWrite",
     "ReleasedConnection",
     "Retryability",
@@ -330,6 +331,20 @@ class BatchFailed(_pg.Error):
 class ReadOnlyGraphWrite(_pg.ReadOnlySqlTransaction):
     """A graph write in a transaction that was opened read-only."""
 
+    @classmethod
+    def before_sending(cls, clause: str, server: str) -> ReadOnlyGraphWrite:
+        """A write refused by the driver, on a server that would have let it through."""
+        return cls(
+            f"the statement holds {clause}, and AgensGraph {server} does not refuse a Cypher write "
+            f"in a read-only transaction (2.16 is the first that does), so it was refused before "
+            f"it was sent"
+        )
+
+    @classmethod
+    def by_the_server(cls) -> ReadOnlyGraphWrite:
+        """A write the server refused inside a read-only block, however it worded the refusal."""
+        return cls("the statement tried to write, in a transaction opened read-only")
+
 
 class MissingLabel(_pg.UndefinedObject, _pg.InternalError_):
     """A write named a label the graph does not have.
@@ -338,6 +353,14 @@ class MissingLabel(_pg.UndefinedObject, _pg.InternalError_):
     ``cannot find target label``, which reads as a server fault. This carries ``42704`` so a
     caller handles one code on every release, and is still the internal error psycopg raised,
     so an ``except`` written against that keeps matching.
+    """
+
+
+class ReadOnlyBoundaryLost(_pg.InterfaceError):
+    """A read-only block found its transaction ended underneath it.
+
+    Statements that end a transaction are refused before they are sent, so this is a backstop:
+    whatever ran next would have run outside the block, and the connection is not trusted again.
     """
 
 

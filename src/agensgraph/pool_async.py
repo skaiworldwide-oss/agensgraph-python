@@ -291,6 +291,12 @@ class AsyncConnectionPool:
             raise StaleGeneration.for_connection(
                 conn._agens_generation, current=self._generation
             )
+        if conn._agens_ran_others_text:
+            # A read-only block ran text from elsewhere, which may have taken a session lock its
+            # rollback left in place; the next borrower must not inherit it.
+            async with self._working_on(conn):
+                await conn._roll_back_and_unlock()
+            conn._agens_ran_others_text = False
         if self._user_reset is not None:
             async with self._working_on(conn):
                 await self._user_reset(conn)

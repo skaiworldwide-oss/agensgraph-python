@@ -266,6 +266,10 @@ class ConnectionPool:
             raise StaleGeneration.for_connection(
                 conn._agens_generation, current=self._generation
             )
+        if conn._agens_ran_others_text:
+            with self._working_on(conn):
+                conn._roll_back_and_unlock()
+            conn._agens_ran_others_text = False
         if self._user_reset is not None:
             with self._working_on(conn):
                 self._user_reset(conn)

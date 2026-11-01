@@ -12,16 +12,29 @@ interface from the other: the more that lives here, the less there is to keep in
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from itertools import count
 from typing import TYPE_CHECKING, Any, NamedTuple, Union
 
+from psycopg import errors as _pg
 from psycopg.conninfo import conninfo_to_dict as _conninfo_to_dict
+from psycopg.pq import TransactionStatus
 
 from ._protocol.labels import LabelCache
 from .adapters import graph_adapters, register_binary, register_text
 from .capabilities import Capabilities
-from .cypher import check_bindable_positions, quote_identifier, writable_counters
+from .cypher import (
+    check_bindable_positions,
+    check_single_statement,
+    check_transaction_kept,
+    first_write_clause,
+    is_session_command,
+    quote_identifier,
+    writable_counters,
+)
 from .errors import (
+    ReadOnlyBoundaryLost,
+    ReadOnlyGraphWrite,
     ReleasedConnection,
     StaleLabelCache,
     explain_string_type,
@@ -49,6 +62,19 @@ __all__ = [
     "savepoint_name",
     "stream_name",
 ]
+
+
+@dataclass(frozen=True)
+class ReadOnlyBlock:
+    """What a read-only block open on a connection holds every statement to.
+
+    ``refuse_writes`` is set where the server would let a Cypher write through a read-only
+    transaction, so the driver refuses one before it is sent rather than relying on the
+    rollback at the end of the block to undo it.
+    """
+
+    refuse_writes: bool
+
 
 GRAPH_ADAPTERS: AdaptersMap = graph_adapters()
 """The graph types, registered once for the process.
@@ -227,6 +253,81 @@ class GraphMixin:
     reason about, and a cancellation is rare enough that replacing it costs nothing anybody
     will see.
     """
+
+    _agens_read_only: ReadOnlyBlock | None = None
+    """The read-only block open on this connection, if one is."""
+
+    _agens_ran_others_text: bool = False
+    """Whether a read-only block has run a statement since a pool last had this connection back.
+
+    Such a statement is text from elsewhere, which may take a session-level advisory lock: the one
+    thing it can do that the block's rollback does not undo. A pool releases them before lending
+    the connection to anybody else; a block that ran nothing costs nothing.
+    """
+
+    _agens_read_only_enforced: bool | None = None
+    """Whether this server refused a Cypher write in a read-only transaction when asked.
+
+    Asked once, by :meth:`read_only_is_enforced`, and kept: neither the server nor the role
+    changes while a connection is open. Until it is asked, the version answers.
+    """
+
+    _agens_untrusted_role: tuple[tuple[str | None, tuple[str, ...]], tuple[str, ...]] | None = (
+        None
+    )
+    """The last answer about this role's fitness for model-written Cypher, and what it was for.
+
+    Kept for one application role and set of schemas: a role's memberships do not change while a
+    connection is open, and a connection serves one application.
+    """
+
+    def _read_only_gate(self) -> bool:
+        """Whether this server refuses a Cypher write in a read-only transaction.
+
+        The probe's answer where it has been asked, and the version's otherwise. The version
+        answers no for a development build or a release candidate of any line, which may predate
+        the fix, and for a 2.14 or 2.15 that carries it; that only costs those servers a refusal
+        the driver did not need to make, and :meth:`read_only_is_enforced` removes it.
+        """
+        if self._agens_read_only_enforced is not None:
+            return self._agens_read_only_enforced
+        return self.capabilities.has("cypher_write_enforced")
+
+    def _check_read_only_statement(self, text: str) -> None:
+        """Refuse, before it is sent, a statement a read-only block cannot hold.
+
+        More than one statement, a statement that ends the transaction, and on a server that
+        lets Cypher writes through a read-only transaction, a Cypher write.
+        """
+        block = self._agens_read_only
+        if block is None:
+            return
+        check_single_statement(text)
+        check_transaction_kept(text)
+        # A session command is SQL, which the server holds to the transaction on every release;
+        # making the transaction read-write again is refused once it has taken its snapshot.
+        if block.refuse_writes and not is_session_command(text):
+            clause = first_write_clause(text)
+            if clause is not None:
+                raise ReadOnlyGraphWrite.before_sending(clause, self.capabilities.reported)
+        self._agens_ran_others_text = True
+
+    def _check_read_only_kept(self) -> None:
+        """Refuse to go on if the block's transaction ended under it."""
+        if (
+            self._agens_read_only is not None
+            and self.pgconn.transaction_status == TransactionStatus.IDLE
+        ):
+            raise self._boundary_lost(
+                "the read-only transaction ended while the block was open, so what ran after it "
+                "was not read-only"
+            )
+
+    def _boundary_lost(self, message: str) -> ReadOnlyBoundaryLost:
+        """The error for a boundary that did not hold, with the connection marked as not to be
+        trusted again: a pool closes it rather than lend it to the next caller."""
+        self._agens_cancelled = True
+        return ReadOnlyBoundaryLost(message)
 
     def _check_lent(self) -> None:
         """Refuse a connection its holder has already given back.
@@ -415,9 +516,19 @@ class GraphMixin:
         A failure caused by a string's declared type also picks up a note saying why the
         parameter was text, which is the one thing the server's own message cannot know. The
         server's version decides what a refused plain SQL write to a label table is told to do.
+
+        Inside a read-only block, any refusal to write reads as the write it was: the server names
+        the command rather than what it did, refusing a Cypher ``CREATE`` as ``nextval()`` and a
+        write on 2.16 and 2.17 under the tag ``SELECT``.
         """
         better = translate(exc, graph_dml_setting=self.capabilities.has("graph_dml_setting"))
         replacement = redact_details(better or exc)
+        if (
+            self._agens_read_only is not None
+            and isinstance(replacement, _pg.ReadOnlySqlTransaction)
+            and not isinstance(replacement, ReadOnlyGraphWrite)
+        ):
+            return ReadOnlyGraphWrite.by_the_server()
         hint = explain_string_type(replacement)
         if hint is not None:
             replacement.add_note(hint)

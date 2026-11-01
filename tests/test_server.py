@@ -385,7 +385,11 @@ class TestRefusalsTheServerReportsBadly:
         assert replacement.setting == "enable_eager"
 
     def test_a_graph_write_in_a_read_only_transaction(self, graph: Connection[object]) -> None:
-        """Classified correctly and named by a command tag: '???' up to 2.17, 'CYPHER' from 2.18."""
+        """Classified correctly and named by a command tag: '???' up to 2.17, 'CYPHER' from 2.18.
+
+        2.14 and 2.15 do not check a Cypher write against a read-only transaction at all. They
+        refuse a CREATE only because it calls nextval(), and let a SET or a DELETE through.
+        """
         graph.autocommit = False
         graph.execute("set transaction read only")
         try:
@@ -396,6 +400,9 @@ class TestRefusalsTheServerReportsBadly:
             graph.autocommit = True
         message = str(caught.value)
         assert caught.value.sqlstate == "25006"
+        if not Capabilities.of(graph).has("cypher_write_enforced"):
+            assert "nextval" in message
+            return
         assert "???" in message or "CYPHER" in message
         assert isinstance(translate(caught.value), ReadOnlyGraphWrite)
 
@@ -621,24 +628,24 @@ class TestThePromotedSentinelColumn:
 
 @contextmanager
 def counting_statements() -> Iterator[list[str]]:
-    """Every statement any connection sends, counted at the cursor it is sent through.
+    """Every statement any connection sends, counted where the cursor sends it.
 
     Not through the query logger: that reports what a caller asked for, and the driver's own
     catalog reads do not go through it -- which is exactly what a test about hidden round trips
-    must be able to see.
+    must be able to see. Nor at ``execute``, which the driver's own statements do not pass.
     """
     sent: list[str] = []
-    real = connection_module.Cursor.execute
+    real = connection_module.Cursor._sent
 
-    def counting(self, query, params=None, **kwargs):  # type: ignore[no-untyped-def]
-        sent.append(str(query))
-        return real(self, query, params, **kwargs)
+    def counting(self, conn, text, *args, **kwargs):  # type: ignore[no-untyped-def]
+        sent.append(text)
+        return real(self, conn, text, *args, **kwargs)
 
-    connection_module.Cursor.execute = counting  # type: ignore[method-assign, assignment]
+    connection_module.Cursor._sent = counting  # type: ignore[method-assign]
     try:
         yield sent
     finally:
-        connection_module.Cursor.execute = real  # type: ignore[method-assign]
+        connection_module.Cursor._sent = real  # type: ignore[method-assign]
 
 
 class TestTheMechanismsAReadRelieson:

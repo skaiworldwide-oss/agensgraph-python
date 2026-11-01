@@ -32,6 +32,7 @@ from psycopg.types.json import Jsonb
 from ._core import (
     GRAPH_ADAPTERS,
     GraphMixin,
+    ReadOnlyBlock,
     Result,
     savepoint_name,
     statement_text,
@@ -125,12 +126,16 @@ if TYPE_CHECKING:
     from collections.abc import Generator, Iterable, Iterator, Mapping, Sequence
     from typing import Self
 
+    from psycopg._queries import PostgresQuery
     from psycopg.abc import Params, Query, QueryNoTemplate
+    from psycopg.copy import Copy, Writer
     from psycopg.rows import RowFactory
 
     from ._core import Statement
     from ._protocol.graphid import GraphId
 __all__ = ["Connection", "Cursor"]
+_READ_ONLY_PROBE_READ = "match (n) where false return n"
+_READ_ONLY_PROBE_WRITE = "match (n) where false set n.agensgraph_probe = 1"
 
 
 class Cursor(psycopg.Cursor[Row]):
@@ -162,6 +167,37 @@ class Cursor(psycopg.Cursor[Row]):
         text = statement_text(query)
         conn = self._guard()
         check_bindable_positions(text)
+        conn._check_read_only_statement(text)
+        return self._sent(conn, text, query, params, prepare=prepare, binary=binary)
+
+    def _execute_own(
+        self, statement: str, params: Params | None = None, *, prepare: bool | None = False
+    ) -> Self:
+        """One of the driver's own statements, reported like any other.
+
+        It skips the read-only block's checks, which are for text from elsewhere. The driver's
+        statements are its savepoints, settings and catalog reads: a savepoint it takes inside a
+        block is one it is done with before the block closes, so rolling back to it leaves the
+        block read-only -- which is also how psycopg's ``transaction()`` sends its own, past every
+        cursor. Not prepared by default, since most are sent once or with a different name each
+        time, and a string holding two of them -- as opening a model's streamed read does --
+        cannot be prepared at all, which ``prepare_threshold=0`` would otherwise try.
+        """
+        return self._sent(
+            self._guard(), statement, statement, params, prepare=prepare, binary=None
+        )
+
+    def _sent(
+        self,
+        conn: Connection[Row],
+        text: str,
+        query: Query,
+        params: Params | None,
+        *,
+        prepare: bool | None,
+        binary: bool | None,
+    ) -> Self:
+        """The statement sent, its failure translated, and what happened reported."""
         timer = Timer.start()
         try:
             super().execute(
@@ -177,6 +213,7 @@ class Cursor(psycopg.Cursor[Row]):
                 conn._report_query(text, timer, rows=0, error=exc)
             raise
         conn._report_query(text, timer, rows=self.rowcount, error=None)
+        conn._check_read_only_kept()
         self._watch_graph_path(text)
         return self
 
@@ -186,6 +223,7 @@ class Cursor(psycopg.Cursor[Row]):
         text = statement_text(query)
         conn = self._guard()
         check_bindable_positions(text)
+        conn._check_read_only_statement(text)
         timer = Timer.start()
         try:
             super().executemany(query, params_seq, returning=returning)
@@ -199,7 +237,60 @@ class Cursor(psycopg.Cursor[Row]):
                 conn._report_query(text, timer, rows=0, error=exc)
             raise
         conn._report_query(text, timer, rows=self.rowcount, error=None)
+        conn._check_read_only_kept()
         self._watch_graph_path(text)
+
+    @contextmanager
+    def copy(
+        self, statement: Query, params: Params | None = None, *, writer: Writer | None = None
+    ) -> Generator[Copy]:
+        """psycopg's ``COPY``, held to the same read-only check as every other statement."""
+        conn = self._guard()
+        conn._check_read_only_statement(statement_text(statement))
+        try:
+            with super().copy(statement, params, writer=writer) as copy:
+                yield copy
+        except psycopg.Error as exc:
+            raise conn._translated(exc) from None
+        conn._check_read_only_kept()
+
+    def stream(
+        self,
+        query: Query,
+        params: Params | None = None,
+        *,
+        binary: bool | None = None,
+        size: int = 1,
+    ) -> Iterator[Row]:
+        """psycopg's row-by-row read, held to the same read-only check as every other statement.
+
+        A statement that ends the transaction is no less one for being read a row at a time.
+        """
+        conn = self._guard()
+        conn._check_read_only_statement(statement_text(query))
+        try:
+            for row in super().stream(query, params, binary=binary, size=size):
+                yield row
+        except psycopg.Error as exc:
+            raise conn._translated(exc) from None
+        conn._check_read_only_kept()
+
+    def _execute_send(
+        self, query: PostgresQuery, *, force_extended: bool = False, binary: bool | None = None
+    ) -> None:
+        """Send a statement, never over the simple protocol inside a read-only block.
+
+        That protocol runs every statement in a string, so a smuggled ``; commit; ...`` would
+        end the block and run the rest read-write. The extended protocol takes one statement and
+        refuses a second with ``42601``. psycopg chooses the protocol here, for ``execute``,
+        ``executemany`` and ``copy`` alike; a server-side cursor already uses the extended one.
+        """
+        conn = cast("Connection[Row]", self.connection)
+        super()._execute_send(
+            query,
+            force_extended=force_extended or conn._agens_read_only is not None,
+            binary=binary,
+        )
 
     def _guard(self) -> Connection[Row]:
         """The connection, refused if its holder has given it back."""
@@ -535,15 +626,90 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
 
         A caller that wants both should keep its own repeated statements on a different connection
         from the ones it did not write.
+
+        **What is held to it, on every way of running a statement.** Inside the block every
+        statement goes over the extended protocol, so a smuggled ``; commit; ...`` is refused
+        with ``42601`` rather than ending the block; text holding a second statement, or one
+        that would end or split the transaction, is refused before it is sent. On a server
+        that does not refuse a Cypher write in a read-only transaction -- 2.14 and 2.15 -- a
+        statement holding a Cypher write clause is refused before it is sent as well, and a
+        write the reading misses still runs, shows its effect to the caller, and is undone
+        only by the rollback. Any refusal to write raises :class:`ReadOnlyGraphWrite`.
+
+        **The one thing the rollback does not undo** is a session-level advisory lock, which a
+        read may take: ``pg_advisory_lock`` is not a write. A pool releases every such lock on a
+        connection that ran this block before lending it again; a connection kept by its caller
+        keeps them until it closes or calls ``pg_advisory_unlock_all()``. :meth:`run_untrusted`
+        releases them itself.
         """
         if not allow_server_programs and self.can_run_server_programs():
             raise ConfigurationError(
                 "this role may run a command on the server's host, through COPY ... TO PROGRAM, which a read-only transaction does not stop -- so a read-only transaction is not a boundary for a statement this role did not write. Connect as a role that is not a superuser and does not hold pg_execute_server_program, or pass allow_server_programs=True to accept it."
             )
         with self.transaction() as block:
-            self._run("set transaction read only")
-            yield
+            self._run("select set_config('transaction_read_only', 'on', true)")
+            outer = self._agens_read_only
+            self._agens_read_only = ReadOnlyBlock(refuse_writes=not self._read_only_gate())
+            try:
+                yield
+            finally:
+                self._agens_read_only = outer
             raise psycopg.Rollback(block)
+
+    def read_only_is_enforced(self) -> bool:
+        """Whether this server refuses a Cypher write in a read-only transaction, by asking it.
+
+        The version answers this for free: 2.16 is the first release that refuses. Asking costs
+        one round trip and is worth it where the answer matters most, on a 2.14 or 2.15 build
+        that carries the fix. A zero-row read and a zero-row ``SET`` run inside a read-only
+        transaction that is rolled back, so nothing is written either way.
+
+        The answer is kept for the connection. It is true only when the server refused the
+        ``SET`` with ``25006`` or ``42501`` after letting the read run, and false otherwise --
+        including when the question could not be put, inside a transaction already open or
+        without a graph selected. That errs on the side of the driver refusing writes itself.
+        """
+        if self._agens_read_only_enforced is not None:
+            return self._agens_read_only_enforced
+        if self.pgconn.transaction_status != TransactionStatus.IDLE:
+            return self.capabilities.has("cypher_write_enforced")
+        enforced: bool | None = None
+        try:
+            with self.transaction(force_rollback=True):
+                self._run("set transaction read only")
+                self._run(_READ_ONLY_PROBE_READ)
+                try:
+                    with self.transaction():
+                        self._run(_READ_ONLY_PROBE_WRITE)
+                except psycopg.Error as exc:
+                    if exc.sqlstate in ("25006", "42501"):
+                        enforced = True
+                else:
+                    enforced = False
+        except psycopg.Error:
+            return False
+        if enforced is not None:
+            self._agens_read_only_enforced = enforced
+        return bool(enforced)
+
+    def _roll_back_and_unlock(self) -> None:
+        """Roll back whatever text from elsewhere left open, and release every session advisory
+        lock, which a rollback leaves in place: one round trip either way.
+
+        In a transaction both go in one string. Out of one the release goes in autocommit, so that
+        a connection outside it does not open a transaction around the release only to end it.
+        """
+        if self.pgconn.transaction_status != TransactionStatus.IDLE:
+            self._run("rollback; select pg_advisory_unlock_all()")
+            return
+        was_autocommit = self.autocommit
+        if not was_autocommit:
+            self.set_autocommit(True)
+        try:
+            self._run("select pg_advisory_unlock_all()")
+        finally:
+            if not was_autocommit:
+                self.set_autocommit(False)
 
     def transaction_id(self, *, assign: bool = False) -> int | None:
         """The id of the transaction now open, so its fate can be asked about if it is lost.
@@ -1590,11 +1756,20 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
             raise AssertionError("the write counters returned no row")
         return [int(value) for value in row]
 
-    def _run(self, statement: str) -> None:
-        with super().cursor() as cursor:
-            cursor.execute(statement)
+    def _run(self, statement: str, params: Params | None = None) -> None:
+        """One of the driver's own statements: a savepoint, a setting, a lock released.
+
+        Never prepared, and past the read-only block's checks; see
+        :meth:`Cursor._execute_own`.
+        """
+        with Cursor(self) as cursor:
+            cursor._execute_own(statement, params)
 
     def _fetch(self, statement: str, params: Params) -> list[Any]:
-        with super().cursor(row_factory=tuple_row) as cursor:
-            cursor.execute(statement, params)
+        """The rows of one of the driver's own reads, as tuples, past the read-only block's checks.
+
+        Prepared as psycopg would, since the catalog reads it serves come back again and again.
+        """
+        with Cursor(self, row_factory=tuple_row) as cursor:
+            cursor._execute_own(statement, params, prepare=None)
             return cursor.fetchall()
