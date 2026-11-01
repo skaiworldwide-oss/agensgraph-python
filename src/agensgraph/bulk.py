@@ -27,6 +27,7 @@ from __future__ import annotations
 import gc
 import struct
 from contextlib import contextmanager
+from math import isfinite
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 from psycopg.types.json import Jsonb
@@ -361,7 +362,11 @@ def key_spellings(value: Any) -> list[Any]:
 
 
 def _as_number(text: str) -> int | float | None:
-    """The number this text stands for, if a number renders back to exactly this text."""
+    """The number this text stands for, if a number renders back to exactly this text.
+
+    ``nan`` and ``inf`` are words here, not numbers: jsonb cannot hold either, so no stored key is
+    one, and asking for them as numbers would only fail on the way to the server.
+    """
     try:
         whole = int(text)
     except ValueError:
@@ -371,6 +376,8 @@ def _as_number(text: str) -> int | float | None:
     try:
         fractional = float(text)
     except ValueError:
+        return None
+    if not isfinite(fractional):
         return None
     return fractional if str(fractional) == text else None
 

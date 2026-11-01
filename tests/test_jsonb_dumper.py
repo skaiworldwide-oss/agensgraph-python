@@ -47,6 +47,36 @@ class TestWhatItRenders:
         assert isinstance(dump_jsonb({"a": 1}), bytes)
 
 
+class TestPsycopgsOwnWrapper:
+    """``Jsonb(...)`` goes through the same encoder as a map, so it refuses the same floats."""
+
+    def test_it_is_encoded_by_the_drivers_dumper(self) -> None:
+        from psycopg.adapt import PyFormat
+        from psycopg.types.json import Jsonb
+
+        from agensgraph._core import GRAPH_ADAPTERS
+        from agensgraph.adapters import JsonbBinaryDumper, JsonbDumper
+
+        assert GRAPH_ADAPTERS.get_dumper(Jsonb, PyFormat.TEXT) is JsonbDumper
+        assert GRAPH_ADAPTERS.get_dumper(Jsonb, PyFormat.BINARY) is JsonbBinaryDumper
+        assert bytes(JsonbDumper(Jsonb).dump(Jsonb([1, "a", None]))) == b'[1,"a",null]'
+
+    @pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf])
+    def test_a_float_jsonb_cannot_hold_is_refused(self, value: float) -> None:
+        from psycopg.types.json import Jsonb
+
+        from agensgraph.adapters import JsonbDumper
+
+        with pytest.raises(ValueError, match="NaN or an infinity"):
+            JsonbDumper(Jsonb).dump(Jsonb([value]))
+
+    @pytest.mark.parametrize("text", ["nan", "inf", "-inf", "NaN", "Infinity"])
+    def test_a_key_that_reads_as_a_non_finite_float_stays_a_word(self, text: str) -> None:
+        from agensgraph.bulk import key_spellings
+
+        assert key_spellings(text) == [text]
+
+
 class TestTheFloatsJsonbCannotHold:
     """These encode as ``null`` unguarded, which stores the wrong value without saying so."""
 

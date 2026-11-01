@@ -24,23 +24,64 @@ therefore happens before the encoder sees anything.
 
 from __future__ import annotations
 
-from typing import Any
+from decimal import Decimal
+from typing import TYPE_CHECKING, Any
 
 import msgspec
 
+from ._core import Result
 from ._protocol.graphid import GraphId
 from .types import Edge, Path, Vertex
 from .vector import SparseVector, Vector
 
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
 __all__ = ["json_default", "to_builtins", "to_json"]
 
 
-def to_builtins(obj: Any) -> Any:
-    """A graph value as dicts, lists and strings.
+_SCALARS = (str, int, float, bool, type(None), Decimal)
+"""What JSON, or the encoder, takes as it is."""
 
-    Reads the property map, since a dict is what is being asked for. Where that is not wanted,
-    :func:`enc_hook` leaves an unread map alone.
+
+def _rows(result: Result, convert: Callable[[Any], Any]) -> list[Any]:
+    """A result as one object per row, keyed by the columns it returned."""
+    keys = result.keys
+    return [
+        {key: convert(value) for key, value in row.items()}
+        if isinstance(row, dict)
+        else dict(zip(keys, (convert(value) for value in row), strict=False))
+        for row in result.records
+    ]
+
+
+def _tuple(row: tuple[Any, ...], convert: Callable[[Any], Any]) -> Any:
+    """A tuple as an object where it names its fields, as a named-tuple row does, else a list."""
+    fields = getattr(row, "_asdict", None)
+    if fields is None:
+        return [convert(each) for each in row]
+    return {key: convert(value) for key, value in fields().items()}
+
+
+def to_builtins(obj: Any) -> Any:
+    """A graph value -- or a row, a list of rows, or a whole :class:`~agensgraph.Result` -- as
+    dicts, lists, strings and numbers.
+
+    A result becomes one object per row, keyed by the columns it returned. A tuple that names its
+    fields becomes an object too. Reads the property map, since a dict is what is being asked for;
+    :func:`to_json` leaves an unread one alone.
     """
+    kind = type(obj)
+    if kind is Result:
+        return _rows(obj, to_builtins)
+    if kind is list:
+        return [to_builtins(each) for each in obj]
+    if isinstance(obj, tuple):
+        return _tuple(obj, to_builtins)
+    if kind is dict:
+        return {key: to_builtins(value) for key, value in obj.items()}
+    if isinstance(obj, _SCALARS):
+        return obj
     if type(obj) is GraphId:
         return str(obj)
     if type(obj) is Vertex:
@@ -87,11 +128,17 @@ def _prepared(obj: Any) -> Any:
     """The same shape as :func:`to_builtins`, with an unread property map left as its bytes.
 
     Walks lists, tuples and dicts, so a whole result goes through in one call and anything that is
-    not a graph value is passed on untouched for the encoder to deal with.
+    not a graph value is passed on untouched for the encoder to deal with. A :class:`Result` and a
+    tuple that names its fields are walked too: left to the encoder, a tuple subclass is encoded
+    as it stands, vertices and all, which is how their private fields would get out.
     """
     kind = type(obj)
-    if kind is list or kind is tuple:
+    if kind is Result:
+        return _rows(obj, _prepared)
+    if kind is list:
         return [_prepared(each) for each in obj]
+    if isinstance(obj, tuple):
+        return _tuple(obj, _prepared)
     if kind is dict:
         return {key: _prepared(value) for key, value in obj.items()}
     if kind is Vertex:

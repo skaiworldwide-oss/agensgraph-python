@@ -113,6 +113,39 @@ class TestAWholeResultGoesThroughInOneCall:
     def test_something_with_no_graph_value_in_it_passes_through(self) -> None:
         assert json.loads(to_json({"a": [1, 2], "b": None})) == {"a": [1, 2], "b": None}
 
+    def test_a_result_becomes_one_object_per_row(self) -> None:
+        """A Result is a tuple subclass, so the walk enters it rather than leave the encoder to
+        write its vertices out field by field, private names and all."""
+        from agensgraph import Result
+        from agensgraph.summary import GraphWriteCounts
+
+        result = Result([(VERTEX, 3)], ["n", "k"], GraphWriteCounts.unknown())
+        expected = [{"n": to_builtins(VERTEX), "k": 3}]
+        assert json.loads(to_json(result)) == expected
+        assert to_builtins(result) == expected
+        assert b"_raw" not in to_json(result)
+
+    def test_a_row_that_names_its_fields_becomes_an_object(self) -> None:
+        from collections import namedtuple
+
+        Row = namedtuple("Row", ["n", "k"])
+        row = Row(VERTEX, 3)
+        assert json.loads(to_json([row])) == [{"n": to_builtins(VERTEX), "k": 3}]
+        assert to_builtins(row) == {"n": to_builtins(VERTEX), "k": 3}
+        assert b"_raw" not in to_json([row])
+
+    def test_to_builtins_walks_what_to_json_walks(self) -> None:
+        rows = [(VERTEX, "a label", 3, None, 1.5, True)]
+        assert to_builtins(rows) == json.loads(to_json(rows))
+
+    def test_a_tuple_that_names_nothing_becomes_a_list_by_either_route(self) -> None:
+        class Pair(tuple):  # type: ignore[type-arg]
+            pass
+
+        pair = Pair((VERTEX, 3))
+        assert to_builtins(pair) == [to_builtins(VERTEX), 3]
+        assert json.loads(to_json(pair)) == to_builtins(pair)
+
 
 class TestItDoesNotDecodeWhatNobodyRead:
     """The reason to reach for the fast route.

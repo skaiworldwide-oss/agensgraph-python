@@ -445,6 +445,10 @@ def register_text(
     adapters.register_dumper(GraphId, GraphIdBinaryDumper)
     adapters.register_dumper(dict, JsonbDumper)
     adapters.register_dumper(dict, JsonbBinaryDumper)
+    # psycopg's own wrapper as well, so a list or a scalar wrapped for a jsonb position goes through
+    # the same encoder: about twice as fast, and NaN is refused rather than stored as null.
+    adapters.register_dumper(_json.Jsonb, JsonbDumper)
+    adapters.register_dumper(_json.Jsonb, JsonbBinaryDumper)
     # Saying a string is text is what reaches the server's own text-to-jsonb conversion
     # rather than jsonb's parser. psycopg ships these two for exactly this: its own note on
     # StrDumper is that it is for "where the unknown oid is ambiguous and the text oid is
