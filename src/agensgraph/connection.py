@@ -120,7 +120,14 @@ from .introspect import (
     reconcile_labels,
 )
 from .notify import LISTENING_QUERY, NOTIFY_QUERY, listen_statement, unlisten_statement
-from .observability import Timer, query_span, report_notice
+from .observability import (
+    Timer,
+    detached_span,
+    end_span,
+    operation_span,
+    query_span,
+    report_notice,
+)
 from .settings import check_settings, settings_statement
 from .summary import (
     ASSIGNED_TRANSACTION_QUERY,
@@ -930,24 +937,34 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
         ):
             raise NoEnclosingTransaction.for_stream()
         timer = Timer.start()
-        with self.cursor(name=name or stream_name()) as cursor:
-            cursor.itersize = size
-            if binary_:
-                self._check_binary()
-                cursor.format = psycopg.pq.Format.BINARY
-            try:
-                cursor.execute(statement, params)
-            except psycopg.Error as exc:
-                failure = self._translated(exc)
-                self._report_query(statement, timer, rows=0, error=failure)
-                raise failure from None
-            self._report_query(statement, timer, rows=cursor.rowcount, error=None)
-            while True:
-                rows = cursor.fetchmany(size)
-                if not rows:
-                    return
-                for row in rows:
-                    yield row
+        span = detached_span(
+            "STREAM", graph=self.label_table.graph, **{"db.query.text": statement}
+        )
+        failure: BaseException | None = None
+        try:
+            with self.cursor(name=name or stream_name()) as cursor:
+                cursor.itersize = size
+                if binary_:
+                    self._check_binary()
+                    cursor.format = psycopg.pq.Format.BINARY
+                try:
+                    cursor.execute(statement, params)
+                except psycopg.Error as exc:
+                    failure = self._translated(exc)
+                    self._report_query(statement, timer, rows=0, error=failure)
+                    raise failure from None
+                self._report_query(statement, timer, rows=cursor.rowcount, error=None)
+                while True:
+                    rows = cursor.fetchmany(size)
+                    if not rows:
+                        return
+                    for row in rows:
+                        yield row
+        except BaseException as exc:
+            failure = failure or exc
+            raise
+        finally:
+            end_span(span, failure)
 
     def register_vectors(self) -> tuple[str, ...]:
         """Read vectors on this connection, reporting which vector types were found.
@@ -1002,13 +1019,15 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
         same write through a statement did not.
 
         The handle is checked here as well, since a copy runs through no cursor of this
-        connection's that would check it.
+        connection's that would check it. And a span is taken here, since no statement's span
+        covers the rows a copy sends.
         """
         self._check_lent()
-        try:
-            yield
-        except psycopg.Error as exc:
-            raise self._translated(exc) from None
+        with operation_span("COPY", graph=self.label_table.graph):
+            try:
+                yield
+            except psycopg.Error as exc:
+                raise self._translated(exc) from None
 
     def load_vertices(
         self, label: str, properties: Iterable[Mapping[str, Any]], *, graph: str | None = None
@@ -1605,11 +1624,16 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
             batch = sent[start : start + chunk]
             mark = savepoint_name() if self._can_hold_a_savepoint() else None
             try:
-                results.extend(
-                    self._pipelined(
-                        batch, savepoint=mark, binary=binary_, prepare=prepare_, row=row_
+                with operation_span(
+                    "PIPELINE",
+                    graph=self.label_table.graph,
+                    **{"db.operation.batch.size": len(batch)},
+                ):
+                    results.extend(
+                        self._pipelined(
+                            batch, savepoint=mark, binary=binary_, prepare=prepare_, row=row_
+                        )
                     )
-                )
             except psycopg.Error:
                 if mark is not None:
                     self._run(f"rollback to savepoint {mark}")

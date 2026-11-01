@@ -56,6 +56,7 @@ from psycopg_pool import errors as _pool_errors
 from .connection import Connection
 from .deadline import Deadline
 from .errors import InterruptedConnection, Retryability, StaleGeneration, UnresolvedCommit
+from .observability import record_wait
 from .retry import RetryPolicy, sleep
 from .summary import CommitOutcome
 
@@ -315,7 +316,11 @@ class ConnectionPool:
         try:
             for _ in range(self._pool.max_size + 1):
                 budget.check("waiting for a connection")
+                asked = time.time_ns()
                 with self._pool.connection(timeout=budget.bounded(timeout)) as conn:
+                    record_wait(
+                        "POOL WAIT", asked, **{"db.client.connection.pool.name": self.name}
+                    )
                     lent = conn
                     conn._agens_lent = True
                     if conn._agens_generation != self._generation:

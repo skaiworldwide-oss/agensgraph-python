@@ -53,6 +53,7 @@ from psycopg_pool import errors as _pool_errors
 from .connection_async import AsyncConnection
 from .deadline import Deadline
 from .errors import InterruptedConnection, Retryability, StaleGeneration, UnresolvedCommit
+from .observability import record_wait
 from .retry import RetryPolicy, async_sleep
 from .summary import CommitOutcome
 
@@ -352,7 +353,13 @@ class AsyncConnectionPool:
             # more caller first, which is the failure per caller the epoch bump replaces.
             for _ in range(self._pool.max_size + 1):
                 budget.check("waiting for a connection")
+                asked = time.time_ns()
                 async with self._pool.connection(timeout=budget.bounded(timeout)) as conn:
+                    # The wait, as a span of its own once it is over: it happens inside the
+                    # pool's block, where nothing of ours opens and closes around just that.
+                    record_wait(
+                        "POOL WAIT", asked, **{"db.client.connection.pool.name": self.name}
+                    )
                     # Marked before the test and left so through the end of psycopg's own
                     # block, which commits and resets: the pool doing that is not a caller
                     # reaching past its turn. One rejected here is closed on the way out, so

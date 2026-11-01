@@ -122,7 +122,14 @@ from .notify import (
     listen_statement,
     unlisten_statement,
 )
-from .observability import Timer, query_span, report_notice
+from .observability import (
+    Timer,
+    detached_span,
+    end_span,
+    operation_span,
+    query_span,
+    report_notice,
+)
 from .settings import check_settings, settings_statement
 from .summary import (
     ASSIGNED_TRANSACTION_QUERY,
@@ -1010,24 +1017,36 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
         # Reported here rather than at the cursor: a server-side cursor is psycopg's own class
         # and not the one that reports for itself, and a stream is a statement like any other.
         timer = Timer.start()
-        async with self.cursor(name=name or stream_name()) as cursor:
-            cursor.itersize = size
-            if binary_:
-                self._check_binary()
-                cursor.format = psycopg.pq.Format.BINARY
-            try:
-                await cursor.execute(statement, params)
-            except psycopg.Error as exc:
-                failure = self._translated(exc)
-                self._report_query(statement, timer, rows=0, error=failure)
-                raise failure from None
-            self._report_query(statement, timer, rows=cursor.rowcount, error=None)
-            while True:
-                rows = await cursor.fetchmany(size)
-                if not rows:
-                    return
-                for row in rows:
-                    yield row
+        # Not made current: this yields between rows, and a current span would hold every span
+        # the caller takes meanwhile under it.
+        span = detached_span(
+            "STREAM", graph=self.label_table.graph, **{"db.query.text": statement}
+        )
+        failure: BaseException | None = None
+        try:
+            async with self.cursor(name=name or stream_name()) as cursor:
+                cursor.itersize = size
+                if binary_:
+                    self._check_binary()
+                    cursor.format = psycopg.pq.Format.BINARY
+                try:
+                    await cursor.execute(statement, params)
+                except psycopg.Error as exc:
+                    failure = self._translated(exc)
+                    self._report_query(statement, timer, rows=0, error=failure)
+                    raise failure from None
+                self._report_query(statement, timer, rows=cursor.rowcount, error=None)
+                while True:
+                    rows = await cursor.fetchmany(size)
+                    if not rows:
+                        return
+                    for row in rows:
+                        yield row
+        except BaseException as exc:
+            failure = failure or exc
+            raise
+        finally:
+            end_span(span, failure)
 
     async def register_vectors(self) -> tuple[str, ...]:
         """Read vectors on this connection, reporting which vector types were found.
@@ -1084,13 +1103,15 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
         same write through a statement did not.
 
         The handle is checked here as well, since a copy runs through no cursor of this
-        connection's that would check it.
+        connection's that would check it. And a span is taken here, since no statement's span
+        covers the rows a copy sends.
         """
         self._check_lent()
-        try:
-            yield
-        except psycopg.Error as exc:
-            raise self._translated(exc) from None
+        with operation_span("COPY", graph=self.label_table.graph):
+            try:
+                yield
+            except psycopg.Error as exc:
+                raise self._translated(exc) from None
 
     async def load_vertices(
         self,
@@ -1727,11 +1748,16 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
             # batch was already taking and the ordinary path pays nothing for it.
             mark = savepoint_name() if self._can_hold_a_savepoint() else None
             try:
-                results.extend(
-                    await self._pipelined(
-                        batch, savepoint=mark, binary=binary_, prepare=prepare_, row=row_
+                with operation_span(
+                    "PIPELINE",
+                    graph=self.label_table.graph,
+                    **{"db.operation.batch.size": len(batch)},
+                ):
+                    results.extend(
+                        await self._pipelined(
+                            batch, savepoint=mark, binary=binary_, prepare=prepare_, row=row_
+                        )
                     )
-                )
             except psycopg.Error:
                 # The pipeline blamed one of them and a pipeline names the wrong one, so the
                 # answer comes from asking again singly. Reading twice costs a round trip per

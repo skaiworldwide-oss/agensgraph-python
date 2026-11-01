@@ -52,10 +52,15 @@ __all__ = [
     "QueryRecord",
     "add_notice_listener",
     "add_query_logger",
+    "detached_span",
     "disable_tracing",
     "enable_tracing",
+    "end_span",
     "notice_from_diagnostic",
     "notices_wanted",
+    "operation_of",
+    "operation_span",
+    "record_wait",
     "remove_notice_listener",
     "remove_query_logger",
     "report_notice",
@@ -186,15 +191,83 @@ class _NoSpan:
 _NO_SPAN = _NoSpan()
 
 
+def operation_of(statement: str) -> str:
+    """What a statement does, by its first word: ``MATCH``, ``SELECT``, ``CREATE``.
+
+    The span's name, as the semantic conventions ask -- an operation, not the statement, whose
+    text can be long and differs with every literal written into it.
+    """
+    word = statement.lstrip().split(None, 1)[0] if statement.strip() else ""
+    word = word.rstrip("(;").upper()
+    return word if word.isalpha() else "query"
+
+
+def operation_span(operation: str, *, graph: str | None = None, **attributes: object) -> Any:
+    """A span around something that is more than one statement: a ``COPY``, a pipeline.
+
+    Gated exactly as :func:`query_span` is, so a caller who never asked for tracing pays a flag
+    read. *attributes* with a value of ``None`` are left off.
+    """
+    if not _tracing:
+        return _NO_SPAN
+    return _real_operation_span(operation, graph, attributes)
+
+
 @contextmanager
-def _real_span(statement: str, graph: str | None) -> Generator[None]:
-    """A span around one statement, for when tracing has been asked for."""
-    with _tracer.start_as_current_span("query") as span:
-        span.set_attribute("db.system.name", SYSTEM)
-        span.set_attribute("db.query.text", statement)
-        if graph is not None:
-            span.set_attribute("db.namespace", graph)
+def _real_operation_span(
+    operation: str, graph: str | None, attributes: dict[str, object]
+) -> Generator[None]:
+    with _tracer.start_as_current_span(operation) as span:
+        _describe(span, operation, graph, attributes)
         yield
+
+
+def _describe(
+    span: Any, operation: str, graph: str | None, attributes: dict[str, object]
+) -> None:
+    span.set_attribute("db.system.name", SYSTEM)
+    span.set_attribute("db.operation.name", operation)
+    if graph is not None:
+        span.set_attribute("db.namespace", graph)
+    for key, value in attributes.items():
+        if value is not None:
+            span.set_attribute(key, value)
+
+
+def detached_span(operation: str, *, graph: str | None = None, **attributes: object) -> Any:
+    """A span that is started but not made current, or ``None`` when nobody is tracing.
+
+    For a generator. A span made current inside one would stay current in its caller between one
+    row and the next, and every span the caller took meanwhile would be filed under it. End it
+    with :func:`end_span`.
+    """
+    if not _tracing:
+        return None
+    span = _tracer.start_span(operation)
+    _describe(span, operation, graph, attributes)
+    return span
+
+
+def end_span(span: Any, failure: BaseException | None = None) -> None:
+    """End a span from :func:`detached_span`, recording what failed it if anything did."""
+    if span is None:
+        return
+    if failure is not None:
+        span.set_attribute("error.type", type(failure).__name__)
+    span.end()
+
+
+def record_wait(operation: str, started_ns: int, **attributes: object) -> None:
+    """A span for a wait that has already happened, from *started_ns* (``time.time_ns()``) to now.
+
+    For waiting on a pool, which happens inside the pool's own block, where no span of ours can
+    open and close around exactly the wait.
+    """
+    if not _tracing:
+        return
+    span = _tracer.start_span(operation, start_time=started_ns)
+    _describe(span, operation, None, attributes)
+    span.end()
 
 
 def query_span(statement: str, *, graph: str | None = None) -> Any:
@@ -210,7 +283,7 @@ def query_span(statement: str, *, graph: str | None = None) -> Any:
     """
     if not _tracing:
         return _NO_SPAN
-    return _real_span(statement, graph)
+    return _real_operation_span(operation_of(statement), graph, {"db.query.text": statement})
 
 
 _notice_handlers: list[Callable[[Notice], None]] = []

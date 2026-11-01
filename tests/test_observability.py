@@ -209,7 +209,8 @@ class TestAgainstAServer:
             agens.execute_query("match (n) return n limit 0")
         finally:
             disable_tracing()
-        assert "span=query" in taken
+        assert "span=MATCH" in taken, "named for the operation, as the conventions ask"
+        assert "db.operation.name=MATCH" in taken
         assert "db.system.name=postgresql" in taken
         assert any(item.startswith("db.query.text=match (n) return n") for item in taken)
         assert not any("password" in item for item in taken)
@@ -239,6 +240,108 @@ class TestAgainstAServer:
             disable_tracing()
         assert taken
         assert not any("hunter2" in item for item in taken)
+
+
+class _Recorder:
+    """A tracer of our own: every span started, current or not, with what was set on it."""
+
+    def __init__(self) -> None:
+        self.spans: list[dict[str, object]] = []
+
+    def _span(self, name: str) -> object:
+        record: dict[str, object] = {"name": name, "ended": False}
+        self.spans.append(record)
+
+        class Span:
+            def set_attribute(self, key: str, value: object) -> None:
+                record[key] = value
+
+            def end(self, end_time: object = None) -> None:
+                record["ended"] = True
+
+            def __enter__(self) -> Span:
+                return self
+
+            def __exit__(self, *exc: object) -> None:
+                record["ended"] = True
+
+        return Span()
+
+    def start_as_current_span(self, name: str) -> object:
+        return self._span(name)
+
+    def start_span(self, name: str, start_time: object = None) -> object:
+        return self._span(name)
+
+    def named(self, name: str) -> list[dict[str, object]]:
+        return [span for span in self.spans if span["name"] == name]
+
+
+@pytest.fixture
+def recorder():  # type: ignore[no-untyped-def]
+    tracer = _Recorder()
+    agensgraph.enable_tracing(tracer)
+    try:
+        yield tracer
+    finally:
+        disable_tracing()
+
+
+class TestSpansAreNamedForTheOperation:
+    @pytest.mark.parametrize(
+        ("statement", "operation"),
+        [
+            ("match (n) return n", "MATCH"),
+            ("  SELECT 1", "SELECT"),
+            ("create (:a)", "CREATE"),
+            ("with x as (select 1) select * from x", "WITH"),
+            ("", "query"),
+            ("(select 1)", "query"),
+        ],
+    )
+    def test_by_the_first_word(self, statement: str, operation: str) -> None:
+        from agensgraph.observability import operation_of
+
+        assert operation_of(statement) == operation
+
+
+@pytest.mark.server
+class TestSpansBeyondOneStatement:
+    """What no statement's own span covers: rows sent by COPY, a pipeline, a stream, a pool wait."""
+
+    def test_a_copy(self, agens, recorder) -> None:  # type: ignore[no-untyped-def]
+        agens.execute("create vlabel doc")
+        agens.load_vertices("doc", [{"n": n} for n in range(3)])
+        (span,) = recorder.named("COPY")
+        assert span["ended"]
+        assert span["db.namespace"] == agens.label_table.graph
+
+    def test_a_pipeline(self, agens, recorder) -> None:  # type: ignore[no-untyped-def]
+        agens.pipeline_query(["select 1", "select 2", "select 3"])
+        (span,) = recorder.named("PIPELINE")
+        assert span["db.operation.batch.size"] == 3
+
+    def test_a_stream_is_ended_and_never_made_current(self, agens, recorder) -> None:  # type: ignore[no-untyped-def]
+        agens.execute("create vlabel doc")
+        agens.execute("create (:doc {n: 1}), (:doc {n: 2})")
+        with agens.transaction():
+            rows = list(agens.stream("match (n:doc) return n.n"))
+        assert len(rows) == 2
+        (span,) = recorder.named("STREAM")
+        assert span["ended"]
+        assert "match (n:doc)" in str(span["db.query.text"])
+
+    def test_a_pool_wait(self, dsn, recorder) -> None:  # type: ignore[no-untyped-def]
+        pool = agensgraph.ConnectionPool(dsn, min_size=1, max_size=1, name="traced")
+        pool.open(wait=True)
+        try:
+            with pool.connection() as conn:
+                conn.execute("select 1")
+        finally:
+            pool.close()
+        (span,) = recorder.named("POOL WAIT")
+        assert span["db.client.connection.pool.name"] == "traced"
+        assert span["ended"]
 
 
 class TestAskingForASpanCostsAlmostNothing:
