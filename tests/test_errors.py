@@ -186,7 +186,19 @@ REFUSAL_TAGS = ["???", "CYPHER"]
 
 
 class TestTranslate:
-    """The three failures the server reports in terms a caller cannot act on."""
+    """The failures the server reports in terms a caller cannot act on."""
+
+    def test_a_missing_label_reads_the_same_on_every_release(self) -> None:
+        """2.15 reports a write to a missing label as an internal error; 2.14 as 42704."""
+        exc = error_for("XX000")
+        exc.args = ('cannot find target label "nowhere"',)
+        replacement = E.translate(exc)
+        assert isinstance(replacement, E.MissingLabel)
+        assert replacement.sqlstate == "42704"
+        assert isinstance(replacement, pg.UndefinedObject)
+        assert isinstance(replacement, type(exc)), (
+            "an except written for psycopg's still matches"
+        )
 
     def test_a_dml_refusal_names_the_setting(self) -> None:
         exc = error_for("XX000")
@@ -195,6 +207,16 @@ class TestTranslate:
         assert isinstance(replacement, E.ConfigurationError)
         assert replacement.setting == "enable_graph_dml"
         assert "enable_graph_dml" in str(replacement)
+
+    def test_before_2_17_the_same_refusal_says_there_is_no_setting(self) -> None:
+        """2.14 to 2.16 refuse with the same words and have no setting to turn on."""
+        exc = error_for("XX000")
+        exc.args = ("DML query to graph objects is not allowed",)
+        replacement = E.translate(exc, graph_dml_setting=False)
+        assert isinstance(replacement, E.ConfigurationError)
+        assert replacement.setting is None
+        assert "before 2.17" in str(replacement)
+        assert "Cypher" in str(replacement)
 
     def test_an_eagerness_refusal_names_the_setting(self) -> None:
         exc = error_for("XX000")

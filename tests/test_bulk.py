@@ -102,7 +102,7 @@ class TestLoadingVertices:
         loaded.load_vertices("doc", [{"v": "123"}, {"v": "null"}, {"v": 123}])
         values = [
             row[0]
-            for row in loaded.execute_query("match (n:doc) return n.v order by n.v").records
+            for row in loaded.execute_query("match (n:doc) return n.v as v order by v").records
         ]
         assert "123" in values
         assert "null" in values
@@ -137,7 +137,7 @@ class TestLoadingEdges:
         )
         assert count == 3
         walked = loaded.execute_query(
-            "match (a:doc)-[r:cites]->(b:doc) return a.key, b.key, r.w order by a.key"
+            "match (a:doc)-[r:cites]->(b:doc) return a.key as a, b.key as b, r.w as w order by a"
         ).records
         assert walked == [("k0", "k1", 1), ("k1", "k2", 2), ("k2", "k3", None)]
 
@@ -346,7 +346,7 @@ class TestTheAwaitingInterface:
         pyarrow = pytest.importorskip("pyarrow", reason="pyarrow is not installed")
         table = pyarrow.table({"key": ["a", "b", "c"]})
         assert await aloaded.load_vertex_frame("doc", table) == 3
-        result = await aloaded.execute_query("match (n:doc) return n.key order by n.key")
+        result = await aloaded.execute_query("match (n:doc) return n.key as key order by key")
         assert [key for (key,) in result.records] == ["a", "b", "c"]
 
     @pytest.mark.asyncio

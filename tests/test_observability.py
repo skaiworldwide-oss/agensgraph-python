@@ -325,6 +325,10 @@ class TestNoticesFromARealServer:
         add_notice_listener(seen.append)
         try:
             agens.execute("select regather_graphmeta()")
+            # Asserted both ways, so a gate that went wrong fails here rather than skipping.
+            if not agens.capabilities.has("graphmeta_notices"):
+                assert not seen, "a server the gate says sends no notices sent some"
+                return
             assert seen, "the server sends notices and none arrived"
             assert all(isinstance(notice, Notice) for notice in seen)
             assert all(notice.severity for notice in seen)

@@ -21,6 +21,8 @@ from __future__ import annotations
 import re
 from typing import TYPE_CHECKING
 
+from ._keywords import GRAMMAR_KEYWORDS
+
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
@@ -118,6 +120,10 @@ _RESERVED = frozenset(
         "with",
         "xor",
     }
+    # Every word a supported release's grammar keeps for itself, and `path`, which 2.17 and 2.18
+    # refuse as a path variable although their grammar lists it as unreserved.
+    | GRAMMAR_KEYWORDS
+    | {"path"}
 )
 
 

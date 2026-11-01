@@ -119,7 +119,7 @@ class TestItActuallyDrivesAServer:
         PostgreSQL dialect's own regular expression already matches."""
         with engine.connect() as conn:
             assert conn.dialect.server_version_info is not None
-            assert conn.dialect.server_version_info[0] >= 16
+            assert conn.dialect.server_version_info[0] >= 14
 
     def test_a_cypher_statement_runs_and_describes_its_columns(self, engine, agens) -> None:  # type: ignore[no-untyped-def]
         graph = agens.label_table.graph

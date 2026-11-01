@@ -9,6 +9,12 @@ graph features and is what everything here reads. ``server_version`` is the Post
 release underneath, which differs between graph releases for reasons of its own -- so a
 graph feature is never gated on it.
 
+Every behaviour that differs between releases is one row of :data:`FEATURES`: the first
+release that has it, and for a known bug the first release that fixed it. That table is the
+only place in the driver, and in the packages built on it, where a version is compared. A
+caller asks for a feature by name and chooses between its own implementations once, rather
+than comparing versions where it works.
+
 Reading the graph types, decoding either wire format, counting what a write changed, and
 resolving an unknown commit all work on every supported version, so nothing in this
 module gates them.
@@ -17,39 +23,174 @@ module gates them.
 from __future__ import annotations
 
 import re
-from typing import Protocol
+import warnings
+from dataclasses import dataclass
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Protocol
 
 from .errors import CapabilityError
 
-__all__ = ["MINIMUM_VERSION", "Capabilities", "parse_version"]
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
-MINIMUM_VERSION = (2, 17)
-"""The oldest server this driver reads.
+__all__ = [
+    "FEATURES",
+    "MINIMUM_VERSION",
+    "Capabilities",
+    "Feature",
+    "parse_release",
+    "parse_version",
+]
 
-Older ones lack catalogs it depends on. The floor is also what the build tests against, so a
-release below it is not a release this driver is claimed to work on.
+MINIMUM_VERSION = (2, 14)
+"""The oldest server line this driver is built and tested against.
+
+2.14 runs on PostgreSQL 14. 2.13, on PostgreSQL 13, is untested, so it is not a release this
+driver is claimed to work on.
 """
 
-_PROPERTY_PROMOTION = (2, 18)
-_GQL_CLAUSES = (2, 18)
-_ELEMENT_ORDERING = (2, 18)
-_ENDPOINT_ELISION = (2, 18)
-
-# The two leading numbers are the AgensGraph line and the PostgreSQL major under it. What follows
-# them names the build and its shape varies by release -- '2.16', '2.17.0', '2.18.6.0',
-# '2.18.6.0-rcN', '2.18-devel' -- so it is kept as reported and never read.
-_VERSION = re.compile(r"(\d+)\.(\d+)")
+_RELEASE_WIDTH = 4
 
 
-def parse_version(text: str) -> tuple[int, int]:
-    """Read the AgensGraph line and the PostgreSQL major out of a reported version."""
+def _pad(release: tuple[int, ...]) -> tuple[int, ...]:
+    return release + (0,) * (_RELEASE_WIDTH - len(release))
+
+
+@dataclass(frozen=True)
+class Feature:
+    """One behaviour that differs between releases.
+
+    ``since`` is the first release that has it. For a known bug, ``until`` is the first release
+    that no longer has it, so the feature is present on ``since <= release < until``. Releases
+    are compared to the patch: ``(2, 18, 6)`` is 2.18.6.
+
+    A ``safety`` feature is one the driver keeps its own guard for where it is missing, so a
+    development build or a release candidate, which may predate the change, is not taken to have
+    it: wrongly answering no costs a refusal the driver did not need, wrongly answering yes costs
+    the guard.
+    """
+
+    since: tuple[int, ...]
+    description: str
+    until: tuple[int, ...] | None = None
+    safety: bool = False
+
+    def holds_for(self, release: tuple[int, ...]) -> bool:
+        """Whether a release, padded to four numbers, has this behaviour."""
+        if release < _pad(self.since):
+            return False
+        return self.until is None or release < _pad(self.until)
+
+
+FEATURES: Mapping[str, Feature] = MappingProxyType(
+    {
+        # Safety. Where these are false, the driver refuses rather than relies on the server.
+        "cypher_write_enforced": Feature(
+            (2, 16), "Cypher writes checked against READ ONLY and table privileges", safety=True
+        ),
+        "detach_checks_edge_grants": Feature(
+            (2, 17),
+            "DETACH DELETE checked against DELETE on each edge label it removes from",
+            safety=True,
+        ),
+        "unlabelled_read_checks_label_grants": Feature(
+            (2, 18, 6),
+            "an unlabelled read checked against each label's grants and row security",
+            safety=True,
+        ),
+        # Statement forms.
+        "order_by_unprojected": Feature(
+            (2, 17), "ORDER BY a value the RETURN does not project"
+        ),
+        "in_parameter_list": Feature((2, 17), "x IN a list parameter"),
+        "cypher_typmod_cast": Feature((2, 17), "a ::vector(N) cast in Cypher"),
+        "cypher_vector_cast": Feature((2, 15), "a ::vector cast in Cypher"),
+        "cypher_sql_functions": Feature(
+            (2, 15), "start_id, end_id, range, split and jsonb_build_object called from Cypher"
+        ),
+        "range_in_unwind": Feature((2, 18), "UNWIND range(a, b)"),
+        "missing_label_read_empty": Feature(
+            (2, 15), "a read of a missing label returning no rows"
+        ),
+        "missing_label_write_noop": Feature(
+            (2, 16), "a write to a missing label changing nothing"
+        ),
+        "merge_creates_label": Feature((2, 15), "MERGE creating its label"),
+        "collect_drops_nulls": Feature(
+            (2, 15), "collect() dropping nulls and giving [] for no rows"
+        ),
+        "fast_vertex_delete": Feature(
+            (2, 17), "deleting a vertex without scanning every edge table in the graph"
+        ),
+        "element_comparison": Feature((2, 18), "comparing a vertex or an edge with < or >"),
+        "element_array_negative_index": Feature(
+            (2, 18), "a negative index into nodes(p) or relationships(p)"
+        ),
+        "list_filter_drops_json_null": Feature(
+            (2, 18), "[x IN l WHERE x IS NOT NULL] dropping JSON nulls"
+        ),
+        "size_of_list": Feature((2, 18), "size() of a list"),
+        "aggregate_slice_in_with": Feature(
+            (2, 18), "slicing an aggregate in the WITH that computes it"
+        ),
+        "gql_clauses": Feature((2, 18), "the GQL surface"),
+        "property_promotion": Feature((2, 18), "storing a property in its own column"),
+        "endpoint_elision": Feature((2, 18), "leaving an unread endpoint unfetched"),
+        "text_cast_sort_in_with": Feature((2, 18, 6), "sorting on a text cast inside a WITH"),
+        # Server state the driver reads.
+        "graph_dml_setting": Feature((2, 17), "the enable_graph_dml setting"),
+        "graphmeta_notices": Feature((2, 17), "regather_graphmeta() reporting what it changed"),
+        "graphmeta_catalog": Feature((2, 18, 4), "the graphmeta_valid flag"),
+        "graph_path_reported": Feature(
+            (2, 18, 6), "graph_path reported as a run-time parameter"
+        ),
+        "write_completes_under_limit": Feature(
+            (2, 18, 6), "a write under LIMIT changing every matched row"
+        ),
+        "write_counters_fresh": Feature(
+            (2, 18, 6), "write counters reporting this statement's changes"
+        ),
+        # Known bugs: present on [since, until).
+        "jsonb_minmax_wrong": Feature(
+            (2, 15), "min() and max() over jsonb comparing as text", until=(2, 18)
+        ),
+        "vle_unnamed_wrong": Feature(
+            (2, 14), "an unnamed variable-length edge returning wrong paths", until=(2, 16)
+        ),
+    }
+)
+"""Every behaviour that differs between supported releases, by name."""
+
+# The two leading numbers are the AgensGraph line and the PostgreSQL major under it; any more
+# name the patch and its build. Whatever follows them -- '-rc1', '-devel', or a shape no release
+# has worn -- marks a build that is not a plain release.
+_VERSION = re.compile(r"(\d+)\.(\d+)((?:\.\d+)*)(.*)", re.DOTALL)
+
+
+def parse_release(text: str) -> tuple[tuple[int, ...], bool]:
+    """Read a reported version as its numbers and whether it is a pre-release.
+
+    ``2.18.6.1`` is ``((2, 18, 6, 1), False)``; ``2.18.6.0-rc1`` is ``((2, 18, 6, 0), True)``;
+    ``2.18-devel`` is ``((2, 18), True)``. Text after the numbers that no release has reported is
+    read the same way rather than refused: the connection goes ahead, and a build that may not be
+    a plain release is held to what the oldest release of its line does.
+    """
     match = _VERSION.match(text.strip())
     if match is None:
         raise CapabilityError(
             f"cannot read an AgensGraph version from {text!r}. The server reports one in "
-            f"`agversion`, as `2.18.6.0`, `2.18.6.0-rc1`, `2.18-devel`, or `2.17.0` before 2.18"
+            "`agversion`, as `2.18.6.1`, `2.18.6.0-rc1`, `2.18-devel`, `2.17.0`, `2.16` "
+            "or `2.14.1`"
         )
-    return int(match.group(1)), int(match.group(2))
+    numbers: tuple[int, ...] = (int(match.group(1)), int(match.group(2)))
+    numbers += tuple(int(part) for part in match.group(3).split(".") if part)
+    return numbers, bool(match.group(4).strip())
+
+
+def parse_version(text: str) -> tuple[int, int]:
+    """Read the AgensGraph line and the PostgreSQL major out of a reported version."""
+    numbers, _ = parse_release(text)
+    return numbers[0], numbers[1]
 
 
 class _Reports(Protocol):
@@ -72,21 +213,30 @@ class Capabilities:
     it, which is what a caller with only one way of doing something wants -- the refusal
     then says what is missing rather than letting the server fail on a syntax it has never
     heard of.
+
+    A release candidate or a development build is judged as the first release of its line:
+    ``2.18.6.0-rc1`` and ``2.18-devel`` both answer as 2.18.0. Such a build may lack a fix its
+    number suggests, and answering as the older release makes every gate err on the side that
+    refuses, or that takes the slower path which is correct everywhere.
     """
 
-    __slots__ = ("_reported", "_version")
+    __slots__ = ("_effective", "_prerelease", "_release", "_reported")
 
-    _version: tuple[int, int]
+    _release: tuple[int, ...]
+    _effective: tuple[int, ...]
+    _prerelease: bool
     _reported: str
 
     def __init__(self, reported: str) -> None:
-        version = parse_version(reported)
-        if version < MINIMUM_VERSION:
+        release, prerelease = parse_release(reported)
+        if release[:2] < MINIMUM_VERSION:
             required = ".".join(str(part) for part in MINIMUM_VERSION)
             raise CapabilityError(
                 f"this driver needs AgensGraph {required} or later; this server is {reported}"
             )
-        self._version = version
+        self._release = release
+        self._prerelease = prerelease
+        self._effective = _pad(release[:2] if prerelease else release)
         self._reported = reported
 
     @classmethod
@@ -105,25 +255,47 @@ class Capabilities:
 
     @property
     def version(self) -> tuple[int, int]:
-        """The AgensGraph line and the PostgreSQL major under it, for comparing.
+        """The AgensGraph line and the PostgreSQL major under it, for comparing lines.
 
         A release, a candidate for it and a development build of one line all compare alike;
-        :attr:`reported` has the version entire.
+        :attr:`release` has the patch and :attr:`reported` the version entire.
         """
-        return self._version
+        return self._release[0], self._release[1]
+
+    @property
+    def release(self) -> tuple[int, ...]:
+        """Every number the server reported, patch and build included: ``(2, 18, 6, 1)``."""
+        return self._release
+
+    @property
+    def is_prerelease(self) -> bool:
+        """Whether the server reported a release candidate or a development build."""
+        return self._prerelease
 
     @property
     def reported(self) -> str:
         """The version exactly as the server gave it, development suffix and all."""
         return self._reported
 
-    def _at_least(self, version: tuple[int, int], feature: str, *, check: bool) -> bool:
-        if self._version >= version:
+    def has(self, name: str, *, check: bool = False) -> bool:
+        """Whether this server has the named behaviour from :data:`FEATURES`.
+
+        For a known bug the answer is whether the bug is present. ``check=True`` raises rather
+        than answering no, naming the release that would carry the behaviour. A safety feature
+        is never taken on a development build or a release candidate.
+        """
+        try:
+            feature = FEATURES[name]
+        except KeyError:
+            raise ValueError(
+                f"no such feature {name!r}; see agensgraph.capabilities.FEATURES"
+            ) from None
+        if feature.holds_for(self._effective) and not (feature.safety and self._prerelease):
             return True
         if check:
             raise CapabilityError.for_feature(
-                feature,
-                required=".".join(str(part) for part in version),
+                feature.description,
+                required=".".join(str(part) for part in feature.since),
                 found=self._reported,
             )
         return False
@@ -143,9 +315,7 @@ class Capabilities:
         version whose features it does not have. Where the answer has to be right rather than
         free, ask the catalog: :meth:`~agensgraph.Connection.can_promote_properties`.
         """
-        return self._at_least(
-            _PROPERTY_PROMOTION, "storing a property in its own column", check=check
-        )
+        return self.has("property_promotion", check=check)
 
     def has_gql_clauses(self, *, check: bool = False) -> bool:
         """Whether the GQL surface is understood.
@@ -165,24 +335,38 @@ class Capabilities:
         ``LIMIT`` that is not last where 2.17 takes it. What a subquery holds is the server's to
         say, and it says so with a syntax error naming the word.
         """
-        return self._at_least(_GQL_CLAUSES, "the GQL surface", check=check)
+        return self.has("gql_clauses", check=check)
+
+    def has_element_comparison(self, *, check: bool = False) -> bool:
+        """Whether a vertex or an edge can be compared with ``<`` or ``>``.
+
+        Before 2.18 such a comparison silently matches nothing. Sorting is a different
+        question: ``ORDER BY`` a vertex or an edge the ``RETURN`` projects sorts by identity on
+        every supported release, and ordering by one it does not project needs
+        ``has("order_by_unprojected")``.
+        """
+        return self.has("element_comparison", check=check)
 
     def has_element_ordering(self, *, check: bool = False) -> bool:
-        """Whether a vertex or an edge can be sorted on directly.
+        """Deprecated alias of :meth:`has_element_comparison`.
 
-        Sorting on a property works everywhere; sorting on the element itself orders by
-        identity and needs the operators for it.
+        The name promised ``ORDER BY`` a vertex or an edge, which works on every supported
+        release; what 2.18 adds is comparing them.
         """
-        return self._at_least(_ELEMENT_ORDERING, "ordering by a vertex or an edge", check=check)
+        warnings.warn(
+            "has_element_ordering() is deprecated; use has_element_comparison(), or "
+            "has('order_by_unprojected') for ORDER BY a value the RETURN does not project",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.has_element_comparison(check=check)
 
     def has_endpoint_elision(self, *, check: bool = False) -> bool:
         """Whether an unread pattern endpoint is left unfetched.
 
         Visible only in a plan, which is the one place a caller would go looking for it.
         """
-        return self._at_least(
-            _ENDPOINT_ELISION, "leaving an unread endpoint unfetched", check=check
-        )
+        return self.has("endpoint_elision", check=check)
 
     def __repr__(self) -> str:
         return f"Capabilities({self._reported!r})"

@@ -24,7 +24,8 @@ ROWS = 250
 def many(agens):  # type: ignore[no-untyped-def]
     agens.execute("create vlabel thing")
     agens.execute("create elabel links")
-    agens.execute(f"unwind range(1, {ROWS})::jsonb as i create (:thing {{n: i}})")
+    # A literal list rather than range(): 2.14 has no range() in Cypher.
+    agens.execute(f"unwind {list(range(1, ROWS + 1))} as i create (:thing {{n: i}})")
     # The labels were made after the graph was selected, so the table the composite rendering
     # resolves names through has not heard of them yet.
     agens.refresh_labels()
@@ -174,7 +175,9 @@ class TestTheAwaitingInterface:
             await conn.execute(f'create graph "{graph}"')
             await conn.graph(graph)
             await conn.execute("create vlabel thing")
-            await conn.execute(f"unwind range(1, {ROWS})::jsonb as i create (:thing {{n: i}})")
+            await conn.execute(
+                f"unwind {list(range(1, ROWS + 1))} as i create (:thing {{n: i}})"
+            )
             await conn.set_autocommit(False)
             try:
                 yield conn
@@ -460,8 +463,8 @@ class TestWhatAStreamNeeds:
         agens.execute("create (:t {x: 1}), (:t {x: 2})")
         with agensgraph.Connection.connect(dsn) as conn:
             conn.execute(f"set graph_path = {agens.label_table.graph}")
-            first = conn.stream("match (n:t) return n.x order by n.x")
-            second = conn.stream("match (n:t) return n.x order by n.x desc")
+            first = conn.stream("match (n:t) return n.x as x order by x")
+            second = conn.stream("match (n:t) return n.x as x order by x desc")
             assert next(iter(first)) == (1,)
             assert next(iter(second)) == (2,)
             conn.rollback()
@@ -471,6 +474,6 @@ class TestWhatAStreamNeeds:
         agens.execute("create (:t {x: 1}), (:t {x: 2})")
         with agensgraph.Connection.connect(dsn) as conn:
             conn.execute(f"set graph_path = {agens.label_table.graph}")
-            rows = list(conn.stream("match (n:t) return n.x order by n.x -- why\n"))
+            rows = list(conn.stream("match (n:t) return n.x as x order by x -- why\n"))
             assert [row[0] for row in rows] == [1, 2]
             conn.rollback()

@@ -79,6 +79,7 @@ __all__ = [
     "IntegrityError",
     "InterfaceError",
     "InternalError",
+    "MissingLabel",
     "NoEnclosingTransaction",
     "NotSupportedError",
     "OperationalError",
@@ -330,6 +331,16 @@ class ReadOnlyGraphWrite(_pg.ReadOnlySqlTransaction):
     """A graph write in a transaction that was opened read-only."""
 
 
+class MissingLabel(_pg.UndefinedObject, _pg.InternalError_):
+    """A write named a label the graph does not have.
+
+    2.14 reports this as ``42704``. 2.15 reports the same thing as an internal error,
+    ``cannot find target label``, which reads as a server fault. This carries ``42704`` so a
+    caller handles one code on every release, and is still the internal error psycopg raised,
+    so an ``except`` written against that keeps matching.
+    """
+
+
 class UnresolvedCommit(_pg.OperationalError):
     """Whether a transaction committed could not be established.
 
@@ -505,13 +516,19 @@ _CONFIGURATION_GATES: tuple[tuple[str, str, str], ...] = (
 )
 
 
+_GRAPH_DML_BEFORE_2_17 = (
+    "AgensGraph before 2.17 refuses plain SQL INSERT, UPDATE and DELETE on a label table "
+    "outright, and has no enable_graph_dml setting to allow them; write through Cypher, or "
+    "load with COPY"
+)
+
 # The command tag in `cannot execute <tag> in a read-only transaction`. Up to 2.17 a graph write
 # had no tag and printed as `???`; from 2.18 it is `CYPHER`. Only the tag is matched, because the
 # sentence around it is translated when lc_messages is and the tag is not.
 _GRAPH_WRITE_REFUSED = re.compile(r"\?\?\?|\bCYPHER\b")
 
 
-def translate(exc: BaseException) -> _pg.Error | None:
+def translate(exc: BaseException, *, graph_dml_setting: bool = True) -> _pg.Error | None:
     """A better exception for the failures the server describes badly, or ``None``.
 
     Three of them. Two settings refuse work through a path that attaches no SQLSTATE, so
@@ -519,6 +536,10 @@ def translate(exc: BaseException) -> _pg.Error | None:
     neither -- those become a :class:`ConfigurationError` naming the setting. And a graph
     write in a read-only transaction is classified correctly but named by a command tag
     rather than by what it did, which is replaced with a sentence that says it.
+
+    ``graph_dml_setting`` says whether the server has ``enable_graph_dml``. Before 2.17 it
+    does not, and refuses a plain SQL write to a label table with the same words, so the
+    explanation says what to do there instead of naming a setting that cannot be changed.
 
     The replacement is always a subclass of what psycopg would have raised, so an
     ``except`` clause written against psycopg keeps matching.
@@ -529,8 +550,13 @@ def translate(exc: BaseException) -> _pg.Error | None:
     message = str(exc).strip()
 
     if state == "XX000":
+        if message.startswith("cannot find target label"):
+            return MissingLabel(message)
         for text, setting, explanation in _CONFIGURATION_GATES:
             if message == text:
+                if setting == "enable_graph_dml" and not graph_dml_setting:
+                    replacement = ConfigurationError(f"{text}: {_GRAPH_DML_BEFORE_2_17}")
+                    return replacement
                 replacement = ConfigurationError(f"{text}: {explanation}")
                 replacement.setting = setting
                 return replacement

@@ -854,7 +854,7 @@ class TestExportingFromAnAwaitingSource:
             await conn.graph(graph)
             await conn.execute("create vlabel doc")
             await conn.execute(
-                f"unwind range(1,{self.ROWS})::jsonb as i create (:doc {{n: i}})"
+                f"unwind {list(range(1, self.ROWS + 1))} as i create (:doc {{n: i}})"
             )
             await conn.refresh_labels()
             await conn.set_autocommit(False)

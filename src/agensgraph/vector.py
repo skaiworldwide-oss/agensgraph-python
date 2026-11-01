@@ -55,6 +55,7 @@ if TYPE_CHECKING:
     from psycopg.abc import AdaptContext, Buffer
     from psycopg.types import TypeInfo
 
+    from .capabilities import Capabilities
     from .introspect import Index
 
 __all__ = [
@@ -510,6 +511,21 @@ def search_option_statements(options: Mapping[str, object], *, local: bool = Tru
     return statements
 
 
+def _check_server(capabilities: Capabilities | None, dimensions: int | None) -> None:
+    """Refuse a Cypher vector statement the server would misread or not parse.
+
+    A cast carrying a dimension in Cypher, ``::vector(4)``, needs 2.17: 2.16 parses it and drops
+    the dimension, and older releases refuse it. A property with a column of its own needs 2.18.
+    Without ``capabilities`` the statement is built as asked, for a caller that knows its server.
+    """
+    if capabilities is None:
+        return
+    if dimensions is None:
+        capabilities.has("property_promotion", check=True)
+    else:
+        capabilities.has("cypher_typmod_cast", check=True)
+
+
 def _searched_expression(property: str, dimensions: int | None, type: str) -> str:
     """How a searched vector is spelled, for the index and for the search alike.
 
@@ -558,6 +574,7 @@ def vector_index(
     operator_class: str = "vector_cosine_ops",
     name: str | None = None,
     options: Mapping[str, object] | None = None,
+    capabilities: Capabilities | None = None,
 ) -> str:
     """A property index over a vector, in the property map or in a column of its own.
 
@@ -572,9 +589,12 @@ def vector_index(
     index takes, as ``options={"lists": 10}``. The operator class serves one operator:
     ``vector_cosine_ops`` answers ``<=>`` and a search ordering by ``<->`` against it sorts a
     sequential scan. :attr:`Distance.operator_class` gives the one for an operator.
+
+    Pass the connection's ``capabilities`` to have a server that cannot carry the statement refused
     """
     from .cypher import quote_identifier
 
+    _check_server(capabilities, dimensions)
     expression = _searched_expression(property, dimensions, type)
     given = f"{quote_identifier(name)} " if name else ""
     # An access method and an operator class are both named by an identifier, and the server
@@ -595,6 +615,7 @@ def nearest(
     limit: int = 10,
     operator: str = "<=>",
     variable: str = "n",
+    capabilities: Capabilities | None = None,
 ) -> str:
     """The Cypher statement that finds the closest elements to a given vector.
 
@@ -603,10 +624,12 @@ def nearest(
     builds, including under ``plan_cache_mode = force_generic_plan``.
 
     ``dimensions`` and ``type`` are the ones the index was built with, spelled by the function the
-    index uses.
+    index uses. ``capabilities`` refuses a server that cannot carry the statement, as for
+    :func:`vector_index`.
     """
     from .cypher import quote_identifier
 
+    _check_server(capabilities, dimensions)
     # An operator is not an identifier and cannot be quoted, so it is checked against the ones
     # the extension defines.
     if operator not in _OPERATORS:

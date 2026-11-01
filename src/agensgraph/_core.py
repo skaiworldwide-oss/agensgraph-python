@@ -409,14 +409,15 @@ class GraphMixin:
             )
         )
 
-    @staticmethod
-    def _translated(exc: BaseException) -> BaseException:
+    def _translated(self, exc: BaseException) -> BaseException:
         """A failure the server described badly, described properly, or the failure itself.
 
         A failure caused by a string's declared type also picks up a note saying why the
-        parameter was text, which is the one thing the server's own message cannot know.
+        parameter was text, which is the one thing the server's own message cannot know. The
+        server's version decides what a refused plain SQL write to a label table is told to do.
         """
-        replacement = redact_details(translate(exc) or exc)
+        better = translate(exc, graph_dml_setting=self.capabilities.has("graph_dml_setting"))
+        replacement = redact_details(better or exc)
         hint = explain_string_type(replacement)
         if hint is not None:
             replacement.add_note(hint)

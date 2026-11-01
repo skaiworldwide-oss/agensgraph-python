@@ -289,7 +289,7 @@ def joined(agens):  # type: ignore[no-untyped-def]
     agens.refresh_labels()
     agens.load_vertices("p", [{"n": i} for i in range(60)])
     ids = [
-        row[0] for row in agens.execute("match (n:p) return id(n) order by id(n)").fetchall()
+        row[0] for row in agens.execute("match (n:p) return id(n) as i order by i").fetchall()
     ]
     return agens, ids
 

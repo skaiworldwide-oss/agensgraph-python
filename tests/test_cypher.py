@@ -126,6 +126,17 @@ class TestQuoteIdentifier:
     def test_a_lower_case_name_is_left_plain(self, name: str) -> None:
         assert quote_identifier(name) == name
 
+    @pytest.mark.parametrize(
+        "name", ["offset", "array", "let", "finish", "current_graph", "path"]
+    )
+    def test_a_word_some_release_keeps_for_itself_is_quoted(self, name: str) -> None:
+        """Measured: each of these breaks a statement as a bare label or variable on some release."""
+        assert quote_identifier(name) == f'"{name}"'
+
+    @pytest.mark.parametrize("name", ["name", "type", "value", "label", "key", "data"])
+    def test_a_word_no_release_keeps_is_left_plain(self, name: str) -> None:
+        assert quote_identifier(name) == name
+
     @pytest.mark.parametrize("name", ["Person", "MixedKey", "UPPER", "aB", "eMail"])
     def test_a_name_holding_a_capital_is_quoted(self, name: str) -> None:
         """The lexer lowers an unquoted name, so bare it would reach the server as another."""

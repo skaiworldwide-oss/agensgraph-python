@@ -158,7 +158,9 @@ class TestExecuteQuery:
         from psycopg.rows import scalar_row
 
         result = conn.execute_query(
-            "match (n:person) return n.name order by n.name", row_=scalar_row
+            # ORDER BY names the alias: before 2.17 it may name only what the RETURN projects.
+            "match (n:person) return n.name as name order by name",
+            row_=scalar_row,
         )
         assert result.records == ["a", "b"]
 
@@ -169,7 +171,12 @@ class TestExecuteQuery:
     def test_a_setting_that_refused_the_work_is_named(self, conn, name: str) -> None:  # type: ignore[no-untyped-def]
         with pytest.raises(ConfigurationError) as caught:
             conn.execute_query(f"insert into \"{name}\".person values (default, '{{}}'::jsonb)")
-        assert caught.value.setting == "enable_graph_dml"
+        if conn.capabilities.has("graph_dml_setting"):
+            assert caught.value.setting == "enable_graph_dml"
+        else:
+            # Before 2.17 there is no setting to name, so the refusal says what to do instead.
+            assert caught.value.setting is None
+            assert "before 2.17" in str(caught.value)
 
 
 class TestTheLabelTableGoingStale:
