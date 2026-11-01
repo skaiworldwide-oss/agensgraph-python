@@ -21,6 +21,7 @@ from .connection import Connection as Connection
 from .connection_async import AsyncConnection as AsyncConnection
 from .deadline import Deadline as Deadline
 from .deadline import Expired as Expired
+from .deadline import Stalled as Stalled
 from .errors import BatchFailed as BatchFailed
 from .errors import Retryability as Retryability
 from .errors import is_retryable as is_retryable
@@ -116,6 +117,7 @@ __all__ = [
     "RetryPolicy",
     "Retryability",
     "SparseVector",
+    "Stalled",
     "TokenBucket",
     "Triple",
     "Unique",

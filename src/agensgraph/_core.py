@@ -12,15 +12,17 @@ interface from the other: the more that lives here, the less there is to keep in
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from itertools import count
-from typing import TYPE_CHECKING, Any, NamedTuple, Union
+from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, Union, cast
 
 from psycopg import errors as _pg
 from psycopg.conninfo import conninfo_to_dict as _conninfo_to_dict
 from psycopg.pq import TransactionStatus
 
 from ._protocol.labels import LabelCache
+from ._watchdog import GRACE, WATCHDOG
 from .adapters import graph_adapters, register_binary, register_text
 from .capabilities import Capabilities
 from .cypher import (
@@ -32,6 +34,7 @@ from .cypher import (
     quote_identifier,
     writable_counters,
 )
+from .deadline import Stalled
 from .errors import (
     ReadOnlyBoundaryLost,
     ReadOnlyGraphWrite,
@@ -48,9 +51,13 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Sequence
 
     from psycopg import ConnectionInfo
+    from psycopg.abc import PQGen
     from psycopg.adapt import AdaptersMap
     from psycopg.pq.abc import PGconn
     from psycopg.sql import SQL, Composed
+
+    from ._watchdog import Watch
+_RV = TypeVar("_RV")
 
 __all__ = [
     "GRAPH_ADAPTERS",
@@ -176,6 +183,45 @@ def with_keepalives(kwargs: dict[str, Any], conninfo: str = "") -> dict[str, Any
     return {**{k: v for k, v in KEEPALIVE_DEFAULTS.items() if k not in named}, **kwargs}
 
 
+def with_idle_limit(kwargs: dict[str, Any], conninfo: str = "") -> dict[str, Any]:
+    """The connection arguments, with ``idle_in_transaction_timeout`` made a startup setting.
+
+    A connection that opens a transaction and then stops -- a crashed worker, a caller holding a
+    transaction across a slow call of its own -- holds its locks until something ends it. The
+    server's ``idle_in_transaction_session_timeout`` ends it, and as a startup setting it costs no
+    statement. It goes into ``options`` after whatever the caller already put there, from the
+    arguments or the connection string, rather than replacing it.
+    """
+    seconds = kwargs.pop("idle_in_transaction_timeout", None)
+    if seconds is None:
+        return kwargs
+    if isinstance(seconds, bool) or not isinstance(seconds, int | float) or seconds <= 0:
+        raise ValueError(f"idle_in_transaction_timeout is a number of seconds, got {seconds!r}")
+    given = kwargs.get("options")
+    if given is None and conninfo:
+        given = _conninfo_to_dict(conninfo).get("options")
+    setting = f"-c idle_in_transaction_session_timeout={max(1, round(seconds * 1000))}"
+    return {**kwargs, "options": f"{given} {setting}" if given else setting}
+
+
+def _look_again_at(conn: GraphMixin, now: float) -> float | None:
+    """When the watchdog should look at a connection again, or ``None`` to shut it down now.
+
+    Quiet too long is a statement running and nothing heard for ``GRACE`` longer than the limit
+    the server holds now -- read each time, since a rollback can take the limit back. With no limit
+    there is nothing to measure silence against, so it only looks again. On the watchdog's thread:
+    it reads two attributes and does nothing else.
+    """
+    limit = conn._agens_statement_timeout_ms
+    if limit is None:
+        return now + GRACE
+    quiet = limit / 1000 + GRACE
+    heard = conn._agens_heard_at
+    if heard is None:
+        return now + quiet
+    return None if now - heard >= quiet else heard + quiet
+
+
 class GraphMixin:
     """Everything a graph connection knows that does not require waiting for the server."""
 
@@ -238,8 +284,37 @@ class GraphMixin:
     _agens_lent: bool = False
     """Whether a pool has lent this connection to somebody, and not had it back."""
 
-    _agens_statement_timeout: bool = False
-    """Whether a statement timeout was set on this connection for the caller now holding it."""
+    _agens_statement_timeout_ms: int | None = None
+    """The statement timeout the driver set on this connection, or ``None`` for the default.
+
+    Kept so that a caller wanting the limit the connection already holds is not sent the statement
+    that sets it again, and so that the watchdog knows how long the server may go unheard.
+    """
+
+    _agens_timeout_before_transaction: int | None = None
+    _agens_timeout_set_in_transaction: bool = False
+    """Whether the limit was set inside the transaction now open, and what was held before it.
+
+    Such a setting is part of the transaction, so a rollback takes it back, and the note above goes
+    back with it when the transaction ends.
+    """
+
+    _agens_watches: frozenset[Watch] = frozenset()
+    """The watches armed on this connection; while there is any, its waits are timed."""
+
+    _agens_heard_at: float | None = None
+    """When the server was last heard from while a statement ran, on the monotonic clock.
+
+    ``None`` while no statement is running, and noted only while a watch is armed. Written by the
+    connection's own thread and read by the watchdog's.
+    """
+
+    _agens_returned_at: float = 0.0
+    """When a pool last had this connection back, on the monotonic clock.
+
+    A connection returned moments ago, with nothing since suggesting the server went away, is lent
+    again without the round trip a health check costs.
+    """
 
     _agens_cancelled: bool = False
     """Whether a statement on this connection was interrupted rather than finished.
@@ -439,6 +514,68 @@ class GraphMixin:
         """
         if not self._agens_binary_ready:
             raise StaleLabelCache.for_binary()
+
+    # -- the client's own deadline ----------------------------------------------------------
+
+    def _watch(self) -> Watch | None:
+        """Watch this connection for a server gone quiet, or not at all without a limit.
+
+        Quiet is a statement running and nothing heard for ``GRACE`` longer than the server's own
+        limit allows: a statement that is merely slow the server ends itself, so silence that long
+        is the network. A block running past its budget, a caller busy between statements, and a
+        long batch whose answers keep coming are none of them quiet.
+        """
+        limit = self._agens_statement_timeout_ms
+        if limit is None:
+            return None
+        watch = WATCHDOG.arm(
+            time.monotonic() + limit / 1000 + GRACE,
+            self,  # type: ignore[arg-type]
+            _look_again_at,
+        )
+        self._agens_watches |= {watch}
+        return watch
+
+    def _unwatch(self, watch: Watch | None) -> bool:
+        """Stop watching; whether the watchdog had already shut the connection down."""
+        if watch is None:
+            return False
+        self._agens_watches -= {watch}
+        return WATCHDOG.disarm(watch)
+
+    def _hearing(self, gen: PQGen[_RV]) -> PQGen[_RV]:
+        """psycopg's generator, noting each time the server is heard from while a statement runs.
+
+        A step that finds the socket ready is the server, or at least the network, moving. psycopg
+        also steps it every tenth of a second with nothing ready, so that an interruption is seen;
+        those are not heard. A connection that is not running a statement -- waiting for a
+        notification, say -- is not waiting on the server, and notes nothing.
+        """
+        try:
+            asked = next(gen)
+            self._note_heard()
+            while True:
+                ready = yield asked
+                if ready:
+                    self._note_heard()
+                asked = gen.send(ready)
+        except StopIteration as done:
+            return cast("_RV", done.value)
+        finally:
+            self._agens_heard_at = None
+
+    def _note_heard(self) -> None:
+        running = self.pgconn.transaction_status == TransactionStatus.ACTIVE
+        self._agens_heard_at = time.monotonic() if running else None
+
+    def _given_up(self) -> bool:
+        """Whether the watchdog has shut this connection down."""
+        return any(watch.fired for watch in self._agens_watches)
+
+    def _stalled(self) -> Stalled:
+        """What a caller whose connection the watchdog shut down is told."""
+        limit = self._agens_statement_timeout_ms
+        return Stalled.unheard((limit or 0) / 1000 + GRACE, limit)
 
     @staticmethod
     def _select_graph_statement(name: str) -> str:

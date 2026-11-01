@@ -21,7 +21,7 @@ they already know.
 from __future__ import annotations
 
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 import psycopg
 from psycopg.adapt import AdaptersMap
@@ -37,6 +37,7 @@ from ._core import (
     savepoint_name,
     statement_text,
     stream_name,
+    with_idle_limit,
     with_keepalives,
 )
 from ._protocol.labels import CURRENT_GRAPH_QUERY, LabelCache
@@ -135,13 +136,14 @@ if TYPE_CHECKING:
     from typing import Self
 
     from psycopg._queries import PostgresQuery
-    from psycopg.abc import Params, Query, QueryNoTemplate
+    from psycopg.abc import Params, PQGen, Query, QueryNoTemplate
     from psycopg.copy import Copy, Writer
     from psycopg.rows import RowFactory
 
     from ._core import Statement
     from ._protocol.graphid import GraphId
 __all__ = ["Connection", "Cursor"]
+_RV = TypeVar("_RV")
 _READ_ONLY_PROBE_READ = "match (n) where false return n"
 _READ_ONLY_PROBE_WRITE = "match (n) where false set n.agensgraph_probe = 1"
 
@@ -369,8 +371,13 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
 
         Keepalive is asked for unless the caller decided otherwise; see
         :data:`~agensgraph._core.KEEPALIVE_DEFAULTS` for what that is worth.
+
+        ``idle_in_transaction_timeout=`` seconds has the server end a session that leaves a
+        transaction open and idle that long, so a caller that stopped cannot hold its locks for
+        ever. It is a startup setting, so it costs no statement; it is left unset unless asked for.
         """
-        conn = super().connect(conninfo, **with_keepalives(kwargs, conninfo))
+        arguments = with_idle_limit(with_keepalives(kwargs, conninfo), conninfo)
+        conn = super().connect(conninfo, **arguments)
         conn.add_notice_handler(report_notice)
         conn._note_graph_path()
         try:
@@ -452,15 +459,56 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
         super().rollback()
         self._transaction_ended(rolled_back=True)
 
+    def wait(self, gen: PQGen[_RV], *args: Any, **kwargs: Any) -> _RV:
+        """psycopg's wait on the server, timed while a watch is armed (see :meth:`deadline`).
+
+        Every exchange with the server comes through here -- a statement, its rows, a ``COPY``, a
+        pipeline's answers, a commit -- so this is where the watchdog learns the server is still
+        talking, and where a connection it shut down is reported as :class:`~agensgraph.Stalled`
+        to whichever statement was waiting. A connection with no watch armed waits exactly as
+        psycopg does.
+        """
+        if not self._agens_watches:
+            return super().wait(gen, *args, **kwargs)
+        try:
+            return super().wait(self._hearing(gen), *args, **kwargs)
+        except psycopg.Error as exc:
+            if self._given_up():
+                raise self._stalled() from exc
+            raise
+
+    def _set_statement_timeout(self, limit: int | None) -> None:
+        """Set the server's statement timeout, or put back the default, and keep a note of it.
+
+        Inside a transaction the setting is part of it, so what was held before is noted too, for
+        :meth:`_transaction_ended` to put back if the transaction rolls back.
+        """
+        held = self._agens_statement_timeout_ms
+        self._run(f"set statement_timeout = {('default' if limit is None else limit)}")
+        if self.pgconn.transaction_status != TransactionStatus.IDLE and (
+            not self._agens_timeout_set_in_transaction
+        ):
+            self._agens_timeout_set_in_transaction = True
+            self._agens_timeout_before_transaction = held
+        self._agens_statement_timeout_ms = limit
+
     def _transaction_ended(self, *, rolled_back: bool) -> None:
-        """Bring the label table in step with a transaction that just ended.
+        """Bring the label table and the statement timeout's note in step with a transaction.
 
         Where the server reports the path, what it reports decides. Elsewhere a rollback over
         a path set inside the transaction drops the table. The note of that setting ends with
-        the outermost transaction; a block rolled back to a savepoint keeps it.
+        the outermost transaction; a block rolled back to a savepoint keeps it. A timeout set inside
+        the transaction goes back on a rollback to what it was before, and so does its note.
         """
         if self.closed:
             return
+        if (
+            self._agens_timeout_set_in_transaction
+            and self.pgconn.transaction_status == TransactionStatus.IDLE
+        ):
+            if rolled_back:
+                self._agens_statement_timeout_ms = self._agens_timeout_before_transaction
+            self._agens_timeout_set_in_transaction = False
         if self._agens_reports_graph_path:
             self._follow_reported_graph_path()
             return
@@ -581,7 +629,7 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
 
     @contextmanager
     def deadline(
-        self, budget: Deadline | float | None, *, gap: float = 0.5
+        self, budget: Deadline | float | None, *, gap: float | None = None
     ) -> Generator[Deadline]:
         """Bound how long the statements in this block may take, and hand back the budget.
 
@@ -614,20 +662,35 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
         here.
 
         A budget with no limit sets nothing and costs nothing.
+
+        **The client holds the limit too.** A server can only stop a statement it can still hear
+        from, so a network that stops answering would leave the block waiting for ever. If a
+        statement is running and the server has sent nothing for half a second longer than its own
+        limit allows, the socket is shut down: the caller gets :class:`~agensgraph.Stalled`, and the
+        connection, which is broken by then, is closed. See :mod:`agensgraph._watchdog`; arming it
+        costs a few microseconds, and only a stalled network ever sets it off -- not a block that
+        runs past its budget doing work of its own between statements.
         """
         held = budget if isinstance(budget, Deadline) else Deadline(budget)
         limit = held.statement_timeout_ms(gap=gap)
         if limit is None:
             yield held
             return
-        self.execute(f"set statement_timeout = {limit}")
-        self._agens_statement_timeout = True
+        self._set_statement_timeout(limit)
+        watch = self._watch()
         try:
             yield held
         finally:
-            if not self.closed and self.pgconn.transaction_status != TransactionStatus.INERROR:
-                self.execute("set statement_timeout = default")
-            self._agens_statement_timeout = False
+            try:
+                if (
+                    not self._given_up()
+                    and (not self.closed)
+                    and (self.pgconn.transaction_status != TransactionStatus.INERROR)
+                ):
+                    self._set_statement_timeout(None)
+            finally:
+                if self._unwatch(watch):
+                    self.close()
 
     @contextmanager
     def read_only_transaction(self, *, allow_server_programs: bool = False) -> Generator[None]:

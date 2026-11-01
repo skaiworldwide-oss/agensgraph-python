@@ -41,6 +41,7 @@ from __future__ import annotations
 import contextlib
 import inspect
 import threading
+import time
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, ClassVar, TypeVar
 
@@ -126,7 +127,8 @@ class AsyncConnectionPool:
         num_workers: int = 3,
         check_connections: bool = True,
         name: str | None = None,
-        statement_timeout_gap: float = 0.5,
+        statement_timeout_gap: float | None = None,
+        check_after_idle: float = 30.0,
     ) -> None:
         """Set a pool up.
 
@@ -142,7 +144,10 @@ class AsyncConnectionPool:
 
         *check_connections* is on by default. The check is an empty statement rather than a
         query, deliberately cheap, and without it the first callers after a server restart each
-        receive the failure themselves.
+        receive the failure themselves. It is skipped for a connection returned less than
+        *check_after_idle* seconds ago, which saves a round trip on nearly every borrow of a busy
+        pool -- except for *check_after_idle* seconds after a caller meets a failure saying the
+        server may have gone away, when every borrow is checked again.
         """
         self._conninfo = conninfo
         self._kwargs = kwargs
@@ -155,6 +160,11 @@ class AsyncConnectionPool:
         # a returning connection touches are not incremented from one thread alone.
         self._counters = threading.Lock()
         self._statement_timeout_gap = statement_timeout_gap
+        self._check_after_idle = check_after_idle
+        # Until when every borrow is checked, after a caller met a failure saying the server may
+        # have gone away. Every connection, not only those returned before it: the one that failed
+        # comes back after the failure, looking as fresh as any other.
+        self._check_every_borrow_until = 0.0
         self._retired = 0
         self._interrupted = 0
         self._pool: psycopg_pool.AsyncConnectionPool[AsyncConnection[Any]] = self._pool_class(
@@ -256,7 +266,18 @@ class AsyncConnectionPool:
             conn._agens_lent = False
 
     async def _check(self, conn: AsyncConnection[Any]) -> None:
-        """psycopg's own check, on a connection the pool is holding rather than lending."""
+        """psycopg's own check, on a connection the pool is holding rather than lending.
+
+        Skipped for one returned within *check_after_idle* seconds, unless a failure has lately
+        suggested the server went away: such a connection has just finished work, so the round
+        trip would only tell the pool what it already knows.
+        """
+        now = time.monotonic()
+        if (
+            now >= self._check_every_borrow_until
+            and now - conn._agens_returned_at < self._check_after_idle
+        ):
+            return
         async with self._working_on(conn):
             await psycopg_pool.AsyncConnectionPool.check_connection(conn)
 
@@ -307,6 +328,7 @@ class AsyncConnectionPool:
         if self._user_reset is not None:
             async with self._working_on(conn):
                 await self._user_reset(conn)
+        conn._agens_returned_at = time.monotonic()
 
     # -- taking one out -----------------------------------------------------------------
 
@@ -340,7 +362,22 @@ class AsyncConnectionPool:
                     if conn._agens_generation != self._generation:
                         continue
                     await self._prepare(conn, budget)
-                    yield conn
+                    # Held by the client as well as the server, so a network that stops
+                    # answering costs this caller its budget and not for ever.
+                    watch = conn._watch()
+                    try:
+                        yield conn
+                    finally:
+                        given_up = conn._unwatch(watch)
+                        if given_up:
+                            await conn.close()
+                        if given_up or conn.broken:
+                            # The server or the network may have gone, not just this caller's
+                            # statement: for a while, every connection returned before this one
+                            # is checked before it is lent again.
+                            self._check_every_borrow_until = (
+                                time.monotonic() + self._check_after_idle
+                            )
                     return
             raise StaleGeneration.for_pool(self._generation)
         except _pool_errors.PoolTimeout:
@@ -376,14 +413,24 @@ class AsyncConnectionPool:
 
         Only ever one statement: a caller with a budget replaces whatever was there, and a
         caller without one pays nothing unless the connection is carrying a limit.
+
+        The limit last sent is remembered. Outside autocommit the setting is part of the
+        borrower's transaction, which the pool rolls back when the block raises; the note goes
+        back with it, so the next borrow sends its own rather than trusting a limit the server no
+        longer holds.
         """
         limit = budget.statement_timeout_ms(gap=self._statement_timeout_gap)
         if limit is not None:
-            await conn.execute(f"set statement_timeout = {limit}")
-            conn._agens_statement_timeout = True
-        elif conn._agens_statement_timeout:
-            await conn.execute("set statement_timeout = default")
-            conn._agens_statement_timeout = False
+            # Rounded up to a tenth of a second, inside the gap, so callers whose budgets differ by
+            # a few milliseconds find the connection already holding theirs and send nothing --
+            # unless a short budget's gap is too small to hold the rounding.
+            rounded = -(-limit // 100) * 100
+            if rounded * 0.001 < (budget.available() or 0.0):
+                limit = rounded
+            if conn._agens_statement_timeout_ms != limit:
+                await conn._set_statement_timeout(limit)
+        elif conn._agens_statement_timeout_ms is not None:
+            await conn._set_statement_timeout(None)
         if self._setup is not None:
             await self._setup(conn)
 
@@ -661,7 +708,7 @@ class AsyncNullConnectionPool(AsyncConnectionPool):
         num_workers: int = 3,
         check_connections: bool = True,
         name: str | None = None,
-        statement_timeout_gap: float = 0.5,
+        statement_timeout_gap: float | None = None,
     ) -> None:
         super().__init__(
             conninfo,

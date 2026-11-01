@@ -19,12 +19,18 @@ unresolvable write is not.
 from __future__ import annotations
 
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Self
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
-__all__ = ["Deadline", "Expired"]
+__all__ = ["DEFAULT_GAP", "GAP_FRACTION", "Deadline", "Expired", "Stalled"]
+
+DEFAULT_GAP = 0.5
+"""How far below a budget the server is asked to stop, when the budget has room for it."""
+
+GAP_FRACTION = 0.2
+"""The share of a short budget the gap takes instead, so a short budget is not refused."""
 
 
 class Expired(TimeoutError):
@@ -39,12 +45,31 @@ class Expired(TimeoutError):
     total: float | None = None
 
     @classmethod
-    def after(cls, spent: float, total: float, *, doing: str) -> Expired:
+    def after(cls, spent: float, total: float, *, doing: str) -> Self:
         """Build the report, naming what ran out of time and how much it had."""
         exc = cls(f"{doing} ran out of its {total:.3f}s budget after {spent:.3f}s")
         exc.spent = spent
         exc.total = total
         return exc
+
+
+class Stalled(Expired):
+    """The server stopped answering a statement, and the client stopped waiting for it.
+
+    Unlike the budget running out before anything was sent, the statement went: whether the server
+    ran it, or committed it, is unknown. :func:`~agensgraph.errors.retryability` reads it as a
+    lost connection, which after a write is an outcome to settle rather than a statement to repeat.
+    """
+
+    @classmethod
+    def unheard(cls, quiet: float, limit_ms: int | None) -> Stalled:
+        """Build the report, naming how long the server went unheard against what it allows."""
+        return cls(
+            f"the network stopped answering: nothing came from the server for {quiet:.3f}s while "
+            f"a statement ran, where its statement_timeout of {limit_ms} ms would have ended a "
+            f"slow one; the connection was shut down and closed, and whether the server ran the "
+            f"statement is unknown"
+        )
 
 
 class Deadline:
@@ -144,16 +169,22 @@ class Deadline:
         remaining = max(remaining, 0.0)
         return remaining if seconds is None else min(seconds, remaining)
 
-    def statement_timeout_ms(self, *, gap: float = 0.5) -> int | None:
+    def statement_timeout_ms(self, *, gap: float | None = None) -> int | None:
         """What to ask the server to stop at, in milliseconds, or ``None`` for no limit.
 
         Set below what the caller is waiting for, so that the server is the one to give up and
         reports it as a cancelled statement, rather than the caller giving up first and leaving
         a statement running on a connection it no longer holds.
+
+        The *gap* below the budget is half a second, or a fifth of what is available when that is
+        less, so a budget of half a second or less can be used and a one-second one keeps most of
+        its time. Pass *gap* to fix it instead.
         """
         available = self.available()
         if available is None:
             return None
+        if gap is None:
+            gap = min(DEFAULT_GAP, available * GAP_FRACTION)
         limit = int((available - gap) * 1000)
         if limit < 1:
             # A floor of one millisecond is a limit no statement can meet, and it outlives the

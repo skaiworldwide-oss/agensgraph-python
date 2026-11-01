@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import time
 
+import psycopg
 import psycopg_pool
 import pytest
 import pytest_asyncio
@@ -530,6 +531,26 @@ class TestAStatementTimeoutBelongsToOneBorrow:
                 second = conn.execute("show statement_timeout").fetchone()[0]
             assert first != second
 
+    def test_a_limit_the_rollback_took_back_is_sent_again(self, dsn: str) -> None:
+        """Outside autocommit the limit is part of the borrower's transaction, which the pool
+        rolls back when the block raises; the next borrow with the same budget must not find
+        the server without it."""
+        from agensgraph.deadline import Deadline
+
+        held: list[str] = []
+        with agensgraph.ConnectionPool(dsn, min_size=1, max_size=1, timeout=5.0) as pool:
+
+            def a_borrow_that_fails() -> None:
+                with pool.connection(deadline=Deadline(3.0)) as conn:
+                    held.append(conn.execute("show statement_timeout").fetchone()[0])
+                    raise ZeroDivisionError
+
+            with pytest.raises(ZeroDivisionError):
+                a_borrow_that_fails()
+            assert held[0] not in ("0", "")
+            with pool.connection(deadline=Deadline(3.0)) as conn:
+                assert conn.execute("show statement_timeout").fetchone()[0] == held[0]
+
 
 @pytest.mark.server
 class TestALockTakenByOthersTextStaysWithIt:
@@ -813,3 +834,76 @@ class TestTheStatsAreReadableOnASchedule:
             assert stats["requests_wait_ms"] > 0, "and they waited, which has to be reportable"
         finally:
             await pool.close()
+
+
+class TestTheBorrowFastPath:
+    """What a borrow costs when nothing has changed: no check, and no repeated setting."""
+
+    @pytest.fixture
+    def checks(self, monkeypatch):  # type: ignore[no-untyped-def]
+        seen: list[object] = []
+        original = psycopg_pool.ConnectionPool.check_connection
+
+        def counting(cls, conn):  # type: ignore[no-untyped-def]
+            seen.append(conn)
+            return original(conn)
+
+        monkeypatch.setattr(
+            psycopg_pool.ConnectionPool, "check_connection", classmethod(counting)
+        )
+        return seen
+
+    def test_a_connection_returned_moments_ago_is_not_checked_again(
+        self, dsn: str, checks
+    ) -> None:  # type: ignore[no-untyped-def]
+        with agensgraph.ConnectionPool(dsn, min_size=1, max_size=1) as pool:
+            for _ in range(5):
+                with pool.connection() as conn:
+                    conn.execute("select 1")
+        assert len(checks) <= 1, "only a connection nobody has used is checked"
+
+    def test_after_the_server_may_have_gone_every_borrow_is_checked(
+        self, dsn: str, checks
+    ) -> None:  # type: ignore[no-untyped-def]
+        with agensgraph.ConnectionPool(dsn, min_size=1, max_size=1) as pool:
+            with pool.connection() as conn:
+                conn.execute("select 1")
+
+            def ended_by_the_server() -> None:
+                with pool.connection() as conn:
+                    with psycopg.connect(dsn, autocommit=True) as admin:
+                        admin.execute(
+                            "select pg_terminate_backend(%s)", (conn.info.backend_pid,)
+                        )
+                    conn.execute("select 1")
+
+            with pytest.raises(psycopg.OperationalError):
+                ended_by_the_server()
+            before = len(checks)
+            for _ in range(2):
+                with pool.connection() as conn:
+                    conn.execute("select 1")
+        assert len(checks) == before + 2
+
+    @pytest.mark.parametrize("autocommit", [True, False])
+    def test_the_same_budget_twice_sets_the_limit_once(
+        self, dsn: str, autocommit: bool
+    ) -> None:
+        """Outside autocommit too: the limit is part of the borrower's transaction, which the
+        pool commits, and only a rollback would take it back."""
+        sent: list[str] = []
+
+        def record(record) -> None:  # type: ignore[no-untyped-def]
+            sent.append(record.statement)
+
+        agensgraph.add_query_logger(record)
+        try:
+            with agensgraph.ConnectionPool(
+                dsn, min_size=1, max_size=1, kwargs={"autocommit": autocommit}
+            ) as pool:
+                for _ in range(3):
+                    with pool.connection(deadline=Deadline(10.0)) as conn:
+                        conn.execute("select 1")
+        finally:
+            agensgraph.remove_query_logger(record)
+        assert sum(text.startswith("set statement_timeout") for text in sent) == 1

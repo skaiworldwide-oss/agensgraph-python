@@ -64,6 +64,7 @@ from psycopg.errors import (
 )
 
 from .deadline import Expired as _Expired
+from .deadline import Stalled as _Stalled
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -522,6 +523,9 @@ class StaleGeneration(_pg.OperationalError):
 # meaningless; waiting for the pool is worth doing later rather than sooner; and a pool that
 # has been closed will never hand anything over however long anyone waits.
 _OURS: tuple[tuple[type[BaseException], Retryability], ...] = (
+    # A reply that never came, so a lost connection: worth another on a new connection, and an
+    # outcome to settle where the transaction had written. Before Expired, which it is.
+    (_Stalled, Retryability.RECONNECT),
     # Named before the fall-through that reads any TimeoutError as an unknown outcome. This one
     # is the driver declining to send rather than a reply that never came, so nothing is
     # unknown: nothing was done. Whether there is budget left for another attempt is the
