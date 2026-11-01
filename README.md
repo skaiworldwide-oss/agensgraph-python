@@ -2,7 +2,7 @@
 
 [![PyPI](https://img.shields.io/pypi/v/agensgraph-python.svg)](https://pypi.org/project/agensgraph-python/)
 [![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue.svg)](https://pypi.org/project/agensgraph-python/)
-[![AgensGraph](https://img.shields.io/badge/AgensGraph-2.17%2B-1f6feb.svg)](https://github.com/skaiworldwide-oss/agensgraph)
+[![AgensGraph](https://img.shields.io/badge/AgensGraph-2.14%2B-1f6feb.svg)](https://github.com/skaiworldwide-oss/agensgraph)
 [![Tests](https://github.com/skaiworldwide-oss/agensgraph-python/actions/workflows/python-driver-test.yaml/badge.svg)](https://github.com/skaiworldwide-oss/agensgraph-python/actions/workflows/python-driver-test.yaml)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](https://github.com/skaiworldwide-oss/agensgraph-python/blob/master/LICENSE)
 
@@ -31,7 +31,8 @@ with agensgraph.connect("host=localhost dbname=graph") as conn:
 pip install agensgraph-python
 ```
 
-Python 3.11 or later. AgensGraph 2.17 or later.
+Python 3.11 or later. AgensGraph 2.14 or later; see [Server versions](#server-versions) for what
+differs between releases.
 
 Optional extras, imported only where they are used, so they never load on a read path:
 
@@ -157,17 +158,30 @@ an underscore:
 | `counts_=True` | read what the statement changed, see [What a write changed](#what-a-write-changed) |
 | `prepare_=` | override when psycopg prepares the statement |
 | `row_=` | a psycopg row factory |
+| `settings_={...}` | settings for this statement alone, sent in its round trip |
 
 Three methods run a statement, and each returns one kind of thing, so none of them returns a union:
 `execute_query` reads it all and gives a result, [`stream`](#streaming-a-large-result) gives an
 iterator that keeps the rows on the server, and `execute` is psycopg's own and gives a cursor.
 
-There is no `graph_` and no `timeout_`, and both absences have a reason. Selecting a graph is a
-statement, is undone by a rollback, and drops the label table, so it belongs on the connection or on
-the pool, once, rather than once per statement. Bounding a statement's time is two more statements,
-one to set the limit and one to put it back, which measures over twice a bare `RETURN 1` on a local
-server and is two more round trips against one a network away. A deadline therefore belongs where it
-is paid once for many statements: see [Deadlines](#deadlines).
+`settings_` is for a search that needs `hnsw.ef_search` raised, a join that needs hash joins off, or
+a slow read that needs its own `statement_timeout`:
+
+```python
+conn.execute_query(query, params, settings_={"hnsw.ef_search": 100, "statement_timeout": 5000})
+```
+
+The settings go as one `select set_config(..., true)` in a pipeline with the statement. In autocommit
+the two share one implicit transaction, so the settings end with the statement; inside a transaction
+they last until it ends, as `SET LOCAL` would. Measured against a local server, a read with two
+settings takes 0.25 ms against 0.21 ms for the bare read, and 1.03 ms for the same settings in a
+transaction of their own. A misspelt `hnsw.` or `ivfflat.` name is refused before anything is sent,
+and so is `graph_path`.
+
+There is no `graph_`, and that absence has a reason: selecting a graph is a statement, is undone by a
+rollback, and drops the label table, so it belongs on the connection or on the pool, once, rather
+than once per statement. A deadline for many statements belongs on the pool: see
+[Deadlines](#deadlines).
 
 ## Graph values
 
@@ -264,7 +278,8 @@ SQL on the same connection needs `WHERE x = ANY(%s)` to keep working.
 | `id(a) = %s` | graphid |
 | `size(%s)` | text (2.18 and later; earlier parsers take no parameter there) |
 | a label, `a.%s`, `{%s: v}`, the lower bound of a walk | not allowed, syntax error |
-| `UNWIND %s`, `x IN %s` | needs an explicit `::jsonb` |
+| `UNWIND %s` | needs an explicit `::jsonb` |
+| `x IN %s` | needs an explicit `::jsonb`, and 2.17 or later: 2.14 to 2.16 refuse a list parameter there. `UNWIND %s::jsonb AS k MATCH ... WHERE n.p = k` works everywhere, and can use an index |
 
 **One shape is refused by the driver before it is sent.** A parameter as the *upper* bound of a
 variable-length relationship, `[r*1..%s]`, is not a syntax error: the server reads it as an unbounded
@@ -848,11 +863,72 @@ not per server, so ask the connection rather than the version:
 
 ```python
 conn.has_vectors()          # is the extension created here
-conn.register_vectors()     # read vector, halfvec and sparsevec on this connection
+conn.register_vectors()     # read and send vector, halfvec and sparsevec here, in one round trip
 conn.vector_version()       # (0, 8, 6)
 ```
 
-Two routes, and both are indexed the same way:
+### Two ways to store vectors
+
+`VectorStorage` says where a label's vectors live, and the connection does the rest:
+
+```python
+from agensgraph import VectorStorage
+
+docs = VectorStorage("g", "doc", dimensions=1536)                      # in each vertex's properties
+docs = VectorStorage("g", "doc", dimensions=1536, storage="table")     # or in a table of their own
+
+conn.ensure_vectors(docs)                              # label, table or index: whatever is missing
+conn.write_vectors(docs, zip(ids, embeddings))         # Vectors, lists or numpy rows
+hits = conn.nearest(docs, query, k=10)                 # [VectorHit(vertex, distance), ...], nearest first
+conn.vectors_of(docs, ids)                             # {id: Vector}
+conn.delete_vectors(docs, ids)                         # the vectors go, the vertices stay
+conn.build_vector_index(docs)                          # after a bulk load, which is faster without it
+conn.drop_vectors(docs)                                # the table, or the property index
+```
+
+**In the properties** is the default: the vector is a property of the vertex, indexed and searched
+through a Cypher cast, as `vector_index()` and `nearest()` build it. It needs
+AgensGraph 2.17. Below that the server cannot carry it, and the driver refuses with a
+`CapabilityError` that names the other design:
+
+| Cypher on | `::vector(N)` | a property index over it | Cypher search |
+|---|---|---|---|
+| 2.14, 2.15 | syntax error | refused | refused |
+| 2.16 | the dimension is **silently dropped** from a property's value | refused: "column does not have dimensions" | a sequential scan, ~3.3 s at 20,000 vectors |
+| 2.17, 2.18 | works | works | an index scan, ~1.8 ms |
+
+**In a table** (`storage="table"`) keeps the vectors in `g_vectors.doc_embedding`,
+`(id graphid primary key references g.doc (id) on delete cascade, embedding vector(1536))`, or
+wherever `InTable(schema=..., name=...)` says. It works on every release from 2.14, and it is the
+faster design wherever more than the nearest neighbours is asked for. Measured on 22,000 vectors of
+1536 dimensions, on 2.14 and 2.18 alike:
+
+| | in a table | in the properties |
+|---|---|---|
+| nearest 10 | 2.5 ms | 3.6–5.2 ms |
+| nearest 10 among 10 % / 1 % of the label | 11 / 4 ms | 375–930 ms |
+| reading the label, vectors not wanted | 3 ms | 320–364 ms |
+| loading | 10.6 s | 18.7 s |
+| storage | 362 MB | 434 MB |
+
+In a table, `write_vectors` writes or replaces each row and leaves an unchanged one untouched;
+`upsert=False` sends one binary `COPY` instead, about 63,000 rows a second at 1536 dimensions. A
+vertex deleted with `DETACH DELETE` takes its row with it. Dropping the label or the graph with
+`CASCADE` drops only the table's key and keeps its rows, whose identities a re-created label hands out
+again, so `ensure_vectors` then raises `StaleVectorStorage` rather than attach old vectors to new
+vertices.
+
+The options belong to the design they are options of: `InTable(schema=, name=)` and
+`InProperties(promoted=True)`, a column of its own (2.18). `index=HNSW(m=, ef_construction=)`,
+`IVFFlat(lists=)` or `None` for exact search; `distance=` and `type=` (`vector`, `halfvec`,
+`sparsevec`) apply to both. Combinations pgvector cannot index are refused when the storage is made.
+
+### Writing the statements yourself
+
+Without `VectorStorage`, the properties design is a pair of statements you send yourself. A
+property in the map is indexed over a cast, and `vector_index()` and `nearest()` (under "Indexing
+and searching") build the statements; pass them `capabilities=` to have a server below 2.17 refused
+before anything is sent:
 
 ```python
 # a property left in the map, with the cast carrying the dimension
@@ -908,9 +984,33 @@ unsupported`. Bulk-load vectors as plain lists, and give the property a column o
 back as `Vector`: measured, a list loaded through `load_vertices` into a `vector(1536) generated`
 column reads back as a `Vector`.
 
-Half precision is `halfvec`, and works the same way. Binary quantisation is available in SQL, where
-`bit` is spellable; Cypher has no syntax for that cast, which is worth knowing before you look for
-one.
+**From numpy, pass the array.** `Vector(array)` copies a numpy array's buffer rather than reading it
+a number at a time: 0.5 µs for 1536 singles against 46 µs. Doubles are copied and narrowed in C.
+
+`%s` sends a `Vector` in its binary form; `%t` sends the text `[1.0,2.5]`, and a list of vectors goes
+as an array, as in `unnest(%s::vector[])`.
+
+Half precision is `halfvec`, and works the same way. A `Vector` sent with `%s` is a `vector` either
+way, and a `halfvec` column takes it through the server's cast. It is not sent as a `halfvec`,
+because pgvector casts a vector to a halfvec implicitly but not back: a half value compared with a
+`vector` column would turn the column into halves and leave its index unused. Binary quantisation is
+available in SQL, where `bit` is spellable; Cypher has no syntax for that cast, which is worth
+knowing before you look for one.
+
+A quantised vector is a bit string, and after `register_vectors()` one reads as a `Bits` and a `Bits`
+is sent as `bit`, so a Hamming or Jaccard search needs no cast on the parameter:
+
+```python
+from agensgraph.vector import Bits
+
+query = Bits("1010")                     # or Bits([True, False, True, False])
+conn.execute("SELECT id FROM t ORDER BY binary_quantize(embedding)::bit(4) <~> %s LIMIT 5", (query,))
+```
+
+`Bits` is a `str` of `0` and `1`, so it equals the text the server prints, which is how a connection
+that has not registered vectors reads a bit string; `to_bytes()` and `Bits.from_bytes(data, length)`
+give the packed form.
+
 
 ### Indexing and searching
 
@@ -1010,15 +1110,28 @@ and mirroring that is what keeps a round trip stable.
 A Cypher list cannot be written into a sparse column at all, so the dumper is not a convenience here;
 it is the reasonable way in.
 
+`%s` sends a `SparseVector` as text, which is what a Cypher property position needs. A SQL column of
+type `sparsevec` takes `%b`, which sends the type itself, or `%s::sparsevec`:
+
+```python
+conn.execute("INSERT INTO docs_store.sparse VALUES (%s, %b)", (identity, v))
+```
+
 ### Tuning a search
 
 ```python
-conn.vector_search_options({"hnsw.ef_search": 100})
+conn.execute_query(query, params, settings_={"hnsw.ef_search": 100})   # this search only
+
+with conn.transaction():
+    conn.vector_search_options({"hnsw.ef_search": 100})               # until the transaction ends
 ```
 
-Seven settings, listed with the type each takes in `agensgraph.vector.SEARCH_OPTIONS`. Applied to the
-transaction by default, so they do not leak into the next caller on a pooled connection; pass
-`local=False` to set them for the session.
+Seven settings, listed with the type each takes in `agensgraph.vector.SEARCH_OPTIONS`. With
+`settings_` they go in the search's own round trip and end with it. `vector_search_options` applies
+them to the transaction, so they do not leak into the next caller on a pooled connection, and sends
+every option in one statement; pass `local=False` to set them for the session. In autocommit outside
+a transaction there is no transaction for them to belong to, and the server would only warn and leave
+the search as it was, so `vector_search_options` warns and sends nothing. From 3.0 it will raise.
 
 ## Pooling
 
@@ -1104,12 +1217,33 @@ caller.
 
 `statement_timeout` is deliberately set a little inside the budget. Arriving at `COMMIT` with no time
 left manufactures the one failure that cannot be retried safely, so the gap is reserved rather than
-spent.
+spent. The gap is half a second, or a fifth of the budget when that is less, so a short budget is
+not refused.
+
+**The client holds the budget as well as the server.** A server can only stop a statement it can
+still hear from. Through a network that stops answering -- a proxy that stops forwarding, a load
+balancer that stops passing packets but still acknowledges them -- a call under a server-side limit
+alone was measured still waiting after fifteen seconds. So a block with a budget, a pool borrow or
+`conn.deadline(...)`, is also watched by one thread shared by the process. If a statement is
+running and the server has sent nothing for half a second longer than its own limit allows, the
+socket is shut down, the caller gets `Stalled`, and the broken connection is closed rather than
+lent again. Measured through a stalled proxy, a one-second budget returned in 1.44 s, blocking and
+awaiting alike. Arming the watch costs a third of a microsecond. Nothing but a server gone quiet
+sets it off: a block that runs past its budget doing its own work between statements, or a long
+batch whose answers keep arriving, keeps its connection.
 
 It never uses `transaction_timeout` or `idle_in_transaction_session_timeout` as a query deadline,
 because those terminate the *session*. `Expired` is a `TimeoutError`, so a caller that already
 catches one keeps working, and running out of your own budget is classified differently from a pool
-with nothing to give.
+with nothing to give. `Stalled` is an `Expired` that is classified as a lost connection: the
+statement was sent, so whether it ran -- or committed -- is unknown.
+
+Ending a session that is left idle inside a transaction is a separate decision, and is offered as a
+startup setting, so it costs no statement:
+
+```python
+agensgraph.connect(dsn, idle_in_transaction_timeout=30)    # seconds; added to any options= given
+```
 
 ## Retrying
 
@@ -1142,7 +1276,7 @@ else:
 what turns a lost connection from "reconnect and try again" into "the outcome is now unknown", and
 `remaining=` from your budget, so a wait that would not leave time for another attempt is not taken.
 
-**Retryability is six categories with a recovery action, not a boolean**, because a boolean gets
+**Retryability is seven categories with a recovery action, not a boolean**, because a boolean gets
 `26000` catastrophically wrong: reconnecting appears to fix it while hiding a broken reset hook that
 keeps firing.
 
@@ -1152,8 +1286,14 @@ keeps firing.
 | `RECONNECT` | new connection, then retry. Class 08, `57P01`, `57P02`, `57P03`, `25P03` |
 | `BACKPRESSURE` | retry, but wait longer. `53300`, `53200`, `55P03`, `55006` |
 | `RESET_STATE` | clear the statement cache, keep the connection. `26000` |
+| `REFRESH_LABELS` | read the label table again, keep the connection. `StaleLabelCache` |
 | `UNKNOWN` | resolve it, do not guess. `08007`, `40003` |
 | `FATAL` | never retry. `57014`, classes 42, 22, 23 |
+
+`conn.recover(exc)` does the part of a category that belongs to the connection, and returns the
+category: `DEALLOCATE ALL` for a lost prepared statement, which otherwise fails the same way on every
+attempt in autocommit, and reading the labels again for a stale label table. `pool.run_transaction`
+does it before handing the connection back for the next attempt.
 
 Concurrent graph writes surface as `40001` by design, so a conflict is the *expected* path rather
 than an exotic one, and it is safe to retry.
@@ -1310,6 +1450,13 @@ statement and never per row, the tracing API is imported only when asked for and
 record carries an opaque connection number rather than the connection's settings (which hold the
 password), and no parameter value ever reaches a span.
 
+A statement's span is named for its operation, `MATCH`, `SELECT` or `CREATE`, with
+`db.operation.name` set to the same. What no one statement covers gets a span of its own: `COPY`
+for a bulk load, `PIPELINE` for each batch `pipeline_query` sends (with `db.operation.batch.size`),
+`STREAM` for a stream from its first row to its last, and `POOL WAIT` for the time a borrow waited
+for a connection. A stream's span is never made current, since it yields between rows and every span
+the caller took meanwhile would be filed under it.
+
 **Notices are structured**, drained per-statement so they do not leak into the next result:
 
 ```python
@@ -1329,7 +1476,8 @@ outcome, and one listener raising does not stop the others being told.
 
 ```python
 agensgraph.to_json(result.records)      # bytes, and the fast one
-agensgraph.to_builtins(vertex)          # dicts and lists
+agensgraph.to_json(result)              # one object per row, keyed by the columns
+agensgraph.to_builtins(vertex)          # dicts and lists; a row, the rows or a result as well
 json.dumps(vertex, default=agensgraph.json_default)
 ```
 
@@ -1359,7 +1507,37 @@ the encoder sees the value, which is what these three do.
 
 ## Running a statement you did not write
 
-Model output, most often. The rule is that the **server** refuses a write rather than the driver,
+Model output, most often. Two tools, the first made for exactly that.
+
+### `run_untrusted()`
+
+```python
+answer = conn.run_untrusted(model_output, max_rows=100, timeout=10)
+answer.columns, answer.rows, answer.truncated
+```
+
+One statement a model wrote, and nothing it could not have meant to:
+
+- **Read first.** Anything that is not plainly one Cypher read is refused before it is sent: a first
+  word other than `MATCH`, `OPTIONAL`, `UNWIND`, `RETURN` or `WITH`; SQL words, comments or dollar
+  quotes; a function outside `agensgraph.untrusted.ALLOWED_FUNCTIONS`; an unbounded or longer than
+  five-hop path; more than 32 patterns or 8 KiB. The check follows the server's quoting, so a quote
+  or bracket cannot carry text out of the statement.
+- **Then run in a transaction of its own**, read-only and always rolled back, under `timeout`, reading
+  at most `max_rows` rows: one round trip, through a cursor over `SELECT * FROM (<text>) AS t`.
+  Measured, 0.42 ms on 2.14 and 0.44 on 2.18 against 0.30 for the bare read. The result must have the
+  columns its `RETURN` declares.
+- **As a role made for it**: not a superuser, unable to reach the server's files, programs or other
+  sessions, and neither the application's role nor a member of it (`untrusted_role_problems()`).
+  Required on 2.14 and 2.15; from 2.16 `unsafe_shared_role=True` accepts the risk.
+
+`allow_writes=True` lets a model write, through a role allowed exactly those writes, and lets the
+statement start with `CREATE` or `MERGE`. It needs a 2.16 or later release, confirmed by
+`read_only_is_enforced()`, and is never retried.
+
+### `read_only_transaction()`
+
+For a block of statements. The rule is that the **server** refuses a write rather than the driver,
 because a driver that reads the text to decide has to recognise every way of writing, and does not:
 this is PostgreSQL underneath, so `INSERT`, `TRUNCATE` and `DROP` are all available and none of them
 is Cypher.
@@ -1372,7 +1550,39 @@ with conn.read_only_transaction():
 Measured inside that transaction: every Cypher write, `INSERT`, `TRUNCATE`, `DROP` and `CREATE
 VLABEL` are refused with `25006`, and a plain read runs. The transaction characteristic is
 psycopg's own `connection.read_only`, which is the thing to set for a whole session; what this adds
-is the check below.
+is everything below.
+
+**Nothing leaves the block.** Every statement inside it goes over the extended protocol, which takes
+one statement, so `...; COMMIT; DROP GRAPH g CASCADE` is refused with `42601` rather than ending the
+transaction and running the rest read-write. Text that would end or split the transaction is refused
+before it is sent, and the transaction is pinned read-only before the first statement, so it cannot
+be switched back. That holds on every way of running a statement: `execute`, `execute_query`, a
+cursor, `executemany`, `COPY`, `stream` and a pipeline.
+
+**2.14 and 2.15 do not refuse a Cypher write in a read-only transaction**, nor check it against
+privileges: a role allowed only `SELECT` committed a `SET` and a `DETACH DELETE` there. The fix is in
+2.16.0 and was never backported. So on those releases the driver refuses a statement holding a
+Cypher write clause before sending it, and a write that reading misses still runs, is visible to
+the block, and is undone by the rollback.
+
+| | 2.14, 2.15 | 2.16 and later |
+|---|---|---|
+| a Cypher write in a read-only transaction | runs, unless the driver's reading refuses it first | refused by the server, `25006` |
+| a write any reading misses | undone by the rollback | refused by the server |
+
+`conn.read_only_is_enforced()` asks the server which it is, with a write that matches nothing, once
+per connection.
+
+**What no read-only transaction stops**, because none of it is a write: a session advisory lock
+(`pg_advisory_lock`), which outlives the transaction; a `PREPARE`d statement, which outlives it too;
+`dblink`, where it is installed, which opens a connection of its own; and `pg_cancel_backend` or
+`pg_terminate_backend` against another session of the same role. `run_untrusted()` refuses all of
+them by reading the text, releases advisory locks after every statement, and refuses a role that
+shares the application's sessions. A pool releases the advisory locks of a connection that ran a
+read-only block before lending it again; a connection you keep yourself holds them until it calls
+`pg_advisory_unlock_all()` or closes. A connection used for model output should be one of its own:
+psycopg drops its prepared statements on every rollback, so sharing it costs the application's
+statements their preparation.
 
 **What a read-only transaction does not stop, and it is worth knowing.** `COPY ... TO PROGRAM` runs
 a command on the server's host and is allowed, because it takes rows *out* of the database rather
@@ -1394,10 +1604,10 @@ neither a superuser nor a member of `pg_execute_server_program`**, and the bound
 | `COPY ... TO PROGRAM`, including one hidden behind another statement | the privilege, `42501` |
 | a plain read | nothing, it runs |
 
-**One thing the server will not refuse for you: a second statement.** Text sent with no parameters
-goes over the simple query protocol, which runs every statement in the string and reports only the
-first one's result, so a read with a write after a semicolon runs the write and looks like the read.
-Measured: `select 1; create table t(i int)` returned a row and left the table behind.
+**Outside such a block, the server will not refuse a second statement for you.** Text sent with no
+parameters goes over the simple query protocol, which runs every statement in the string and reports
+only the first one's result, so a read with a write after a semicolon runs the write and looks like
+the read. Measured: `select 1; create table t(i int)` returned a row and left the table behind.
 
 ```python
 cypher.check_single_statement(model_output)     # refuses, naming the word that is the reason
@@ -1429,7 +1639,7 @@ classes so you do not have to match on message text:
 | `CapabilityError` | a feature this server does not have, naming the version that does |
 
 Plus the driver's own: `BatchFailed`, `StaleLabelCache`, `ReleasedConnection`, `StaleGeneration`,
-`UnresolvedCommit`, `NoEnclosingTransaction`, `Expired`.
+`UnresolvedCommit`, `NoEnclosingTransaction`, `Expired`, `Stalled`.
 
 ### What a failure prints as
 
@@ -1531,12 +1741,38 @@ escape the colon.
 
 ## Server versions
 
-The driver reads AgensGraph 2.17 and later, and refuses anything older at connect rather than at
+The driver reads AgensGraph 2.14 and later, and refuses anything older at connect rather than at
 whichever later query first wants a catalog it does not have. It learns which it is talking to from
 the `agversion` parameter the server sends at startup, so the check costs no round trip.
 
-The floor is what the build tests against: every release named here has the whole suite run against
-it on every change, so support is a thing that is checked rather than a thing that is claimed.
+The floor is what the build tests against: 2.14.1, 2.15.0, 2.16.0, 2.17.0, 2.18.4.0 and 2.18.6.1
+each have the whole suite run against them on every change, so support is a thing that is checked
+rather than a thing that is claimed.
+
+The wire, the types and the catalogs are the same on all of them. What differs is what the server
+does with some statements, and the driver holds that in one table, `agensgraph.capabilities.FEATURES`,
+read the same way everywhere:
+
+| | 2.14 | 2.15 | 2.16 | 2.17 | 2.18.4 | 2.18.6 |
+|---|---|---|---|---|---|---|
+| Cypher writes refused in a read-only transaction, and checked against privileges | no | no | yes | yes | yes | yes |
+| a `::vector` cast in Cypher | no | yes | yes | yes | yes | yes |
+| a `::vector(N)` cast in Cypher, so vectors in properties | no | no | dimension dropped | yes | yes | yes |
+| `DETACH DELETE` checks the privilege on every edge it removes | no | no | no | yes | yes | yes |
+| `ORDER BY` an expression the `RETURN` does not project | no | no | no | yes | yes | yes |
+| `enable_graph_dml`, for plain SQL writes to a label's table | no | no | no | yes | yes | yes |
+| a property kept in a column of its own; GQL clauses; comparing elements | no | no | no | no | yes | yes |
+| `graphmeta` reports whether it is current | no | no | no | no | yes | yes |
+| an unlabelled read checks each label's privileges | no | no | no | no | no | yes |
+
+```python
+caps = conn.capabilities
+caps.has("cypher_write_enforced")         # any row of FEATURES, by name
+caps.has("cypher_typmod_cast", check=True)  # or CapabilityError, naming the release that has it
+```
+
+A release candidate or a development build answers as the first release of its line, since it may
+lack a fix its number suggests.
 
 What the server reports there has had more than one shape, and the driver reads any of them the same
 way: by the two leading numbers, which are the AgensGraph line and the PostgreSQL major beneath it.
@@ -1553,7 +1789,7 @@ caps.version                      # (2, 18)  -- the line, and PostgreSQL 18 unde
 caps.reported                     # '2.18.6.0'
 caps.has_property_promotion()     # a property stored in a column of its own
 caps.has_gql_clauses()            # LET, NEXT, FINISH, FILTER, FOR, CALL
-caps.has_element_ordering()       # ORDER BY on a vertex or an edge
+caps.has_element_comparison()     # ORDER BY on a vertex or an edge (has_element_ordering is its old name)
 caps.has_endpoint_elision()       # visible in a plan
 ```
 
@@ -1569,9 +1805,10 @@ conn.can_promote_properties()     # asks the catalog, once per connection, and k
 ```
 
 The wire and type layer is identical across every supported release, even though they sit on
-different PostgreSQL bases (2.17 on 17, 2.18 and main on 18), so binary graph ids, the composite
-decode, write counters, introspection and the commit resolution path need no version gating at all.
-What is 2.18 only is property promotion, the GQL clause set, and ordering by a graph element.
+different PostgreSQL bases (2.14 on 14 through 2.18 and main on 18), so binary graph ids, the
+composite decode, write counters, introspection and the commit resolution path need no version
+gating at all. What does differ is the table above, and nothing outside `capabilities.py` compares
+version numbers.
 
 ## Performance
 
@@ -1601,10 +1838,10 @@ Everything exported from `agensgraph`. The submodules `agensgraph.columnar`, `ag
 
 | | |
 |---|---|
-| `connect(conninfo, **kwargs)` | open a blocking connection |
+| `connect(conninfo, **kwargs)` | open a blocking connection; `idle_in_transaction_timeout=` seconds ends a session left idle in a transaction |
 | `Connection` / `AsyncConnection` | the connection classes, both psycopg subclasses |
 | `Capabilities` | what one server can do, built from the version at no round trip |
-| `MINIMUM_VERSION` | `(2, 17)`, the oldest server this driver reads |
+| `MINIMUM_VERSION` | `(2, 14)`, the oldest server this driver reads |
 
 **Pools**
 
@@ -1660,15 +1897,26 @@ Everything exported from `agensgraph`. The submodules `agensgraph.columnar`, `ag
 | `GraphDescription`, `Triple`, `PropertyShape` | what it returns |
 | `connection.upsert_vertices(label, key, rows)` | copy what is missing, optionally refresh the rest |
 | `connection.upsert_edges(label, edges)` | the same, keyed on the pair of elements each edge joins |
+| `VectorStorage(graph, label, dimensions=, storage="properties" \| "table")` | where a label's vectors live; `InProperties`, `InTable`, `HNSW`, `IVFFlat` for the options |
+| `connection.ensure_vectors`, `write_vectors`, `vectors_of`, `delete_vectors`, `nearest`, `build_vector_index`, `drop_vectors`, `vector_storage_state` | everything either design does, given a `VectorStorage` |
 | `to_json(value)` | JSON bytes, without decoding a map nobody read |
 | `to_builtins(value)`, `json_default` | the same shape as dicts, and for `json.dumps` |
-| `connection.pipeline_query(statements)` | a burst of reads, every answer read back |
+| `connection.pipeline_query(statements)` | a burst of reads, every answer read back; takes `binary_`, `prepare_` and `row_` as `execute_query` does |
+| `check_settings`, `settings_statement` (`agensgraph.settings`) | what `settings_` sends, for a caller building its own pipeline |
 | `connection.deadline(seconds)` | bound the statements in a block, and hand back the budget |
 | `connection.read_only_transaction()` | a transaction the server will not let write |
 | `connection.can_run_server_programs()` | whether this role could run a command on the host |
-| `Deadline`, `Expired` | one budget across the wait and the statement; `Expired` is a `TimeoutError` |
+| `connection.run_untrusted(text, max_rows=, timeout=)` | one model-written statement: checked, read-only, rolled back, one round trip; `UntrustedResult` |
+| `connection.read_only_is_enforced()` | whether the server refuses a Cypher write in a read-only transaction (2.16 and later) |
+| `connection.untrusted_role_problems()` | what makes this role unfit to run model-written Cypher |
+| `pool.run_transaction(work, policy=, deadline=)` | runs a transaction again where that is safe, and settles a commit whose answer was lost |
+| `connection.schema_lock(graph=)` | the graph's schema lock, which every `ensure_*` takes |
+| `connection.reserve_ids`, `load_vertices_with_ids`, `merge_vertices` | bulk writes that hand back each vertex's identity |
+| `connection.meta_is_current()`, `label_positions()` | whether `graphmeta` describes the graph now, without counting it |
+| `Deadline`, `Expired`, `Stalled` | one budget across the wait and the statement; `Expired` is a `TimeoutError`, and `Stalled` one whose statement went unanswered |
 | `RetryPolicy` | decides whether and when to try again; you keep the loop |
-| `Retryability`, `retryability(exc)`, `is_retryable(exc)` | the six categories, and how to ask |
+| `Retryability`, `retryability(exc)`, `is_retryable(exc)` | the seven categories, and how to ask |
+| `connection.recover(exc)` | what a category asks of the connection, done before another attempt |
 | `TokenBucket` | the process-wide allowance a counter cannot multiply |
 
 **Numbers**
@@ -1692,6 +1940,11 @@ Everything exported from `agensgraph`. The submodules `agensgraph.columnar`, `ag
 | | |
 |---|---|
 | `BatchFailed` | a pipeline failed as a batch, carrying what was sent |
+| `ReadOnlyGraphWrite`, `ReadOnlyBoundaryLost` | a write refused in a read-only block; the block's transaction ended under it |
+| `CapabilityError` | the server lacks something, naming the release that has it |
+| `UnresolvedCommit` | a lost commit whose outcome could not be settled |
+| `MissingLabel` | a write naming a label that does not exist, however the release words it |
+| `StaleVectorStorage`, `VectorStorageMismatch` | a vector table whose key a `DROP ... CASCADE` took; vectors kept in another shape |
 | `show_error_details(bool)`, `showing_error_details()` | whether DETAIL and CONTEXT reach the message |
 | `redact_details(exc)` | cut them from one exception |
 | `safe_message(exc)` | the code and the primary line, for handing somewhere else |
@@ -1710,6 +1963,10 @@ Everything exported from `agensgraph`. The submodules `agensgraph.columnar`, `ag
 |---|---|
 | `columnar` | `to_arrow`, `to_pandas`, `to_polars`, `batches`, `reader`, `columns`, `Layout`; `async_to_arrow`, `async_to_pandas`, `async_to_polars`, `async_batches` for a source that is awaited |
 | `vector` | `Vector`, `SparseVector`, `VectorIndex`, `vector_index`, `describe_vector_index`, `nearest`, `generated_column`, `Distance`, `SEARCH_OPTIONS` |
+| `vector_storage` | `VectorStorage`, `InProperties`, `InTable`, `HNSW`, `IVFFlat`, `Storage`, `StorageState`, `VectorHit` |
+| `untrusted` | `check_untrusted`, `ALLOWED_FUNCTIONS` and the limits `run_untrusted` reads text against |
+| `capabilities` | `Capabilities`, `FEATURES`, the one table of what each release does |
+| `settings` | `check_settings`, `settings_statement` |
 | `dbapi` | the PEP 249 surface |
 | `errors` | the exception hierarchy and the classification function |
 | `adapters` | `register_text`, `register_binary`, to read graph types on a psycopg connection this driver did not make |
@@ -1729,16 +1986,26 @@ uv run python tools/async_to_sync.py           # regenerate
 uv run python tools/async_to_sync.py --check   # fail if it is out of date
 ```
 
-Continuous integration runs the offline suite on Python 3.11 through 3.14, the full suite against
-the AgensGraph 2.17 and 2.18 lines and against main (each with pgvector built against it), the
-linter and formatter, `mypy --strict` and pyright strict, a resolution at the lowest declared
-versions, a fuzzer over the text reader, and an install of the built wheel and source distribution
-into clean environments.
+Continuous integration runs on every push and pull request, on amd64 and arm64 alike: the offline
+suite on Python 3.11 through 3.14; the full suite against every supported release -- 2.14.1,
+2.15.0, 2.16.0, 2.17.0, 2.18.4.0 and 2.18.6.1 -- each from its `skaiworldwide/agensgraph` image
+with pgvector added (`tests/images`, built in the run for the runner's architecture and never
+published); the linter and formatter, `mypy --strict` and pyright strict; a resolution at the
+lowest declared versions; and an install of the built wheel and source distribution into clean
+environments. A fuzzer over the text reader runs on amd64, the only platform atheris ships for. A
+server job fails if a test skipped for a reason that means the job was set up wrong: no second role
+to connect as, or no vectors.
 
-A line is named there rather than a branch, and the branch carrying it is resolved when the job
-runs. The engine names a release branch after the PostgreSQL minor it carries — `v2.17.10`,
-`v2.18.6` — so the branch holding a line changes every time a minor is merged into it, and a name
-written down goes stale at the next merge.
+To run the server suite as CI does:
+
+```console
+docker build --build-arg BASE=skaiworldwide/agensgraph:v2.14.1-bookworm --build-arg AGVERSION=2.14.1 \
+  -t agensgraph-test:2.14.1 tests/images
+docker run -d --name ag -e POSTGRES_PASSWORD=agens -p 5432:5432 agensgraph-test:2.14.1
+docker exec ag psql -U postgres -c 'create database drv_test'     # agens, not postgres, on 2.18
+AGENSGRAPH_TEST_DSN="host=127.0.0.1 user=postgres password=agens dbname=drv_test" \
+  uv run python -X dev -W error -m pytest -q
+```
 
 Many tests pin engine behaviour the driver works around, deliberately: if a later release fixes one,
 that test fails and names the workaround to drop.
