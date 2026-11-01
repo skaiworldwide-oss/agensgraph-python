@@ -320,12 +320,12 @@ class TestKeepaliveDefaults:
         assert with_keepalives({}, "postgresql://h/db?keepalives=0") == {}
 
 
-def test_the_reserved_arguments_are_the_four_that_are_documented() -> None:
-    """So that a fifth is a decision rather than an accident.
+def test_the_reserved_arguments_are_the_five_that_are_documented() -> None:
+    """So that a sixth is a decision rather than an accident.
 
-    Two a caller might look for are absent on purpose: a graph to read for this statement alone,
-    and a time limit for it. Each would cost round trips that belong where they are paid once for
-    many statements.
+    ``settings_`` sends settings with the statement in its round trip, so a time limit for one
+    statement costs nothing extra. A graph to read for this statement alone is absent on purpose,
+    because selecting one drops the label table.
     """
     import inspect
 
@@ -335,7 +335,7 @@ def test_the_reserved_arguments_are_the_four_that_are_documented() -> None:
         for name, parameter in signature.parameters.items()
         if parameter.kind is inspect.Parameter.KEYWORD_ONLY
     ]
-    assert reserved == ["binary_", "counts_", "prepare_", "row_"]
+    assert reserved == ["binary_", "counts_", "prepare_", "row_", "settings_"]
     positional = [
         name
         for name, parameter in signature.parameters.items()

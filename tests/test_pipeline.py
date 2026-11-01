@@ -145,6 +145,38 @@ class TestReadingTheAnswersBack:
     def test_an_empty_list_asks_nothing(self, loaded) -> None:  # type: ignore[no-untyped-def]
         assert loaded.pipeline_query([]) == []
 
+    def test_rows_come_in_the_shape_asked_for(self, loaded) -> None:  # type: ignore[no-untyped-def]
+        from psycopg.rows import dict_row
+
+        asked = [
+            ("match (n:person) where n.k = %s return n.name as name", (i,)) for i in range(3)
+        ]
+        results = loaded.pipeline_query(asked, row_=dict_row)
+        assert [result.records for result in results] == [[{"name": f"n{i}"}] for i in range(3)]
+
+    def test_the_composite_rendering_reads_the_same_elements(self, loaded) -> None:  # type: ignore[no-untyped-def]
+        loaded.refresh_labels()
+        asked = [("match (n:person) where n.k = %s return n", (i,)) for i in range(3)]
+        assert [r.records for r in loaded.pipeline_query(asked, binary_=True)] == [
+            r.records for r in loaded.pipeline_query(asked)
+        ]
+
+    def test_the_composite_rendering_is_refused_before_anything_is_sent(self, dsn) -> None:  # type: ignore[no-untyped-def]
+        """Until a label table is read, a vertex would come back as the bytes it was sent as."""
+        with (
+            agensgraph.Connection.connect(dsn, autocommit=True) as conn,
+            pytest.raises(agensgraph.errors.StaleLabelCache),
+        ):
+            conn.pipeline_query(["select 1"], binary_=True)
+
+    @pytest.mark.parametrize("prepare", [True, False])
+    def test_preparing_is_as_asked(self, loaded, prepare: bool) -> None:  # type: ignore[no-untyped-def]
+        asked = "match (n:person) where n.k = %s return n.name"
+        before = loaded.execute("select count(*) from pg_prepared_statements").fetchone()[0]
+        loaded.pipeline_query([(asked, (1,)), (asked, (2,))], prepare_=prepare)
+        after = loaded.execute("select count(*) from pg_prepared_statements").fetchone()[0]
+        assert (after > before) is prepare
+
     def test_it_beats_asking_one_at_a_time(self, loaded) -> None:  # type: ignore[no-untyped-def]
         """Not a benchmark -- a floor, so a change that makes it slower than the plain route
         fails rather than merely disappoints. Interleaved, because measuring one and then the

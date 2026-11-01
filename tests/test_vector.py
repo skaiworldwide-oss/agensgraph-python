@@ -1005,9 +1005,13 @@ class TestTuningASearch:
         from agensgraph.vector import SEARCH_OPTION_VALUES, SEARCH_OPTIONS
 
         vectors.execute("create (:loose {v: [1,2,3,4]})")
-        for name, kind in SEARCH_OPTIONS.items():
-            for value in [1] if kind is not str else SEARCH_OPTION_VALUES[name]:
-                vectors.vector_search_options({name: value})
+        # In a transaction: in autocommit a setting local to one would end before it was read.
+        with vectors.transaction():
+            for name, kind in SEARCH_OPTIONS.items():
+                for value in [1] if kind is not str else SEARCH_OPTION_VALUES[name]:
+                    vectors.vector_search_options({name: value})
+                    (now,) = vectors.execute("select current_setting(%s)", (name,)).fetchone()
+                    assert now == str(value)
 
     def test_a_name_that_is_not_one_of_them_is_refused(self) -> None:
         """The server takes an unknown ``hnsw.`` name without complaint, so a typo would look as
@@ -1022,13 +1026,21 @@ class TestTuningASearch:
     def test_the_server_accepts_them_and_a_search_still_answers(self, vectors) -> None:  # type: ignore[no-untyped-def]
         vectors.execute(vector_index("loose", "v", dimensions=4))
         vectors.execute("create (:loose {v: [1,2,3,4]})")
-        vectors.vector_search_options(
-            {"hnsw.ef_search": 100, "hnsw.iterative_scan": "relaxed_order"}
-        )
         result = vectors.execute_query(
-            nearest("loose", "v", dimensions=4, limit=1), ("[1,2,3,4]",)
+            nearest("loose", "v", dimensions=4, limit=1),
+            ("[1,2,3,4]",),
+            settings_={"hnsw.ef_search": 100, "hnsw.iterative_scan": "relaxed_order"},
         )
         assert len(result.records) == 1
+
+    def test_a_search_sees_the_settings_sent_with_it(self, vectors) -> None:  # type: ignore[no-untyped-def]
+        """In autocommit, where ``vector_search_options`` would end before the search began."""
+        vectors.execute("create (:loose {v: [1,2,3,4]})")
+        result = vectors.execute_query(
+            "match (n:loose) return (select current_setting('hnsw.ef_search')) as ef",
+            settings_={"hnsw.ef_search": 123},
+        )
+        assert result.records == [("123",)]
 
     def test_an_unknown_name_never_reaches_the_server(self, vectors) -> None:  # type: ignore[no-untyped-def]
         with pytest.raises(ValueError, match="not a vector search option"):

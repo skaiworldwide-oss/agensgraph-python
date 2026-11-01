@@ -66,6 +66,7 @@ __all__ = [
     "Vector",
     "VectorIndex",
     "accept",
+    "check_search_option",
     "dense_dumper",
     "describe_vector_index",
     "generated_column",
@@ -480,33 +481,44 @@ know is a typo worth hearing about rather than something to send.
 """
 
 
+def check_search_option(name: str, value: object) -> str:
+    """One search option, checked, as the text ``set_config`` takes.
+
+    A name that is not one of :data:`SEARCH_OPTIONS` is refused rather than sent, since the server
+    accepts an unknown ``hnsw.`` name silently on PostgreSQL 14 -- an extension may define one --
+    and a typo would then read as having been applied. ``True`` is not a number here, although
+    Python counts it as one.
+    """
+    wanted = SEARCH_OPTIONS.get(name)
+    if wanted is None:
+        raise ValueError(
+            f"not a vector search option: {name!r}. One of {sorted(SEARCH_OPTIONS)}"
+        )
+    if wanted is int and (isinstance(value, bool) or not isinstance(value, int)):
+        raise ValueError(f"{name} takes a whole number, got {value!r}")
+    if wanted is float and (isinstance(value, bool) or not isinstance(value, int | float)):
+        raise ValueError(f"{name} takes a number, got {value!r}")
+    if wanted is str:
+        allowed = SEARCH_OPTION_VALUES[name]
+        if value not in allowed:
+            raise ValueError(f"{name} takes one of {allowed}, got {value!r}")
+    return str(value)
+
+
 def search_option_statements(options: Mapping[str, object], *, local: bool = True) -> list[str]:
-    """Statements that set what a vector search may be tuned with.
+    """Statements that set what a vector search may be tuned with, one per option.
 
     ``local`` keeps each setting to the current transaction, so it reverts on commit rather than
     outliving the search it was meant for. Pass ``False`` to set them for the session.
 
-    A name that is not one of :data:`SEARCH_OPTIONS` is refused rather than sent, since the server
-    accepts an unknown ``hnsw.`` name silently -- an extension may define one -- and a typo would
-    then read as having been applied.
+    The connection sends the same options as one statement instead, through
+    :func:`agensgraph.settings.settings_statement`; this form is for a caller writing a script.
     """
     statements = []
     scope = "local " if local else ""
     for name, value in options.items():
-        wanted = SEARCH_OPTIONS.get(name)
-        if wanted is None:
-            raise ValueError(
-                f"not a vector search option: {name!r}. One of {sorted(SEARCH_OPTIONS)}"
-            )
-        if wanted is int and not isinstance(value, int):
-            raise ValueError(f"{name} takes a whole number, got {value!r}")
-        if wanted is float and not isinstance(value, int | float):
-            raise ValueError(f"{name} takes a number, got {value!r}")
-        if wanted is str:
-            allowed = SEARCH_OPTION_VALUES[name]
-            if value not in allowed:
-                raise ValueError(f"{name} takes one of {allowed}, got {value!r}")
-        rendered = value if isinstance(value, int | float) else f"'{value}'"
+        checked = check_search_option(name, value)
+        rendered = checked if isinstance(value, int | float) else f"'{checked}'"
         statements.append(f"set {scope}{name} = {rendered}")
     return statements
 

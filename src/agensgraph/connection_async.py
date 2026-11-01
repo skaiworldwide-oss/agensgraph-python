@@ -17,12 +17,13 @@ they already know.
 
 from __future__ import annotations
 
+import warnings
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 import psycopg
 from psycopg.adapt import AdaptersMap
-from psycopg.pq import TransactionStatus
+from psycopg.pq import PipelineStatus, TransactionStatus
 from psycopg.rows import Row, tuple_row
 from psycopg.types.json import Jsonb
 
@@ -122,6 +123,7 @@ from .notify import (
     unlisten_statement,
 )
 from .observability import Timer, query_span, report_notice
+from .settings import check_settings, settings_statement
 from .summary import (
     ASSIGNED_TRANSACTION_QUERY,
     COUNTER_QUERY,
@@ -131,7 +133,7 @@ from .summary import (
     GraphWriteCounts,
     read_outcome,
 )
-from .vector import VectorIndex, describe_vector_index, search_option_statements
+from .vector import VectorIndex, check_search_option, describe_vector_index
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, AsyncIterator, Iterable, Mapping, Sequence
@@ -595,6 +597,7 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
         counts_: bool = False,
         prepare_: bool | None = None,
         row_: AsyncRowFactory[Any] | None = None,
+        settings_: Mapping[str, object] | None = None,
     ) -> Result:
         """Run one statement and read all of it.
 
@@ -607,15 +610,16 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
         Nothing rewrites the statement: it goes as written, and ``binary_`` asks only for the
         rendering the answer comes back in.
 
-        Two arguments a caller might look for are deliberately absent, both because they would
-        cost round trips that belong somewhere cheaper. Selecting a graph is a statement and
-        undone by a rollback, and it drops the label table, so it is :meth:`graph` on the
-        connection or ``graph=`` on a pool -- once, not once per statement. Bounding a
-        statement's time is two more statements, one to set the limit and one to put it back:
-        measured, ``return 1`` costs 161 microseconds and the same read between them costs 373,
-        and against a server a network away it would be two more round trips rather than two
-        more local ones. So it belongs where it is paid once for many statements -- a pool's
-        ``deadline``, or ``options=-c statement_timeout=...`` on the connection.
+        Selecting a graph is deliberately absent: it is a statement and undone by a rollback, and
+        it drops the label table, so it is :meth:`graph` on the connection or ``graph=`` on a
+        pool -- once, not once per statement.
+
+        ``settings_`` makes settings for this statement alone -- ``hnsw.ef_search`` for a
+        search, ``statement_timeout`` for a slow read -- without a round trip of their own. They
+        are one ``select set_config(..., true)`` sent in a pipeline with the statement, so in
+        autocommit the two share the pipeline's implicit transaction and the settings end with
+        it. Inside a transaction they last until it ends, as ``SET LOCAL`` would. Checked by
+        :func:`agensgraph.settings.check_settings`, which refuses ``graph_path``.
 
         ``counts_`` reads what the statement changed, which is a second statement because
         the server offers the counters through a function rather than sending them with the
@@ -625,6 +629,8 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
         is no way to tell a number this statement earned from one it inherited.
         """
         text = statement_text(query)
+        # Checked before anything is sent, so a misspelt setting costs no round trip.
+        settings = settings_statement(check_settings(settings_)) if settings_ else None
 
         # The span is taken outside, and is not something to wait for: it is a plain block
         # in both interfaces, so it stays one rather than being converted into a wait.
@@ -636,7 +642,12 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
                 before: Sequence[int] | None = None
                 if counts_ and needs_a_reading_first(text):
                     before = await self._counters()
-                await cursor.execute(query, params, prepare=prepare_)
+                if settings is None:
+                    await cursor.execute(query, params, prepare=prepare_)
+                else:
+                    await self._execute_with_settings(
+                        cursor, query, params, settings, prepare=prepare_
+                    )
                 # A statement that changed something without returning rows still has a
                 # result, and asking that result for rows raises.  What distinguishes the
                 # two is whether it describes any columns.
@@ -646,6 +657,33 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
                 oids = tuple(int(column.type_code) for column in described or ())
         after = await self._counters() if counts_ else None
         return Result(records, keys, self._counts_for(text, before, after), oids)
+
+    async def _execute_with_settings(
+        self,
+        cursor: psycopg.AsyncCursor[Any],
+        query: Statement,
+        params: Params | None,
+        settings: tuple[str, tuple[str, ...]],
+        *,
+        prepare: bool | None,
+    ) -> None:
+        """The settings and the statement in one pipeline: one round trip, one transaction.
+
+        A pipeline entered inside another first finishes what the outer one had sent, so the two
+        statements here always share their own implicit transaction. A failure in either arrives
+        when the pipeline ends rather than from ``execute``, so it is translated here, as the
+        cursor would have.
+        """
+        statement, values = settings
+        setting = self.cursor()
+        try:
+            async with self.pipeline():
+                await setting.execute(statement, values)
+                await cursor.execute(query, params, prepare=prepare)
+        except psycopg.Error as exc:
+            raise self._translated(exc) from None
+        finally:
+            await setting.close()
 
     async def _read_all(self, cursor: psycopg.AsyncCursor[Any]) -> list[Any]:
         """Every row a cursor holds, decoded again once if it names a label the table lacks.
@@ -1652,6 +1690,9 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
         statements: Sequence[tuple[str, Params | None]] | Sequence[str],
         *,
         chunk: int = 100,
+        binary_: bool = False,
+        prepare_: bool | None = None,
+        row_: AsyncRowFactory[Any] | None = None,
     ) -> list[Result]:
         """Send many reads without waiting for each in turn, and read every answer back.
 
@@ -1668,8 +1709,15 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
 
         Each statement gets a cursor, and cursors are made ``chunk`` at a time so that a long list
         does not allocate one for every statement at once.
+
+        ``binary_``, ``prepare_`` and ``row_`` mean what they do on :meth:`execute_query`, for
+        every statement in the list and for the asking again alike: the binary rendering, which
+        carries a vector as packed floats rather than text, whether to prepare each statement, and
+        the shape each row is read into.
         """
         sent = [(item, None) if isinstance(item, str) else item for item in statements]
+        if binary_ and sent:
+            self._check_binary()
         results: list[Result] = []
         for start in range(0, len(sent), chunk):
             batch = sent[start : start + chunk]
@@ -1679,7 +1727,11 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
             # batch was already taking and the ordinary path pays nothing for it.
             mark = savepoint_name() if self._can_hold_a_savepoint() else None
             try:
-                results.extend(await self._pipelined(batch, savepoint=mark))
+                results.extend(
+                    await self._pipelined(
+                        batch, savepoint=mark, binary=binary_, prepare=prepare_, row=row_
+                    )
+                )
             except psycopg.Error:
                 # The pipeline blamed one of them and a pipeline names the wrong one, so the
                 # answer comes from asking again singly. Reading twice costs a round trip per
@@ -1690,7 +1742,11 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
                     await self._run(f"rollback to savepoint {mark}")
                     await self._run(f"release savepoint {mark}")
                 for statement, params in batch:
-                    results.append(await self.execute_query(statement, params))
+                    results.append(
+                        await self.execute_query(
+                            statement, params, binary_=binary_, prepare_=prepare_, row_=row_
+                        )
+                    )
         return results
 
     def _can_hold_a_savepoint(self) -> bool:
@@ -1707,7 +1763,13 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
         return status == TransactionStatus.INTRANS
 
     async def _pipelined(
-        self, batch: Sequence[tuple[str, Params | None]], *, savepoint: str | None = None
+        self,
+        batch: Sequence[tuple[str, Params | None]],
+        *,
+        savepoint: str | None = None,
+        binary: bool = False,
+        prepare: bool | None = None,
+        row: AsyncRowFactory[Any] | None = None,
     ) -> list[Result]:
         """One pipeline's worth, every cursor read back in the order it was filled.
 
@@ -1724,8 +1786,10 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
             if savepoint is not None:
                 await self._run(f"savepoint {savepoint}")
             for statement, params in batch:
-                cursor = self.cursor()
-                await cursor.execute(statement, params)
+                cursor = self.cursor(row_factory=row) if row else self.cursor()
+                if binary:
+                    cursor.format = psycopg.pq.Format.BINARY
+                await cursor.execute(statement, params, prepare=prepare)
                 cursors.append(cursor)
             if savepoint is not None:
                 await self._run(f"release savepoint {savepoint}")
@@ -1747,10 +1811,37 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
         Setting ``hnsw.ef_search`` higher looks at more candidates, and so recalls more of the true
         nearest neighbours. :data:`agensgraph.vector.SEARCH_OPTIONS` lists
         what can be set; a name that is not one of them is refused rather than sent, since the server
-        accepts an unknown one silently.
+        accepts an unknown one silently. Every option goes in one statement.
+
+        A setting local to a transaction needs one to be open. In autocommit, outside a pipeline,
+        there is none, and the server would only warn and leave the search as it was -- so this
+        warns instead, and sends nothing. 3.0 will raise. To tune one search,
+        ``execute_query(..., settings_=...)`` sends the settings with it in one round trip.
         """
-        for statement in search_option_statements(options, local=local):
-            await self._run(statement)
+        checked = [(name, check_search_option(name, value)) for name, value in options.items()]
+        if not checked:
+            return
+        if local and self._outside_any_transaction():
+            warnings.warn(
+                "vector_search_options(local=True) does nothing in autocommit outside a "
+                "transaction or pipeline: the setting would end before any search could see it. "
+                "Pass the settings to execute_query(settings_=...) to send them with the search, "
+                "open a transaction, or pass local=False. This will raise in agensgraph 3.0.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return
+        statement, values = settings_statement(checked, local=local)
+        async with super().cursor() as cursor:
+            await cursor.execute(statement, values)
+
+    def _outside_any_transaction(self) -> bool:
+        """Whether a setting local to the transaction would end before the next statement."""
+        return (
+            self.autocommit
+            and self.pgconn.pipeline_status == PipelineStatus.OFF
+            and self.pgconn.transaction_status == TransactionStatus.IDLE
+        )
 
     async def listen(self, *channels: str) -> None:
         """Subscribe to channels the server announces on.
