@@ -50,6 +50,8 @@ import msgspec
 from psycopg.adapt import Dumper, Loader
 from psycopg.pq import Format
 
+from .errors import CapabilityError
+
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator
 
@@ -345,6 +347,11 @@ class Distance(enum.StrEnum):
         """The operator class an index on a ``vector`` column needs to answer this."""
         return _OPERATOR_CLASS[self]
 
+    def operator_class_for(self, type: str) -> str:
+        """The operator class for a column of another vector type: ``halfvec_cosine_ops``."""
+        found = _OPERATOR_CLASS[self]
+        return found if self.is_for_bits else found.replace("vector_", f"{type}_", 1)
+
     @property
     def is_for_bits(self) -> bool:
         """Whether this measures bit strings rather than vectors."""
@@ -619,13 +626,29 @@ def _check_server(capabilities: Capabilities | None, dimensions: int | None) -> 
     A cast carrying a dimension in Cypher, ``::vector(4)``, needs 2.17: 2.16 parses it and drops
     the dimension, and older releases refuse it. A property with a column of its own needs 2.18.
     Without ``capabilities`` the statement is built as asked, for a caller that knows its server.
+    The refusal says where vectors can be kept instead.
     """
-    if capabilities is None:
-        return
-    if dimensions is None:
-        capabilities.has("property_promotion", check=True)
-    else:
-        capabilities.has("cypher_typmod_cast", check=True)
+    if capabilities is not None:
+        require_for_properties(
+            capabilities, "property_promotion" if dimensions is None else "cypher_typmod_cast"
+        )
+
+
+def require_for_properties(capabilities: Capabilities, feature: str) -> None:
+    """Refuse a server without what keeping vectors in the properties needs, naming the table."""
+    try:
+        capabilities.has(feature, check=True)
+    except CapabilityError as exc:
+        exc.add_note(TABLE_HINT)
+        raise
+
+
+TABLE_HINT = (
+    "Keep the vectors in a table of their own instead: "
+    "agensgraph.VectorStorage(graph, label, dimensions=..., storage='table') works on every "
+    "release this driver supports."
+)
+"""What a refusal to keep vectors in the property map says to do instead."""
 
 
 def _searched_expression(property: str, dimensions: int | None, type: str) -> str:
@@ -677,6 +700,7 @@ def vector_index(
     name: str | None = None,
     options: Mapping[str, object] | None = None,
     capabilities: Capabilities | None = None,
+    if_not_exists: bool = False,
 ) -> str:
     """A property index over a vector, in the property map or in a column of its own.
 
@@ -693,16 +717,23 @@ def vector_index(
     sequential scan. :attr:`Distance.operator_class` gives the one for an operator.
 
     Pass the connection's ``capabilities`` to have a server that cannot carry the statement refused
+    here: a dimension needs 2.17, and a column of its own 2.18. ``if_not_exists`` needs a ``name``,
+    since that is what an existing index is recognised by.
     """
     from .cypher import quote_identifier
 
     _check_server(capabilities, dimensions)
+    if if_not_exists and not name:
+        raise ValueError(
+            "if_not_exists needs a name, which is what an existing index is found by"
+        )
     expression = _searched_expression(property, dimensions, type)
     given = f"{quote_identifier(name)} " if name else ""
+    guard = "if not exists " if if_not_exists else ""
     # An access method and an operator class are both named by an identifier, and the server
     # takes either quoted.
     return (
-        f"create property index {given}on {quote_identifier(label)} "
+        f"create property index {guard}{given}on {quote_identifier(label)} "
         f"using {quote_identifier(method)} "
         f"(({expression}) {quote_identifier(operator_class)}){_with_options(options)}"
     )
@@ -1032,7 +1063,6 @@ def _typed(base: type[Dumper], oid: int) -> type[Dumper]:
 
     Built per registration rather than written out, because the type's oid belongs to the extension
     and is not known until it has been looked up -- the same reason the composite loaders for the
-    graph types are built per connection.
     graph types are built per connection. Kept once made: a database's oids do not change, and the
     dumpers hold nothing of their own, so every connection to it can share them.
     """

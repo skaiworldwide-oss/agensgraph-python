@@ -22,6 +22,7 @@ from psycopg.conninfo import conninfo_to_dict as _conninfo_to_dict
 from psycopg.pq import TransactionStatus
 
 from ._protocol.labels import LabelCache
+from ._vector_plans import plan_for
 from ._watchdog import GRACE, WATCHDOG
 from .adapters import graph_adapters, register_binary, register_text
 from .capabilities import Capabilities
@@ -46,6 +47,7 @@ from .errors import (
 )
 from .observability import QueryRecord, logging_wanted, report
 from .summary import GraphWriteCounts
+from .vector import require_for_properties
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Sequence
@@ -56,7 +58,10 @@ if TYPE_CHECKING:
     from psycopg.pq.abc import PGconn
     from psycopg.sql import SQL, Composed
 
+    from ._vector_plans import Plan
     from ._watchdog import Watch
+    from .vector_storage import VectorStorage
+
 _RV = TypeVar("_RV")
 
 __all__ = [
@@ -576,6 +581,19 @@ class GraphMixin:
         """What a caller whose connection the watchdog shut down is told."""
         limit = self._agens_statement_timeout_ms
         return Stalled.unheard((limit or 0) / 1000 + GRACE, limit)
+
+    # -- vector storage ---------------------------------------------------------------------
+
+    def _vector_plan(self, storage: VectorStorage) -> Plan:
+        """How a storage is carried out, refused here if this server cannot carry its design.
+
+        Keeping vectors in the property map needs 2.17, and the refusal says where else to keep
+        them; a table of their own needs nothing.
+        """
+        plan = plan_for(storage)
+        if plan.requires is not None:
+            require_for_properties(self.capabilities, plan.requires)
+        return plan
 
     @staticmethod
     def _select_graph_statement(name: str) -> str:

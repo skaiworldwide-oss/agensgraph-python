@@ -76,8 +76,17 @@ from .vector import Distance as Distance
 from .vector import SparseVector as SparseVector
 from .vector import Vector as Vector
 from .vector import VectorIndex as VectorIndex
+from .vector_storage import HNSW as HNSW
+from .vector_storage import InProperties as InProperties
+from .vector_storage import InTable as InTable
+from .vector_storage import IVFFlat as IVFFlat
+from .vector_storage import Storage as Storage
+from .vector_storage import StorageState as StorageState
+from .vector_storage import VectorHit as VectorHit
+from .vector_storage import VectorStorage as VectorStorage
 
 __all__ = [
+    "HNSW",
     "LABID_MAX",
     "LOCID_MAX",
     "MINIMUM_VERSION",
@@ -103,6 +112,9 @@ __all__ = [
     "GraphDescription",
     "GraphId",
     "GraphWriteCounts",
+    "IVFFlat",
+    "InProperties",
+    "InTable",
     "Index",
     "IndexElement",
     "Jsonb",
@@ -120,12 +132,16 @@ __all__ = [
     "Retryability",
     "SparseVector",
     "Stalled",
+    "Storage",
+    "StorageState",
     "TokenBucket",
     "Triple",
     "Unique",
     "Unspecified",
     "Vector",
+    "VectorHit",
     "VectorIndex",
+    "VectorStorage",
     "Vertex",
     "add_query_logger",
     "columnar",

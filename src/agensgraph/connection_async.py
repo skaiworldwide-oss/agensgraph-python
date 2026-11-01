@@ -39,6 +39,7 @@ from ._core import (
     with_keepalives,
 )
 from ._protocol.labels import CURRENT_GRAPH_QUERY, LabelCache
+from ._vector_plans import CopyIn, Execute, Found, Plan, refusal
 from .bulk import (
     EDGE_COLUMN_TYPES,
     EDGE_LABEL_FACTS_QUERY,
@@ -176,6 +177,8 @@ if TYPE_CHECKING:
 
     from ._core import Statement
     from ._protocol.graphid import GraphId
+    from .vector import SparseVector, Vector
+    from .vector_storage import StorageState, VectorHit, VectorStorage
 
 __all__ = ["AsyncConnection", "AsyncCursor"]
 
@@ -1326,6 +1329,212 @@ class AsyncConnection(GraphMixin, psycopg.AsyncConnection[Row]):
         if found:
             accept_bits(self)
         return tuple(found)
+
+    # -- vector storage: see agensgraph.vector_storage ---------------------------------------
+
+    async def ensure_vectors(
+        self, storage: VectorStorage, *, index: bool = True
+    ) -> StorageState:
+        """Make what a storage needs and is missing; what is there afterwards.
+
+        For vectors in the properties: the label, and the property index over the cast. For a table
+        of their own: the label, the schema, the table keyed to the label, and its index. Only what
+        is missing is made, under the graph's schema lock, so two processes ensuring the same
+        storage take turns. A storage that has everything costs one catalog read and takes no lock,
+        which is also what lets a role allowed only to read and write call this at startup: making
+        a schema, a table or an index is checked against the role before ``IF NOT EXISTS`` is.
+
+        A table whose key no longer refers to the label raises
+        :class:`~agensgraph.errors.StaleVectorStorage`, and vectors already kept in another type or
+        dimension, or an index built for another distance, raise
+        :class:`~agensgraph.errors.VectorStorageMismatch` -- none is repaired, since each repair
+        would lose data or an index. ``index=False`` leaves the index to
+        :meth:`build_vector_index`, which builds faster once the vectors are loaded; the state is
+        :attr:`~agensgraph.StorageState.ABSENT` until it has.
+
+        Making a missing label needs the session on the storage's graph: the grammar takes no
+        graph in a label's name.
+        """
+        plan = self._vector_plan(storage)
+        await self._vector_types()
+        found = await self._storage_found(plan)
+        if not self._missing(plan, found, index=index):
+            return found.state
+        async with self.schema_lock(graph=storage.graph):
+            # Again under the lock: another process may have made it meanwhile.
+            found = await self._storage_found(plan)
+            await self._plan_run(storage, self._missing(plan, found, index=index))
+            return (await self._storage_found(plan)).state
+
+    async def _probe(self, plan: Plan) -> Found:
+        """What is there for a storage: one catalog read."""
+        probe = plan.probe()
+        return plan.found((await self._fetch(probe.text, probe.params))[0])
+
+    async def _storage_found(self, plan: Plan) -> Found:
+        """What the probe finds, refused if it is a storage that cannot be used."""
+        found = await self._probe(plan)
+        problem = refusal(found)
+        if problem is not None:
+            raise problem
+        return found
+
+    @staticmethod
+    def _missing(plan: Plan, found: Found, *, index: bool) -> list[Execute]:
+        """The statements that make what the probe found missing."""
+        built = plan.index(concurrently=False) if index and not found.indexed else None
+        return [*plan.create(found), *([built] if built is not None else [])]
+
+    async def vector_storage_state(self, storage: VectorStorage) -> StorageState:
+        """What is there for a storage, without changing anything: one catalog read."""
+        return (await self._probe(self._vector_plan(storage))).state
+
+    async def write_vectors(
+        self,
+        storage: VectorStorage,
+        rows: Iterable[tuple[GraphId, object]],
+        *,
+        upsert: bool = True,
+    ) -> int:
+        """Write a vector for each vertex given; how many rows were written or changed.
+
+        A row is an identity and a vector: a :class:`~agensgraph.vector.Vector`, a list, a numpy
+        array -- copied from its buffer -- or a :class:`~agensgraph.vector.SparseVector` for a
+        sparse storage. Each is checked against the storage's dimension before anything is sent.
+
+        In the properties the vector is set on the vertex, as ``SET n.embedding = ...`` would. In a
+        table, ``upsert`` writes or replaces each row in one statement, leaving an unchanged one
+        untouched; ``upsert=False`` sends one binary ``COPY`` instead -- the bulk route, about
+        63,000 rows a second at 1536 dimensions -- and a vertex that already has a row fails it.
+        """
+        plan = self._vector_plan(storage)
+        material = list(rows)
+        if not material:
+            return 0
+        await self._vector_types()
+        write = plan.write(material, upsert=upsert)
+        match write:
+            case CopyIn(text=text, types=types, rows=copied):
+                return await self._copy_rows(text, types, copied)
+            case Execute():
+                return await self._plan_count(storage, write)
+
+    async def vectors_of(
+        self, storage: VectorStorage, ids: Iterable[GraphId]
+    ) -> dict[GraphId, Vector | SparseVector]:
+        """The vectors kept for these vertices; one with none is left out."""
+        plan = self._vector_plan(storage)
+        wanted = list(ids)
+        if not wanted:
+            return {}
+        await self._vector_types()
+        return plan.vectors(await self._plan_rows(storage, plan.read(wanted)))
+
+    async def delete_vectors(self, storage: VectorStorage, ids: Iterable[GraphId]) -> int:
+        """Remove these vertices' vectors and keep the vertices; how many were removed.
+
+        Deleting a vertex removes its vector either way: with the vertex in the properties, and
+        through the key's cascade in a table.
+        """
+        plan = self._vector_plan(storage)
+        wanted = list(ids)
+        if not wanted:
+            return 0
+        return await self._plan_count(storage, plan.delete(wanted))
+
+    async def nearest(
+        self,
+        storage: VectorStorage,
+        vector: object,
+        *,
+        k: int = 10,
+        settings_: Mapping[str, object] | None = None,
+    ) -> list[VectorHit]:
+        """The ``k`` vertices whose vectors are nearest to this one, nearest first.
+
+        Each hit is the vertex and its distance by the storage's measure, the same from either
+        design. ``settings_`` tunes the search in its own round trip, as for
+        :meth:`execute_query`: ``{"hnsw.ef_search": 100}`` looks at more candidates.
+        """
+        plan = self._vector_plan(storage)
+        # Built first, so a vector or a k it refuses costs no round trip.
+        statement = plan.nearest(vector, k)
+        await self._vector_types()
+        await self._check_on_graph(storage, [statement])
+        # Read as tuples whatever the connection's row factory, since a hit is read by position.
+        result = await self.execute_query(
+            statement.text, statement.params, settings_=settings_, row_=tuple_row
+        )
+        return plan.hits(result.records)
+
+    async def build_vector_index(
+        self, storage: VectorStorage, *, concurrently: bool = False
+    ) -> None:
+        """Build the storage's index if it is not there.
+
+        Faster after loading than during it. ``concurrently`` keeps a table writable while its
+        index builds, and needs the connection in autocommit; a property index has no such build.
+        An index already there is left alone without asking the server to build anything, which a
+        role that does not own the table could not.
+        """
+        plan = self._vector_plan(storage)
+        statement = plan.index(concurrently=concurrently)
+        if statement is None or (await self._storage_found(plan)).indexed:
+            return
+        await self._plan_run(storage, [statement])
+
+    async def drop_vectors(self, storage: VectorStorage) -> None:
+        """Drop what the storage made to keep its vectors: the table, or the property index.
+
+        Vectors in the properties stay on their vertices; :meth:`delete_vectors` removes them.
+        """
+        await self._plan_run(storage, self._vector_plan(storage).drop())
+
+    async def _plan_run(self, storage: VectorStorage, statements: Sequence[Execute]) -> None:
+        """Run a plan's statements whose rows are not wanted, on the storage's graph."""
+        await self._check_on_graph(storage, statements)
+        for statement in statements:
+            await self._run_with(statement.text, statement.params)
+
+    async def _plan_rows(self, storage: VectorStorage, statement: Execute) -> list[Any]:
+        """A plan's statement's rows, as tuples, on the storage's graph."""
+        await self._check_on_graph(storage, [statement])
+        return await self._fetch(statement.text, statement.params)
+
+    async def _plan_count(self, storage: VectorStorage, statement: Execute) -> int:
+        """A plan's statement that answers one row with a count, and the count."""
+        rows = await self._plan_rows(storage, statement)
+        return int(rows[0][0]) if rows else 0
+
+    async def _check_on_graph(
+        self, storage: VectorStorage, statements: Sequence[Execute]
+    ) -> None:
+        """Refuse statements that name a label alone while the session is on another graph.
+
+        Cypher names a label without its graph, and so does making one: the grammar takes no
+        qualified label name. Run on another graph, they would read or make the wrong label. A
+        session put on its graph by ``options`` or by a ``SET`` is on it all the same, so where the
+        label table does not say, it is filled for wherever the session is -- once, rather than
+        the server being asked on every call.
+        """
+        if not any(s.on_graph for s in statements):
+            return
+        self._follow_reported_graph_path()
+        if self.label_table.graph is None:
+            await self.refresh_labels()
+        current = self.label_table.graph
+        if current != storage.graph:
+            raise ConfigurationError(
+                f"this needs the session on graph {storage.graph!r}, and it is on "
+                f"{current!r}; select it with graph() first"
+            )
+
+    async def _vector_types(self) -> None:
+        """Register the vector types here if they are not yet: one round trip, once."""
+        if self.adapters.types.get("vector") is None and not await self.register_vectors():
+            raise ConfigurationError(
+                "the vector extension is not created in this database: create extension vector"
+            )
 
     async def has_vectors(self) -> bool:
         """Whether vectors can be read here at all, without registering anything."""

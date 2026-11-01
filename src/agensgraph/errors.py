@@ -91,7 +91,9 @@ __all__ = [
     "Retryability",
     "StaleGeneration",
     "StaleLabelCache",
+    "StaleVectorStorage",
     "UnresolvedCommit",
+    "VectorStorageMismatch",
     "Warning",
     "attach_query",
     "attach_retry_history",
@@ -332,6 +334,19 @@ class ConfigurationError(_pg.OperationalError):
     """A setting, rather than the statement, is what refused the work."""
 
     setting: str | None = None
+
+
+class StaleVectorStorage(_pg.IntegrityError):
+    """A table of vectors whose key no longer refers to the label it was made for.
+
+    Dropping a label or its graph with ``CASCADE`` drops the table's key and keeps its rows, and a
+    label made again hands out the same identities -- so the rows would attach old vectors to new
+    vertices. Refused rather than used.
+    """
+
+
+class VectorStorageMismatch(_pg.ProgrammingError):
+    """Vectors already kept where asked, in another type or dimension than the one asked for."""
 
 
 class BatchFailed(_pg.Error):
