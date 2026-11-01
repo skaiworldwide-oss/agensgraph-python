@@ -41,15 +41,21 @@ from __future__ import annotations
 import inspect
 import threading
 from contextlib import asynccontextmanager
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar, TypeVar
 
+import psycopg
 import psycopg_pool
 from psycopg.pq import TransactionStatus
 from psycopg_pool import errors as _pool_errors
 
 from .connection_async import AsyncConnection
 from .deadline import Deadline
-from .errors import InterruptedConnection, StaleGeneration
+from .errors import InterruptedConnection, Retryability, StaleGeneration, UnresolvedCommit
+from .retry import RetryPolicy, async_sleep
+from .summary import CommitOutcome
+
+_T = TypeVar("_T")
+
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Awaitable, Callable
@@ -392,6 +398,119 @@ class AsyncConnectionPool:
         """Run one statement on a connection taken for just that statement."""
         async with self.connection(timeout=timeout, deadline=deadline) as conn:
             return await conn.execute_query(query, params, **kwargs)
+
+    async def run_transaction(
+        self,
+        work: Callable[[AsyncConnection[Any]], Awaitable[_T]],
+        *,
+        policy: RetryPolicy | None = None,
+        timeout: float | None = None,
+        deadline: Deadline | None = None,
+        merging: bool = False,
+        idempotent: bool = False,
+        track_commit: bool = False,
+    ) -> _T:
+        """Run ``work(conn)`` in a transaction, run it again where that is safe, and commit once.
+
+        A conflict, a deadlock or a connection lost before the commit was sent leaves nothing
+        behind, so the work runs again on a connection taken afresh, after a jittered wait and
+        within the policy's attempts and the caller's budget. ``merging`` says the work only
+        creates what is missing, so another writer creating it first is a reason to run it again
+        rather than a failure.
+
+        A connection lost *while committing* is different: whether the commit landed is exactly
+        what was lost. Three ways out, chosen by the caller, who knows what the work does:
+
+        - ``idempotent``: running the work twice leaves what running it once does, so it simply
+          runs again.
+        - ``track_commit``: the transaction's id is read before committing -- one round trip --
+          and the outcome is asked of another connection. Committed returns the work's result;
+          aborted runs the work again; a transaction still running is waited for within the
+          budget.
+        - neither: :class:`~agensgraph.errors.UnresolvedCommit` is raised, since repeating the
+          work could apply it twice and not repeating it could lose it.
+
+        ``work`` should do only database work: it may run more than once.
+        """
+        policy = policy if policy is not None else RetryPolicy()
+        budget = deadline if deadline is not None else Deadline(timeout)
+        failures: list[BaseException] = []
+        number = 0
+        while True:
+            number += 1
+            done: list[_T] = []
+            committing = False
+            transaction_id: int | None = None
+            try:
+                async with self.connection(deadline=budget) as conn, conn.transaction():
+                    done.append(await work(conn))
+                    if track_commit:
+                        transaction_id = await conn.transaction_id()
+                    committing = True
+                policy.succeeded()
+                return done[0]
+            except Exception as exc:
+                lost_commit = committing and not idempotent
+                attempt = policy.decide(
+                    exc,
+                    number=number,
+                    wrote=lost_commit,
+                    merging=merging,
+                    remaining=budget.remaining(),
+                )
+                if attempt.recovery is Retryability.UNKNOWN:
+                    if transaction_id is None and committing and track_commit:
+                        # Asked for and not given: the server gives a transaction an id when it
+                        # first writes, so this one wrote nothing, and whether its commit arrived
+                        # changes nothing.
+                        policy.succeeded()
+                        return done[0]
+                    if transaction_id is None:
+                        raise UnresolvedCommit.for_transaction(
+                            None,
+                            reason=(
+                                "the connection was lost while committing and no transaction id "
+                                "was kept; pass track_commit=True to have it resolved, or "
+                                "idempotent=True if running the work again is harmless"
+                            ),
+                        ) from exc
+                    try:
+                        outcome = await self._settle(transaction_id, budget)
+                    except (psycopg.Error, TimeoutError) as unreachable:
+                        # The server is still out of reach, so the commit may have landed or
+                        # not; that is what the caller has to be told, not why asking failed.
+                        raise UnresolvedCommit.for_transaction(
+                            transaction_id,
+                            reason=f"asking what became of it failed too: {unreachable}",
+                        ) from exc
+                    if outcome is CommitOutcome.COMMITTED:
+                        policy.succeeded()
+                        return done[0]
+                    if outcome is not CommitOutcome.ABORTED:
+                        raise UnresolvedCommit.for_transaction(
+                            transaction_id, reason=f"the server reports it {outcome.value}"
+                        ) from exc
+                    attempt = policy.decide(
+                        exc, number=number, merging=merging, remaining=budget.remaining()
+                    )
+                if not attempt.retry:
+                    raise policy.exhausted(exc, attempts=number, previous=failures) from None
+                failures.append(exc)
+                await async_sleep(attempt.delay)
+
+    async def _settle(self, transaction_id: int, budget: Deadline) -> CommitOutcome:
+        """Ask another connection what became of a commit, waiting out one still running."""
+        wait = 0.05
+        while True:
+            async with self.connection(deadline=budget) as other:
+                outcome = await other.resolve_commit(transaction_id)
+            remaining = budget.remaining()
+            if outcome is not CommitOutcome.IN_PROGRESS or (
+                remaining is not None and remaining <= wait
+            ):
+                return outcome
+            await async_sleep(wait)
+            wait = min(wait * 2, 1.0)
 
     # -- retiring a set of connections --------------------------------------------------
 

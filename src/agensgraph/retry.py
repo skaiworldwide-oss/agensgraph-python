@@ -26,6 +26,7 @@ against the budget makes a single slow attempt look like an exhausted one.
 
 from __future__ import annotations
 
+import asyncio
 import random
 import threading
 import time
@@ -42,8 +43,21 @@ __all__ = [
     "Attempt",
     "RetryPolicy",
     "TokenBucket",
+    "async_sleep",
     "full_jitter",
+    "sleep",
 ]
+
+
+async def async_sleep(seconds: float) -> None:
+    """Wait without holding the event loop. The blocking module calls :func:`sleep` instead."""
+    await asyncio.sleep(seconds)
+
+
+def sleep(seconds: float) -> None:
+    """Wait, holding the thread."""
+    time.sleep(seconds)
+
 
 TRANSIENT_COST = 14
 """What a transient failure costs the bucket.
