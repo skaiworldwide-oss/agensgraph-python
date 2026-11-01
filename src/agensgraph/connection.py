@@ -46,7 +46,9 @@ from .bulk import (
     EDGE_COLUMN_TYPES,
     EDGE_LABEL_FACTS_QUERY,
     PROMOTED_KEY_TYPES,
+    RESERVE_IDS_QUERY,
     VERTEX_COLUMN_TYPES,
+    VERTEX_WITH_ID_COLUMN_TYPES,
     UpsertCounts,
     build_identity_map,
     edge_copy_statement,
@@ -62,6 +64,7 @@ from .bulk import (
     split_by_what_exists,
     split_edges_by_what_exists,
     vertex_copy_statement,
+    vertex_copy_with_ids_statement,
     vertex_rows,
 )
 from .capabilities import VECTOR_AVAILABLE_QUERY, VECTOR_VERSION_QUERY
@@ -1265,17 +1268,98 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
         would, so nothing here has to reproduce the server's numbering.
         """
         name = self._graph_of(graph)
-        loaded = 0
-        with (
-            self._describing_a_copy(),
-            self.cursor() as cursor,
-            cursor.copy(vertex_copy_statement(name, label)) as copy,
-        ):
-            copy.set_types(VERTEX_COLUMN_TYPES)
-            for row in vertex_rows(properties):
+        return self._copy_rows(
+            vertex_copy_statement(name, label), VERTEX_COLUMN_TYPES, vertex_rows(properties)
+        )
+
+    def _copy_rows(
+        self, statement: str, types: Sequence[str], rows: Iterable[Sequence[Any]]
+    ) -> int:
+        """Rows sent through one binary ``COPY``, under its span; how many were sent."""
+        sent = 0
+        with self._describing_a_copy(), self.cursor() as cursor, cursor.copy(statement) as copy:
+            copy.set_types(list(types))
+            for row in rows:
                 copy.write_row(row)
-                loaded += 1
-        return loaded
+                sent += 1
+        return sent
+
+    def reserve_ids(self, label: str, count: int, *, graph: str | None = None) -> list[GraphId]:
+        """Take ``count`` identities for a label, the way its own id default would, at once.
+
+        One round trip. The label's id and its sequence are read from the catalog rather than
+        from the default, which names the label by a string that 2.14.1 and 2.15.0 leave stale
+        after a rename. Identities taken and not used leave a gap, as a rolled-back ``CREATE``
+        would.
+        """
+        if count < 0:
+            raise ValueError(f"cannot reserve a negative number of identities, got {count}")
+        if count == 0:
+            return []
+        name = self._graph_of(graph)
+        rows = self._fetch(RESERVE_IDS_QUERY, {"graph": name, "label": label, "count": count})
+        if len(rows) != count:
+            raise ValueError(f"there is no label {label!r} in graph {name!r}")
+        return [row[0] for row in rows]
+
+    def load_vertices_with_ids(
+        self, label: str, properties: Iterable[Mapping[str, Any]], *, graph: str | None = None
+    ) -> list[GraphId]:
+        """Copy vertices into a label and return their identities, in the order given.
+
+        The identities are reserved first (:meth:`reserve_ids`) and copied with the vertices, so a
+        caller can write rows that refer to them -- a vector table keyed by the vertex, say -- in
+        the same transaction without reading anything back. Two round trips and one copy stream.
+        """
+        name = self._graph_of(graph)
+        material = [dict(each) for each in properties]
+        ids = self.reserve_ids(label, len(material), graph=name)
+        if not ids:
+            return ids
+        self._copy_rows(
+            vertex_copy_with_ids_statement(name, label),
+            VERTEX_WITH_ID_COLUMN_TYPES,
+            ([identity, Jsonb(props)] for identity, props in zip(ids, material, strict=True)),
+        )
+        return ids
+
+    def merge_vertices(
+        self,
+        label: str,
+        key: str,
+        rows: Iterable[Mapping[str, Any]],
+        *,
+        on_existing: str = "update",
+        require_unique: bool = True,
+        graph: str | None = None,
+    ) -> dict[str, GraphId]:
+        """Write elements by a key, as :meth:`upsert_vertices` does, and return every identity.
+
+        The answer maps each row's key, as text, to the identity of its element -- the one already
+        there or the one just created -- so a caller can go on to write rows that refer to them.
+        Keys are read the way :meth:`identity_map` reads them, so ``1`` and ``"1"`` are one key.
+        """
+        material = list(rows)
+        name, known, fresh, updates = self._by_what_exists(
+            label,
+            key,
+            material,
+            on_existing=on_existing,
+            require_unique=require_unique,
+            graph=graph,
+        )
+        identities = dict(known)
+        if fresh:
+            created = self.load_vertices_with_ids(label, fresh, graph=name)
+            identities.update(
+                (
+                    (str(row[key]), identity)
+                    for row, identity in zip(fresh, created, strict=True)
+                )
+            )
+        if on_existing == "update" and updates:
+            self._run_with(overlap_update_statement(label), (Jsonb(updates),))
+        return {str(row[key]): identities[str(row[key])] for row in material}
 
     def upsert_vertices(
         self,
@@ -1303,14 +1387,42 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
         twenty-five shared keys were measured making twenty-seven elements. ``require_unique``
         turns the refusal off for a graph that already has such a key and cannot add one.
         """
+        name, _, fresh, updates = self._by_what_exists(
+            label,
+            key,
+            list(rows),
+            on_existing=on_existing,
+            require_unique=require_unique,
+            graph=graph,
+        )
+        inserted = self.load_vertices(label, fresh, graph=name) if fresh else 0
+        updated = 0
+        if on_existing == "update" and updates:
+            self._run_with(overlap_update_statement(label), (Jsonb(updates),))
+            updated = len(updates)
+        return UpsertCounts(inserted, updated)
+
+    def _by_what_exists(
+        self,
+        label: str,
+        key: str,
+        material: Sequence[Mapping[str, Any]],
+        *,
+        on_existing: str,
+        require_unique: bool,
+        graph: str | None,
+    ) -> tuple[str, dict[str, GraphId], list[Mapping[str, Any]], list[dict[str, Any]]]:
+        """The graph, the identities already there by *key*, the new rows, and updates for the rest.
+
+        Refuses an *on_existing* other than ``"skip"`` or ``"update"`` before anything is read,
+        and a key nothing makes unique unless *require_unique* is off.
+        """
         if on_existing not in ("skip", "update"):
             raise ValueError(
                 f"on_existing is 'skip' or 'update', not {on_existing!r}: there is no third thing to do with an element that is already there"
             )
         name = self._graph_of(graph)
-        material = list(rows)
-        indexed = self._key_is_unique(label, key, graph=name)
-        if require_unique and (not indexed):
+        if require_unique and (not self._key_is_unique(label, key, graph=name)):
             raise ValueError(
                 f"nothing makes {key!r} unique on {label!r}, so two writers merging on it would each create an element rather than find one. Add a unique property index or a uniqueness constraint, or pass require_unique=False to accept the hazard"
             )
@@ -1318,12 +1430,7 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
             label, key, keys=[row.get(key) for row in material], graph=name
         )
         fresh, updates = split_by_what_exists(material, key, known)
-        inserted = self.load_vertices(label, fresh, graph=name) if fresh else 0
-        updated = 0
-        if on_existing == "update" and updates:
-            self._run_with(overlap_update_statement(label), (Jsonb(updates),))
-            updated = len(updates)
-        return UpsertCounts(inserted, updated)
+        return (name, known, fresh, updates)
 
     def upsert_edges(
         self,
@@ -1454,17 +1561,9 @@ class Connection(GraphMixin, psycopg.Connection[Row]):
         from whatever the source calls an element to the identity the server gave it is read.
         """
         name = self._graph_of(graph)
-        loaded = 0
-        with (
-            self._describing_a_copy(),
-            self.cursor() as cursor,
-            cursor.copy(edge_copy_statement(name, label)) as copy,
-        ):
-            copy.set_types(EDGE_COLUMN_TYPES)
-            for row in edge_rows(edges):
-                copy.write_row(row)
-                loaded += 1
-        return loaded
+        return self._copy_rows(
+            edge_copy_statement(name, label), EDGE_COLUMN_TYPES, edge_rows(edges)
+        )
 
     def load_vertex_frame(
         self, label: str, source: Any, *, graph: str | None = None, size: int = CHUNK

@@ -12,7 +12,13 @@ stored; the planner uses it as a stand-in for "unlabelled".
 
 from __future__ import annotations
 
-__all__ = ["AG_EDGE_LABID", "AG_VERTEX_LABID", "CURRENT_GRAPH_QUERY", "LabelCache"]
+__all__ = [
+    "AG_EDGE_LABID",
+    "AG_VERTEX_LABID",
+    "CURRENT_GRAPH_QUERY",
+    "LABEL_SEQUENCES",
+    "LabelCache",
+]
 
 AG_VERTEX_LABID = 1
 AG_EDGE_LABID = 2
@@ -22,6 +28,20 @@ CURRENT_GRAPH_QUERY = "select current_setting('graph_path', true)"
 
 The setting is not one the server reports of its own accord, so a session moved by anything
 other than :meth:`~agensgraph.Connection.graph` is only found by asking.
+"""
+
+LABEL_SEQUENCES = """\
+from pg_catalog.ag_label l
+join pg_catalog.ag_graph g on g.oid = l.graphid
+join pg_catalog.pg_attribute a on a.attrelid = l.relid and a.attname = 'id'
+join pg_catalog.pg_attrdef ad on ad.adrelid = l.relid and ad.adnum = a.attnum
+join pg_catalog.pg_depend d on d.classid = 'pg_catalog.pg_attrdef'::regclass
+     and d.objid = ad.oid and d.refclassid = 'pg_catalog.pg_class'::regclass
+join pg_catalog.pg_class seq on seq.oid = d.refobjid and seq.relkind = 'S'"""
+"""The ``from`` of a query over labels (``l``, in graph ``g``) and the sequences of their ids (``seq``).
+
+The sequence is found through ``pg_depend`` rather than by reading the id default, which names the
+label by a string that 2.14.1 and 2.15.0 leave pointing at the old name after the label is renamed.
 """
 
 _QUERY = """

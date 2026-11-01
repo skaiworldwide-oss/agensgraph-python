@@ -491,3 +491,44 @@ class TestACopysFailureIsDescribedToo:
         with pytest.raises(psycopg.Error) as by_copy:
             agens.load_vertices("doc", [{"email": secret}])
         assert str(by_statement.value) == str(by_copy.value)
+
+
+class TestIdentitiesTakenBeforehand:
+    """Writes that return what they made, so rows referring to it follow in the same transaction."""
+
+    def test_a_renamed_label_gets_its_own_identities(self, agens) -> None:  # type: ignore[no-untyped-def]
+        """2.14.1 and 2.15.0 leave the id default naming the old label after a rename."""
+        agens.execute("create vlabel old_name")
+        agens.execute("alter vlabel old_name rename to new_name")
+        agens.refresh_labels()
+        ids = agens.load_vertices_with_ids("new_name", [{"k": 1}, {"k": 2}, {"k": 3}])
+        assert len(ids) == 3
+        assert len(set(ids)) == 3
+        found = agens.execute(
+            "match (n:new_name) return id(n) as i, n.k as k order by k"
+        ).fetchall()
+        assert [row[0] for row in found] == ids
+
+    def test_identities_are_unique_across_reservations(self, loaded) -> None:  # type: ignore[no-untyped-def]
+        first = loaded.reserve_ids("doc", 50)
+        second = loaded.reserve_ids("doc", 50)
+        assert len(set(first) | set(second)) == 100
+        assert loaded.reserve_ids("doc", 0) == []
+
+    def test_a_label_that_is_not_there_is_named(self, loaded) -> None:  # type: ignore[no-untyped-def]
+        with pytest.raises(ValueError, match="no label 'nowhere'"):
+            loaded.reserve_ids("nowhere", 1)
+
+    def test_a_merge_returns_the_identity_of_every_row(self, loaded) -> None:  # type: ignore[no-untyped-def]
+        loaded.execute("create unique property index on doc (key)")
+        (existing,) = loaded.load_vertices_with_ids("doc", [{"key": "k1", "v": 1}])
+        merged = loaded.merge_vertices(
+            "doc", "key", [{"key": "k1", "v": 10}, {"key": "k2", "v": 2}, {"key": "k3", "v": 3}]
+        )
+        assert set(merged) == {"k1", "k2", "k3"}
+        assert merged["k1"] == existing
+        assert merged == loaded.identity_map("doc", "key")
+        values = dict(
+            loaded.execute("match (n:doc) return n.key as k, n.v as v order by k").fetchall()
+        )
+        assert values == {"k1": 10, "k2": 2, "k3": 3}

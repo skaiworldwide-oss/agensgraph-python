@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 
 from psycopg.types.json import Jsonb
 
+from ._protocol.labels import LABEL_SEQUENCES
 from .cypher import quote_identifier
 
 if TYPE_CHECKING:
@@ -43,6 +44,8 @@ __all__ = [
     "BLOCK_SIZE",
     "EDGE_LABEL_FACTS_QUERY",
     "PROMOTED_KEY_TYPES",
+    "RESERVE_IDS_QUERY",
+    "VERTEX_WITH_ID_COLUMN_TYPES",
     "UpsertCounts",
     "build_identity_map",
     "edge_blocks",
@@ -61,6 +64,7 @@ __all__ = [
     "split_edges_by_what_exists",
     "vertex_blocks",
     "vertex_copy_statement",
+    "vertex_copy_with_ids_statement",
 ]
 
 
@@ -119,8 +123,37 @@ def edge_copy_statement(graph: str, label: str) -> str:
     )
 
 
+def vertex_copy_with_ids_statement(graph: str, label: str) -> str:
+    """How to copy vertices into a label with identities reserved beforehand.
+
+    For a caller that needs each vertex's identity without reading it back -- to write rows that
+    refer to it in the same transaction. The identities come from :data:`RESERVE_IDS_QUERY`.
+    """
+    return (
+        f"copy {quote_identifier(graph)}.{quote_identifier(label)} (id, properties) "
+        f"from stdin (format binary)"
+    )
+
+
+RESERVE_IDS_QUERY = f"""
+select graphid(l.labid, nextval(seq.oid::regclass))
+{LABEL_SEQUENCES}
+cross join generate_series(1, %(count)s)
+where g.graphname = %(graph)s and l.labname = %(label)s
+"""
+"""Take identities for a label, the way its own default would, in one round trip.
+
+The label's id is read from ``ag_label`` and its sequence through ``pg_depend``, rather than by
+evaluating the default: the default names the label by a string, which 2.14.1 and 2.15.0 leave
+pointing at the old name after the label is renamed. A sequence's values are never given twice, so
+the identities are unique however many callers take them at once; any not used leave a gap.
+"""
+
 VERTEX_COLUMN_TYPES = ["jsonb"]
 """What a vertex copy sends. Stated because binary copying converts nothing."""
+
+VERTEX_WITH_ID_COLUMN_TYPES = ["graphid", "jsonb"]
+"""What a vertex copy with reserved identities sends."""
 
 EDGE_COLUMN_TYPES = ["graphid", "graphid", "jsonb"]
 """What an edge copy sends: the two endpoints, then the property map."""
