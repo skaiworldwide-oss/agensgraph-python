@@ -1,6 +1,6 @@
 # Changelog
 
-## 2.1.0 (unreleased)
+## 2.1.0 (2026-11-06)
 
 AgensGraph 2.14 to 2.18, a read-only boundary that holds, a safe way to run model-written Cypher,
 and a choice of where vectors live. Every 2.0.0 signature is unchanged, and so is every default but
